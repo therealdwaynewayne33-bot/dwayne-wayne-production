@@ -1,5 +1,5 @@
 import { Link, useLocation } from "wouter";
-import { LayoutDashboard, FolderOpen, Video, Users, Plus, LogOut, Sparkles } from "lucide-react";
+import { LayoutDashboard, FolderOpen, Video, Users, Plus, LogOut, Sparkles, Crown } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import { cn } from "@/lib/utils";
 
@@ -52,13 +52,28 @@ export function Sidebar() {
       </nav>
 
       <div className="px-3 py-4 border-t border-sidebar-border space-y-1">
+        {user?.plan === "free" && (
+          <Link href="/pricing">
+            <div className="mx-1 mb-3 rounded-lg bg-primary/10 border border-primary/20 p-3 cursor-pointer hover:bg-primary/15 transition-colors">
+              <div className="flex items-center gap-2 mb-1">
+                <Crown className="w-3.5 h-3.5 text-primary" />
+                <span className="text-xs font-bold text-primary">Upgrade to Pro</span>
+              </div>
+              <p className="text-[11px] text-muted-foreground leading-snug">
+                100 videos/mo, face-lock, 1080p output
+              </p>
+            </div>
+          </Link>
+        )}
         {user && (
-          <div className="px-3 py-2 mb-2">
+          <div className="px-3 py-2 mb-1">
             <p className="text-xs font-semibold text-foreground truncate">{user.name}</p>
             <p className="text-[11px] text-muted-foreground truncate">{user.email}</p>
-            <span className="mt-1 inline-block text-[10px] uppercase tracking-widest px-1.5 py-0.5 rounded bg-primary/20 text-primary font-bold">
-              {user.plan}
-            </span>
+            <Link href="/pricing">
+              <span className="mt-1 inline-block text-[10px] uppercase tracking-widest px-1.5 py-0.5 rounded bg-primary/20 text-primary font-bold hover:bg-primary/30 transition-colors cursor-pointer">
+                {user.plan}
+              </span>
+            </Link>
           </div>
         )}
         <button

@@ -5,6 +5,7 @@ import charactersRouter from "./characters";
 import projectsRouter from "./projects";
 import videosRouter from "./videos";
 import dashboardRouter from "./dashboard";
+import billingRouter from "./billing";
 
 const router: IRouter = Router();
 
@@ -14,5 +15,6 @@ router.use(charactersRouter);
 router.use(projectsRouter);
 router.use(videosRouter);
 router.use(dashboardRouter);
+router.use(billingRouter);
 
 export default router;

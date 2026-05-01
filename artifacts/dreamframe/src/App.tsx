@@ -10,6 +10,7 @@ import ProjectDetailPage from "@/pages/project-detail";
 import CharactersPage from "@/pages/characters";
 import CreatePage from "@/pages/create";
 import VideoDetailPage from "@/pages/video-detail";
+import PricingPage from "@/pages/pricing";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -69,6 +70,7 @@ function Router() {
       <Route path="/projects/:id" component={({ params }) => <ProtectedRoute component={ProjectDetailPage} id={Number(params.id)} />} />
       <Route path="/characters" component={() => <ProtectedRoute component={CharactersPage} />} />
       <Route path="/videos/:id" component={({ params }) => <ProtectedRoute component={VideoDetailPage} id={Number(params.id)} />} />
+      <Route path="/pricing" component={() => <ProtectedRoute component={PricingPage} />} />
       <Route component={NotFound} />
     </Switch>
   );

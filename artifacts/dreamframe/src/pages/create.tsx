@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
 import { Check, ChevronRight, Video, Image, Sparkles, Users, Layers, Film } from "lucide-react";
+import { PlanLimitModal } from "@/components/PlanLimitModal";
 
 const STYLES = [
   { id: "realistic", label: "Realistic", icon: Film, desc: "Photorealistic output" },
@@ -33,6 +34,7 @@ export default function CreatePage() {
   const [bgPrompt, setBgPrompt] = useState("");
   const [title, setTitle] = useState("");
   const [generatedVideoId, setGeneratedVideoId] = useState<number | null>(null);
+  const [planLimitInfo, setPlanLimitInfo] = useState<{ plan: string; planUsed: number; planLimit: number } | null>(null);
   const [, setLocation] = useLocation();
 
   const { data: projects } = useListProjects({ query: { queryKey: getListProjectsQueryKey() } });
@@ -76,7 +78,13 @@ export default function CreatePage() {
         setGeneratedVideoId(video.id);
         setStep(4);
       },
-      onError: () => toast({ title: "Generation failed", variant: "destructive" }),
+      onError: (err: any) => {
+        if (err?.status === 402 && err?.data) {
+          setPlanLimitInfo({ plan: err.data.plan, planUsed: err.data.planUsed, planLimit: err.data.planLimit });
+        } else {
+          toast({ title: "Generation failed", variant: "destructive" });
+        }
+      },
     });
   };
 
@@ -313,6 +321,14 @@ export default function CreatePage() {
           </div>
         )}
       </div>
+      {planLimitInfo && (
+        <PlanLimitModal
+          plan={planLimitInfo.plan}
+          planUsed={planLimitInfo.planUsed}
+          planLimit={planLimitInfo.planLimit}
+          onClose={() => setPlanLimitInfo(null)}
+        />
+      )}
     </AppLayout>
   );
 }

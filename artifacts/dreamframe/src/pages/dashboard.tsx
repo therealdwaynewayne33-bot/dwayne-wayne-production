@@ -2,7 +2,7 @@ import { Link } from "wouter";
 import { useGetDashboardSummary, useGetRecentActivity, useGetStyleBreakdown, getGetDashboardSummaryQueryKey, getGetRecentActivityQueryKey, getGetStyleBreakdownQueryKey } from "@workspace/api-client-react";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { useAuth } from "@/lib/auth";
-import { Plus, Video, FolderOpen, Users, TrendingUp, Clock, Zap } from "lucide-react";
+import { Plus, Video, FolderOpen, Users, TrendingUp, Clock, Zap, Crown } from "lucide-react";
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from "recharts";
 
 const STYLE_COLORS: Record<string, string> = {
@@ -114,9 +114,20 @@ export default function DashboardPage() {
               </div>
               <p className="text-xs text-muted-foreground mt-2">{usagePercent}% used</p>
               {user?.plan === "free" && (
-                <div className="mt-4 p-3 rounded-lg bg-primary/10 border border-primary/20">
-                  <p className="text-xs text-primary font-medium">Upgrade to Pro for 100 videos/month</p>
-                </div>
+                <Link href="/pricing">
+                  <div className="mt-4 p-3 rounded-lg bg-primary/10 border border-primary/20 cursor-pointer hover:bg-primary/15 transition-colors flex items-center gap-2">
+                    <Crown className="w-3.5 h-3.5 text-primary shrink-0" />
+                    <p className="text-xs text-primary font-medium">Upgrade to Pro — 100 videos/month</p>
+                  </div>
+                </Link>
+              )}
+              {user?.plan === "pro" && usagePercent >= 80 && (
+                <Link href="/pricing">
+                  <div className="mt-4 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20 cursor-pointer hover:bg-amber-500/15 transition-colors flex items-center gap-2">
+                    <Crown className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    <p className="text-xs text-amber-400 font-medium">Running low — upgrade to Enterprise</p>
+                  </div>
+                </Link>
               )}
             </div>
 

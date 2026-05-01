@@ -26,6 +26,16 @@ Full-stack AI video generation platform (SaaS MVP). Dark cinematic UI with chara
 - `lib/api-zod` — Generated Zod validation schemas
 - `lib/db` — Drizzle ORM + PostgreSQL schema
 
+## Billing (Mock Mode)
+
+- `/pricing` — Full pricing page: Free / Pro / Enterprise plan cards with monthly/yearly toggle
+- Plan limits enforced server-side on `POST /api/videos` (Free=10/mo, Pro=100/mo, Enterprise=unlimited)
+- Returns HTTP 402 with `{ plan, planUsed, planLimit }` when limit reached
+- `PlanLimitModal` — paywall modal shown on 402 when generating a video
+- `/api/billing/upgrade` — mock upgrade endpoint that writes `plan` to DB (no Stripe yet)
+- Dashboard and sidebar both have upgrade CTAs linking to `/pricing`
+- **Stripe integration is NOT yet connected.** When ready, connect Stripe via the Integrations tab (connector ID: `ccfg_stripe_01K611P4YQR0SZM11XFRQJC44Y`), then wire `stripeClient.ts`, webhook route, and checkout session into the billing route.
+
 ## Key Features
 
 - **Auth**: Session-based login/register (bcryptjs password hashing)

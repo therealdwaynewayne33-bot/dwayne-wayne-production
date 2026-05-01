@@ -1,6 +1,6 @@
 import { Router } from "express";
-import { db, videosTable, activityTable, projectsTable, charactersTable } from "@workspace/db";
-import { eq, and } from "drizzle-orm";
+import { db, videosTable, activityTable, projectsTable, charactersTable, usersTable } from "@workspace/db";
+import { eq, and, gte, count } from "drizzle-orm";
 import {
   GenerateVideoBody,
   GetVideoParams,
@@ -12,6 +12,12 @@ import {
 } from "@workspace/api-zod";
 
 const router = Router();
+
+const PLAN_LIMITS: Record<string, number> = {
+  free: 10,
+  pro: 100,
+  enterprise: Infinity,
+};
 
 function requireAuth(req: any, res: any, next: any) {
   if (!req.session.userId) return res.status(401).json({ error: "Not authenticated" });
@@ -49,6 +55,29 @@ router.get("/videos", requireAuth, async (req, res) => {
 router.post("/videos", requireAuth, async (req, res) => {
   const parsed = GenerateVideoBody.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid request body" });
+
+  const [user] = await db.select().from(usersTable).where(eq(usersTable.id, req.session.userId!)).limit(1);
+  if (!user) return res.status(401).json({ error: "User not found" });
+
+  const planLimit = PLAN_LIMITS[user.plan] ?? 10;
+  const monthStart = new Date();
+  monthStart.setDate(1);
+  monthStart.setHours(0, 0, 0, 0);
+
+  const [{ value: monthlyCount }] = await db
+    .select({ value: count() })
+    .from(videosTable)
+    .where(and(eq(videosTable.userId, user.id), gte(videosTable.createdAt, monthStart)));
+
+  if (planLimit !== Infinity && monthlyCount >= planLimit) {
+    return res.status(402).json({
+      error: "Plan limit reached",
+      planLimit,
+      planUsed: monthlyCount,
+      plan: user.plan,
+    });
+  }
+
   const [video] = await db.insert(videosTable).values({
     ...parsed.data,
     userId: req.session.userId!,
