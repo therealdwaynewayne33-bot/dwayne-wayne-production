@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "DreamFrame AI Studio"
+version = "1.0.0"
+id = "artifacts/dreamframe"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 19591
+
+[services.development]
+run = "pnpm --filter @workspace/dreamframe run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/dreamframe", "run", "build" ]
+publicDir = "artifacts/dreamframe/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "19591"
+BASE_PATH = "/"
