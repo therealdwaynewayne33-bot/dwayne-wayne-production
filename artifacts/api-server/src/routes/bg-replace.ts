@@ -17,12 +17,14 @@ const execAsync   = promisify(exec);
 
 const router = Router();
 
+const VIDEO_EXTS = new Set([".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v", ".3gp"]);
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 200 * 1024 * 1024 }, // 200 MB max
   fileFilter: (_req, file, cb) => {
-    if (file.mimetype.startsWith("video/")) cb(null, true);
-    else cb(new Error("Only video files are accepted"));
+    const ext = "." + (file.originalname.split(".").pop() ?? "").toLowerCase();
+    if (file.mimetype.startsWith("video/") || VIDEO_EXTS.has(ext)) cb(null, true);
+    else cb(new Error("Only video files are accepted (MP4, MOV, WebM…)"));
   },
 });
 

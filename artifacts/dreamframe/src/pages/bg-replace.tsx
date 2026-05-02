@@ -94,8 +94,14 @@ export default function BgReplacePage() {
   const fileRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
 
+  const VIDEO_EXTS = [".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v", ".3gp"];
+  const isVideoFile = (f: File) => {
+    const ext = "." + f.name.split(".").pop()?.toLowerCase();
+    return f.type.startsWith("video/") || f.type === "application/octet-stream" && VIDEO_EXTS.includes(ext) || VIDEO_EXTS.includes(ext);
+  };
+
   const handleFile = (f: File) => {
-    if (!f.type.startsWith("video/")) { toast({ title: "Please upload a video file", variant: "destructive" }); return; }
+    if (!isVideoFile(f)) { toast({ title: "Please upload a video file (MP4, MOV, WebM…)", variant: "destructive" }); return; }
     setFile(f);
     setPreviewUrl(URL.createObjectURL(f));
     setResult(null);
@@ -184,7 +190,7 @@ export default function BgReplacePage() {
                       className="text-xs text-white/40 hover:text-white transition-colors font-medium">Browse file</button>
                   </div>
                 )}
-                <input ref={fileRef} type="file" accept="video/*" className="hidden"
+                <input ref={fileRef} type="file" accept="video/*,.mp4,.mov,.webm,.avi,.mkv,.m4v,.3gp" className="hidden"
                   onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])} />
               </div>
             </div>
