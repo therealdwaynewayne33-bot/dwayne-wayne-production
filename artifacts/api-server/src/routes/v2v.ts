@@ -43,22 +43,39 @@ function isImageFile(file: Express.Multer.File): boolean {
 }
 
 /**
- * Compute the average RGB colour of an image by scaling it to a single pixel
- * and reading the raw bytes from a PPM file.
+ * Compute the WHITE POINT of an image — the average colour of its brightest
+ * pixels (top 25% by luminance). This is the reference colour neutral pixels
+ * (white walls, sky, paper, t-shirts) should be after white-balancing.
  *
- * PPM (P6) layout:
- *   "P6\n<width> <height>\n<maxval>\n<raw RGB bytes>"
+ * Why brightest-pixel average instead of full-frame average:
+ *   - Frame averages mix bright neutrals with dark shadows + colourful subjects,
+ *     so they conflate exposure with white balance and produce wrong shifts.
+ *   - The brightest pixels in most natural scenes ARE the neutrals (walls,
+ *     ceilings, sky), so averaging them gives a clean estimate of "what white
+ *     looks like in this lighting".
  */
-async function avgRGB(imagePath: string): Promise<[number, number, number]> {
-  const ppmPath = `${imagePath}.avg.ppm`;
-  await execAsync(`ffmpeg -y -i "${imagePath}" -vf scale=1:1 -frames:v 1 "${ppmPath}"`);
+async function whitePoint(imagePath: string): Promise<[number, number, number]> {
+  // 16×16 = 256 samples — enough to be stable, small enough to be fast
+  const ppmPath = `${imagePath}.16.ppm`;
+  await execAsync(`ffmpeg -y -i "${imagePath}" -vf scale=16:16 -frames:v 1 "${ppmPath}"`);
   const buf = await readFile(ppmPath);
   let nl = 0, idx = 0;
   while (nl < 3 && idx < buf.length) {
     if (buf[idx] === 0x0a) nl++;
     idx++;
   }
-  return [buf[idx], buf[idx + 1], buf[idx + 2]];
+  type Px = { r: number; g: number; b: number; lum: number };
+  const pixels: Px[] = [];
+  for (let i = idx; i < buf.length; i += 3) {
+    const r = buf[i], g = buf[i + 1], b = buf[i + 2];
+    pixels.push({ r, g, b, lum: 0.299 * r + 0.587 * g + 0.114 * b });
+  }
+  pixels.sort((a, b) => b.lum - a.lum);
+  const topN = Math.max(8, Math.floor(pixels.length * 0.25));
+  const top = pixels.slice(0, topN);
+  let sr = 0, sg = 0, sb = 0;
+  for (const p of top) { sr += p.r; sg += p.g; sb += p.b; }
+  return [sr / topN, sg / topN, sb / topN];
 }
 
 /**
@@ -190,35 +207,45 @@ router.post(
       return res.status(500).json({ error: `AI transfer failed: ${err.message}` });
     }
 
-    // 5. Compute the colour DELTA between the original target frame and the
-    //    AI-edited target frame, then push the entire video toward the AI
-    //    look using ffmpeg's `colorbalance` filter.
+    // 5. White-balance the target video to match the REFERENCE.
     //
-    //  Why this is better than the old softlight-blend approach:
-    //   - softlight blend is opacity-limited; subtle reference colours barely
-    //     shift the result.
-    //   - colorbalance with computed deltas is a TRUE colour transform: every
-    //     pixel gets the exact RGB shift needed to match the AI's intended tone.
-    //   - We boost the delta 1.6× so subtle reference looks (e.g. two indoor
-    //     videos with similar lighting) still produce a clearly visible grade.
+    //  Approach: compute the white point (avg of brightest 25% of pixels) of
+    //  both the original target frame AND the reference frame. Compute the
+    //  per-channel SCALE factor needed to make the target's whites look like
+    //  the reference's whites. Apply that scale to every frame of the video.
     //
-    let cr = 0, cg = 0, cb = 0;
+    //  Why this is better than averaging the AI-edited frame:
+    //   - GPT-Image-1 sometimes drifts (over-warms, over-cools, darkens).
+    //     Using its output as the colour target propagates that drift.
+    //   - The user's REFERENCE photo is the ground truth for what they want.
+    //     Balancing against it directly is precise and predictable.
+    //   - White-point matching is what real cinematographers do — it's true
+    //     white balance, not crude colour shifting.
+    //
+    let sR = 1, sG = 1, sB = 1;
     try {
-      const [er, eg, eb] = await avgRGB(editedFramePath);
-      const [tr, tg, tb] = await avgRGB(targetFramePath);
-      const BOOST = 1.6;
-      const clamp = (v: number) => Math.max(-1, Math.min(1, v));
-      cr = clamp(((er - tr) / 255) * BOOST);
-      cg = clamp(((eg - tg) / 255) * BOOST);
-      cb = clamp(((eb - tb) / 255) * BOOST);
-      req.log.info({ deltaR: cr.toFixed(3), deltaG: cg.toFixed(3), deltaB: cb.toFixed(3) }, "v2v: colour transfer deltas");
+      const [tR, tG, tB] = await whitePoint(targetFramePath);
+      const [rR, rG, rB] = await whitePoint(refFramePath);
+      // Scale factors: multiply target whites by (ref / target) to match
+      const clamp = (v: number) => Math.max(0.75, Math.min(1.30, v));
+      sR = clamp(rR / Math.max(1, tR));
+      sG = clamp(rG / Math.max(1, tG));
+      sB = clamp(rB / Math.max(1, tB));
+      req.log.info(
+        {
+          target_wp: [Math.round(tR), Math.round(tG), Math.round(tB)],
+          ref_wp:    [Math.round(rR), Math.round(rG), Math.round(rB)],
+          scale: { r: sR.toFixed(3), g: sG.toFixed(3), b: sB.toFixed(3) },
+        },
+        "v2v: white-balance scale"
+      );
     } catch (err: any) {
-      req.log.warn({ err: err.message }, "v2v: avgRGB failed, falling back to no-shift");
+      req.log.warn({ err: err.message }, "v2v: whitePoint failed, falling back to identity scale");
     }
 
-    // colorbalance: rs/gs/bs = shadows, rm/gm/bm = midtones, rh/gh/bh = highlights
-    // Same delta for all three keeps the shift uniform across the tonal range.
-    const cb_filter = `colorbalance=rs=${cr}:gs=${cg}:bs=${cb}:rm=${cr}:gm=${cg}:bm=${cb}:rh=${cr}:gh=${cg}:bh=${cb}`;
+    // colorchannelmixer: per-channel multiplicative scaling = pure white balance.
+    // No additive shifts (which crush blacks) and no opacity (which limits effect).
+    const wb_filter = `colorchannelmixer=rr=${sR}:gg=${sG}:bb=${sB}`;
 
     const outputPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
     const ffmpegCmd = [
@@ -226,9 +253,9 @@ router.post(
       `-i "${targetPath}"`,
       `-filter_complex`,
       `"[0:v]scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,format=yuv420p,` +
-      `${cb_filter},` +
-      `eq=contrast=1.06:saturation=1.12,` +
-      `noise=alls=3:allf=t+u[out]"`,
+      `${wb_filter},` +
+      `eq=contrast=1.04:saturation=1.06,` +
+      `noise=alls=2:allf=t+u[out]"`,
       `-map "[out]" -map "0:a?"`,
       `-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p`,
       `-c:a copy`,
