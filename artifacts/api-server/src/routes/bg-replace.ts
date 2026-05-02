@@ -43,6 +43,31 @@ async function makeThumbnail(videoPath: string, outPath: string) {
   await execAsync(`ffmpeg -y -i "${videoPath}" -ss 0.5 -frames:v 1 -q:v 3 "${outPath}"`);
 }
 
+/**
+ * Normalize an uploaded video to a format Luma's modify-video pipeline
+ * reliably accepts:
+ *   - H.264 (high profile, yuv420p) in MP4 container
+ *   - AAC audio
+ *   - max 1280px on the long edge, even pixel dims
+ *   - 30fps, capped at 30s (Luma hard limit)
+ *   - faststart for streaming
+ *
+ * Phones (especially iPhones) often produce HEVC / H.265 .mov files which
+ * Luma rejects with E006 ("input was invalid"). Re-encoding here turns any
+ * upload into something the model is happy with.
+ */
+async function normalizeForLuma(srcPath: string, outPath: string) {
+  await execAsync(
+    `ffmpeg -y -i "${srcPath}" ` +
+    `-t 30 ` +
+    `-vf "scale='min(1280,iw)':-2:flags=lanczos,fps=30,format=yuv420p" ` +
+    `-c:v libx264 -profile:v high -level 4.0 -preset fast -crf 22 ` +
+    `-c:a aac -b:a 128k -ac 2 -ar 44100 ` +
+    `-movflags +faststart ` +
+    `"${outPath}"`
+  );
+}
+
 async function extractFaceFrame(videoOrImagePath: string, outPath: string) {
   // Grab a frame ~0.5 s in (well past any black intro) for a clean face.
   await execAsync(`ffmpeg -y -ss 0.5 -i "${videoOrImagePath}" -frames:v 1 -q:v 2 "${outPath}"`);
@@ -91,9 +116,23 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
   await mkdir(VIDEOS_DIR,  { recursive: true });
   await mkdir(THUMBS_DIR,  { recursive: true });
 
-  // 1. Save source video to disk and serve publicly so Replicate can fetch it
+  // 1. Save raw upload, then normalize to a Luma-compatible H.264 MP4.
+  //    Phones often record in HEVC / .mov which Luma rejects with E006.
+  const rawExt = "." + (req.file.originalname.split(".").pop() ?? "mp4").toLowerCase();
+  const safeRawExt = VIDEO_EXTS.has(rawExt) ? rawExt : ".mp4";
+  const rawPath = path.join(UPLOADS_DIR, `${jobId}-raw${safeRawExt}`);
   const srcPath = path.join(UPLOADS_DIR, `${jobId}-src.mp4`);
-  await writeFile(srcPath, req.file.buffer);
+  await writeFile(rawPath, req.file.buffer);
+
+  try {
+    await normalizeForLuma(rawPath, srcPath);
+  } catch (err: any) {
+    req.log.error({ err: err.message }, "bg-replace: video normalization failed");
+    return res.status(400).json({
+      error: "Could not read your video file. Please try a different MP4, MOV, or WebM clip.",
+    });
+  }
+
   const srcPublicUrl = `https://${domain}/api/uploads/${jobId}-src.mp4`;
 
   const replicate = new Replicate({ auth: token });
