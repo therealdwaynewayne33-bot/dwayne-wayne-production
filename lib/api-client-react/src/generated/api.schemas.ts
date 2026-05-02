@@ -171,12 +171,22 @@ export const GenerateVideoBodyStyle = {
   cinematic: "cinematic",
 } as const;
 
+export type GenerateVideoBodyAiModel =
+  (typeof GenerateVideoBodyAiModel)[keyof typeof GenerateVideoBodyAiModel];
+
+export const GenerateVideoBodyAiModel = {
+  "wan-21": "wan-2.1",
+  hunyuan: "hunyuan",
+  "minimax-live": "minimax-live",
+} as const;
+
 export interface GenerateVideoBody {
   projectId: number;
   title: string;
   prompt: string;
   generationType: GenerateVideoBodyGenerationType;
   style: GenerateVideoBodyStyle;
+  aiModel?: GenerateVideoBodyAiModel;
   characterId?: number;
   sourceImageUrl?: string;
   backgroundReplaced?: boolean;

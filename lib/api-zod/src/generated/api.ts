@@ -229,6 +229,7 @@ export const GenerateVideoBody = zod.object({
   prompt: zod.string(),
   generationType: zod.enum(["text-to-video", "image-to-video"]),
   style: zod.enum(["realistic", "cartoon", "animated-3d", "cinematic"]),
+  aiModel: zod.enum(["wan-2.1", "hunyuan", "minimax-live"]).optional(),
   characterId: zod.number().optional(),
   sourceImageUrl: zod.string().optional(),
   backgroundReplaced: zod.boolean().optional(),

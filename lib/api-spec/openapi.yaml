@@ -659,6 +659,9 @@ components:
         style:
           type: string
           enum: [realistic, cartoon, animated-3d, cinematic]
+        aiModel:
+          type: string
+          enum: [wan-2.1, hunyuan, minimax-live]
         characterId:
           type: integer
         sourceImageUrl:

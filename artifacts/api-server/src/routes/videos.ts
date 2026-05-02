@@ -56,23 +56,67 @@ function resolveReplicateUrl(output: unknown): string {
 }
 
 // Generate real video using AI
-// • Default model: wavespeedai/wan-2.1-t2v-720p  — high quality, sharp faces, great motion
-// • Face-lock fallback: minimax/video-01          — supports first_frame_image reference
-async function generateVideo(videoId: number, prompt: string, characterImageUrl?: string): Promise<{ videoUrl: string; duration: number }> {
+// Priority order for model selection:
+//   1. sourceImageUrl present → WAN 2.1 i2v  (Modify/animate-image feature)
+//   2. characterImageUrl present → MiniMax    (face-lock, supports first_frame_image)
+//   3. aiModel = "hunyuan"   → HunyuanVideo  (Tencent premium quality)
+//   4. aiModel = "minimax-live" → MiniMax Live
+//   5. default               → WAN 2.1 t2v   (fast, sharp 720p)
+async function generateVideo(
+  videoId: number,
+  prompt: string,
+  characterImageUrl?: string,
+  sourceImageUrl?: string,
+  aiModel?: string,
+): Promise<{ videoUrl: string; duration: number }> {
   const token = process.env.REPLICATE_API_TOKEN;
   if (!token) throw new Error("REPLICATE_API_TOKEN not set");
 
   const replicate = new Replicate({ auth: token });
-
   let output: unknown;
+  let duration = 5;
 
-  if (characterImageUrl) {
-    // Face-lock: use minimax which supports first_frame_image
+  if (sourceImageUrl) {
+    // Modify / image-to-video: animate a still image using WAN 2.1 i2v
+    output = await replicate.run("wavespeedai/wan-2.1-i2v-720p", {
+      input: {
+        image: sourceImageUrl,
+        prompt,
+        aspect_ratio: "16:9",
+        fast_mode: "Balanced",
+        sample_steps: 25,
+        negative_prompt: "blur, low quality, watermark, text",
+      },
+    });
+    duration = 5;
+  } else if (characterImageUrl) {
+    // Face-lock: MiniMax supports first_frame_image for character consistency
     output = await replicate.run("minimax/video-01", {
       input: { prompt, prompt_optimizer: true, first_frame_image: characterImageUrl },
     });
+    duration = 6;
+  } else if (aiModel === "hunyuan") {
+    // HunyuanVideo — Tencent's premium model, high realism, comparable to Kling/Luma
+    output = await replicate.run("tencent/hunyuan-video", {
+      input: {
+        prompt,
+        width: 1280,
+        height: 720,
+        fps: 24,
+        video_length: 97, // ~4 seconds at 24fps
+        infer_steps: 40,
+        embedded_guidance_scale: 6,
+      },
+    });
+    duration = 4;
+  } else if (aiModel === "minimax-live") {
+    // MiniMax Live — good for faces, slightly smoother motion
+    output = await replicate.run("minimax/video-01-live", {
+      input: { prompt, prompt_optimizer: true },
+    });
+    duration = 6;
   } else {
-    // Default: Wan 2.1 — sharper 720p, better face rendering, more natural motion
+    // Default: WAN 2.1 t2v — fast, sharp 720p, great motion
     output = await replicate.run("wavespeedai/wan-2.1-t2v-720p", {
       input: {
         prompt,
@@ -83,6 +127,7 @@ async function generateVideo(videoId: number, prompt: string, characterImageUrl?
         disable_safety_checker: false,
       },
     });
+    duration = 5;
   }
 
   const remoteUrl = resolveReplicateUrl(output);
@@ -94,10 +139,10 @@ async function generateVideo(videoId: number, prompt: string, characterImageUrl?
   const buf = Buffer.from(await videoResp.arrayBuffer());
   await writeFile(path.join(VIDEOS_DIR, `${videoId}.mp4`), buf);
 
-  return { videoUrl: `/api/videos-files/${videoId}.mp4`, duration: 6 };
+  return { videoUrl: `/api/videos-files/${videoId}.mp4`, duration };
 }
 
-async function runGeneration(videoId: number, prompt: string) {
+async function runGeneration(videoId: number, prompt: string, sourceImageUrl?: string, aiModel?: string) {
   try {
     await db.update(videosTable).set({ status: "processing" }).where(eq(videosTable.id, videoId));
 
@@ -107,7 +152,6 @@ async function runGeneration(videoId: number, prompt: string) {
     if (videoRecord?.characterId) {
       const [char] = await db.select().from(charactersTable).where(eq(charactersTable.id, videoRecord.characterId)).limit(1);
       if (char?.imageUrl && char.imageUrl.startsWith("/api/char-files/")) {
-        // Build a public URL Replicate can fetch
         const domain = process.env.REPLIT_DEV_DOMAIN ?? process.env.REPLIT_DOMAINS?.split(",")[0];
         if (domain) {
           characterImageUrl = `https://${domain}/api/char-files/${char.id}.png`;
@@ -118,7 +162,7 @@ async function runGeneration(videoId: number, prompt: string) {
     // Run thumbnail and video generation in parallel
     const [thumbnailUrl, videoResult] = await Promise.allSettled([
       generateThumbnail(videoId, prompt),
-      generateVideo(videoId, prompt, characterImageUrl),
+      generateVideo(videoId, prompt, characterImageUrl, sourceImageUrl, aiModel),
     ]);
 
     const thumb = thumbnailUrl.status === "fulfilled" ? thumbnailUrl.value : `https://picsum.photos/seed/${videoId}/640/360`;
@@ -190,7 +234,7 @@ router.post("/videos", requireAuth, async (req, res) => {
   }).returning();
   await db.insert(activityTable).values({ userId: req.session.userId!, type: "video_generated", description: `Started generating "${video.title}"`, resourceId: video.id, resourceType: "video" });
   await db.update(projectsTable).set({ status: "processing", updatedAt: new Date() }).where(eq(projectsTable.id, video.projectId));
-  void runGeneration(video.id, parsed.data.prompt);
+  void runGeneration(video.id, parsed.data.prompt, parsed.data.sourceImageUrl, parsed.data.aiModel);
   return res.status(201).json(video);
 });
 
