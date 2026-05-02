@@ -59,9 +59,10 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
   // 2. Run Robust Video Matting → green-screen output
   let greenScreenUrl: string;
   try {
-    const output = await replicate.run("arielreplicate/robust_video_matting", {
-      input: { input_video: publicVideoUrl, output_type: "green-screen" },
-    }) as unknown;
+    const output = await replicate.run(
+      "arielreplicate/robust_video_matting:73d2128a371922d5d1abf0712a1d974be0e4e2358cc1218e4e34714767232bac",
+      { input: { input_video: publicVideoUrl, output_type: "green-screen" } },
+    ) as unknown;
 
     if (typeof output === "string") {
       greenScreenUrl = output;
