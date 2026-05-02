@@ -83,6 +83,7 @@ type BgResult = {
   sourceUrl?: string;
   lumaUrl?: string;
   faceLocked?: boolean;
+  demoMode?: boolean;
 };
 
 const PRESETS = [
@@ -380,18 +381,30 @@ export default function BgReplacePage() {
           <div>
             {stage === "done" && result ? (
               <div className="space-y-5">
-                <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center justify-between mb-2 gap-2">
                   <div className="flex items-center gap-2 text-sm font-medium text-white/60">
                     <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                    <span>Scene re-rendered</span>
+                    <span>{result.demoMode ? "Demo render ready" : "Scene re-rendered"}</span>
                   </div>
-                  {result.faceLocked && (
-                    <div className="flex items-center gap-1.5 text-[11px] text-emerald-400/80 bg-emerald-400/5 px-2.5 py-1 rounded-full border border-emerald-400/15">
-                      <ShieldCheck className="w-3 h-3" />
-                      <span>Face locked</span>
-                    </div>
-                  )}
+                  <div className="flex items-center gap-2">
+                    {result.demoMode && (
+                      <div className="flex items-center gap-1.5 text-[11px] text-amber-300 bg-amber-400/10 px-2.5 py-1 rounded-full border border-amber-400/20">
+                        <span>DEMO</span>
+                      </div>
+                    )}
+                    {result.faceLocked && (
+                      <div className="flex items-center gap-1.5 text-[11px] text-emerald-400/80 bg-emerald-400/5 px-2.5 py-1 rounded-full border border-emerald-400/15">
+                        <ShieldCheck className="w-3 h-3" />
+                        <span>Face locked</span>
+                      </div>
+                    )}
+                  </div>
                 </div>
+                {result.demoMode && (
+                  <p className="text-[11px] text-white/30 -mt-3 mb-1">
+                    No AI was called. This is a stylized preview so you can demo the flow without using Replicate credits. Set <code className="text-white/50">BG_REPLACE_DEMO_MODE=false</code> to enable real Luma Ray-2.
+                  </p>
+                )}
                 <VideoPlayer src={result.videoUrl} thumbnail={result.thumbnailUrl} />
 
                 {/* Fix face button */}

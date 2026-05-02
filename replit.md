@@ -46,6 +46,17 @@ Full-stack AI video generation platform (SaaS MVP). Dark cinematic UI with chara
 - **Face Lock**: Character consistency system — upload character images, lock to videos
 - **Background Replace**: Luma Ray-2 video-to-video (`luma/modify-video`, mode `flex_1`) with optional `arabyai-replicate/roop_face_swap` for face-lock. Per-result "Fix face" button re-runs only the swap against the original Luma render.
 
+### Background Replace — DEMO MODE
+
+The Replicate account currently has $0 credit, so `BG_REPLACE_DEMO_MODE` is **on by default**. When on:
+
+- `POST /api/videos/bg-replace` and `/fix-face` skip Luma + Roop entirely
+- Instead, ffmpeg applies a prompt-aware color grade (warm beach, cool night, green forest, etc.) + vignette
+- Response includes `demoMode: true` and the UI shows a yellow `DEMO` badge plus a hint about the env var
+- "Fix face" still works — it re-runs a slightly different stylize on the existing render so the button visibly changes the output
+- To turn the real Luma+Roop pipeline back on once credits exist, set `BG_REPLACE_DEMO_MODE=false` (or `0` / `off`) and restart the API Server. No code changes needed.
+- Implementation: `isDemoMode()`, `demoFilterForPrompt()`, `applyDemoEffect()` helpers at the top of `artifacts/api-server/src/routes/bg-replace.ts`; demo branches before the Replicate calls in both routes.
+
 ### Luma `modify-video` constraints (learned the hard way)
 
 The model rejects inputs with a silent `(E006)` "input was invalid" error if any of these aren't met. `normalizeForLuma()` in `bg-replace.ts` re-encodes every upload to match this profile:

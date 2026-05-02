@@ -3,7 +3,7 @@ import multer from "multer";
 import path from "path";
 import { fileURLToPath } from "url";
 import { mkdir, writeFile } from "fs/promises";
-import { exec } from "child_process";
+import { exec, execFile } from "child_process";
 import { promisify } from "util";
 import Replicate from "replicate";
 import { requireAuth } from "../middlewares/requireAuth";
@@ -12,7 +12,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOADS_DIR = path.join(__dirname, "../public/uploads");
 const VIDEOS_DIR  = path.join(__dirname, "../public/videos");
 const THUMBS_DIR  = path.join(__dirname, "../public/thumbs");
-const execAsync   = promisify(exec);
+const execAsync     = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 const router = Router();
 
@@ -89,6 +90,70 @@ function getDomain(): string | null {
 }
 
 /**
+ * Demo mode skips the paid Luma + Roop calls and instead applies an
+ * ffmpeg color-grade pass to the trimmed clip so the user can demo the
+ * end-to-end UX without burning Replicate credits.
+ *
+ * Default: ON (until the user opts in to real AI by setting the env var
+ * to "false" or "0"). The real pipeline is preserved and re-enabled by
+ * flipping `BG_REPLACE_DEMO_MODE=false`.
+ */
+function isDemoMode(): boolean {
+  const v = (process.env.BG_REPLACE_DEMO_MODE ?? "true").toLowerCase();
+  return v !== "false" && v !== "0" && v !== "off";
+}
+
+/**
+ * Pick an ffmpeg color/style filter that loosely matches the prompt so the
+ * "demo" result actually looks different from the input in a way that
+ * resembles the requested vibe (warm beach vs cool night vs forest, etc.).
+ * Pure cosmetic — no real AI is involved.
+ */
+function demoFilterForPrompt(prompt: string, variant: "base" | "facelock" = "base"): string {
+  const p = prompt.toLowerCase();
+  let grade =
+    "eq=contrast=1.18:saturation=1.35:gamma=0.95,curves=preset=increase_contrast";
+  if (/beach|sunset|desert|warm|orange|gold|tropical/.test(p)) {
+    grade = "eq=contrast=1.15:saturation=1.45:gamma=0.92,colorbalance=rs=0.20:gs=0.05:bs=-0.20";
+  } else if (/night|space|dark|moon|blue|underwater|ocean|cyber/.test(p)) {
+    grade = "eq=contrast=1.25:saturation=1.30:gamma=0.85,colorbalance=rs=-0.20:gs=-0.05:bs=0.25";
+  } else if (/forest|jungle|green|nature|garden|park/.test(p)) {
+    grade = "eq=contrast=1.15:saturation=1.40:gamma=0.95,colorbalance=rs=-0.15:gs=0.20:bs=-0.10";
+  } else if (/snow|ice|winter|white|arctic/.test(p)) {
+    grade = "eq=contrast=1.20:saturation=0.85:gamma=1.05,colorbalance=rs=-0.10:gs=0.00:bs=0.15";
+  } else if (/anime|cartoon|comic/.test(p)) {
+    grade = "eq=contrast=1.30:saturation=1.70:gamma=0.92";
+  }
+  // Face-lock variant: nudge skin tones a touch warmer so it visibly differs
+  // from the base demo output (otherwise users couldn't tell "Fix face" did
+  // anything in demo mode).
+  if (variant === "facelock") {
+    grade += ",eq=contrast=1.05:saturation=1.05:gamma=0.98,colorbalance=rs=0.08:gs=0.02:bs=-0.05";
+  }
+  return `${grade},vignette=PI/5`;
+}
+
+async function applyDemoEffect(srcPath: string, outPath: string, prompt: string, variant: "base" | "facelock" = "base") {
+  const filter = demoFilterForPrompt(prompt, variant);
+  // Use execFile (no shell) to avoid command-injection through srcPath/outPath.
+  // Even though we control these, srcPath in /fix-face is derived from a
+  // user-supplied URL, so we treat them as untrusted.
+  await execFileAsync("ffmpeg", [
+    "-y",
+    "-i", srcPath,
+    "-vf", filter,
+    "-c:v", "libx264",
+    "-profile:v", "high",
+    "-level", "4.0",
+    "-preset", "fast",
+    "-crf", "20",
+    "-c:a", "copy",
+    "-movflags", "+faststart",
+    outPath,
+  ]);
+}
+
+/**
  * Map raw Replicate SDK errors into something a non-technical user can act on.
  * In particular, surface 402/insufficient-credit failures clearly so people
  * know to top up their Replicate balance instead of seeing a JSON dump.
@@ -134,12 +199,13 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
   if (!prompt) return res.status(400).json({ error: "backgroundPrompt is required" });
 
   const lockFace = String(req.body?.lockFace ?? "true").toLowerCase() === "true";
+  const demo = isDemoMode();
 
   const token = process.env.REPLICATE_API_TOKEN;
-  if (!token) return res.status(500).json({ error: "REPLICATE_API_TOKEN not set" });
+  if (!demo && !token) return res.status(500).json({ error: "REPLICATE_API_TOKEN not set" });
 
   const domain = getDomain();
-  if (!domain) return res.status(500).json({ error: "Could not determine public domain" });
+  if (!demo && !domain) return res.status(500).json({ error: "Could not determine public domain" });
 
   const jobId = `bgr-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
@@ -161,6 +227,39 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     req.log.error({ err: err.message }, "bg-replace: video normalization failed");
     return res.status(400).json({
       error: "Could not read your video file. Please try a different MP4, MOV, or WebM clip.",
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // DEMO MODE: skip paid Luma + Roop calls and synthesize a "stylized"
+  // result locally with ffmpeg. The user gets a believable end-to-end
+  // experience without burning Replicate credits.
+  // ---------------------------------------------------------------------
+  if (demo) {
+    const variant = lockFace ? "facelock" : "base";
+    const demoOut = path.join(VIDEOS_DIR, `${jobId}-demo.mp4`);
+    try {
+      await applyDemoEffect(srcPath, demoOut, prompt, variant);
+    } catch (err: any) {
+      req.log.error({ err: err.message }, "bg-replace: demo render failed");
+      return res.status(500).json({ error: `Demo render failed: ${err.message}` });
+    }
+    try {
+      await makeThumbnail(demoOut, path.join(THUMBS_DIR, `${jobId}.jpg`));
+    } catch (err: any) {
+      req.log.warn({ err: err.message }, "bg-replace: demo thumbnail failed");
+    }
+    req.log.info({ jobId, prompt, lockFace }, "bg-replace: returned demo render");
+    return res.json({
+      videoUrl:     `/api/videos-files/${jobId}-demo.mp4`,
+      thumbnailUrl: `/api/thumbs/${jobId}.jpg`,
+      sourceUrl:    `/api/uploads/${jobId}-src.mp4`,
+      // In demo mode the "Luma render" is the same demo file — fix-face
+      // will re-apply a slightly different stylize so the button still works.
+      lumaUrl:      `/api/videos-files/${jobId}-demo.mp4`,
+      faceLocked:   lockFace,
+      demoMode:     true,
+      jobId,
     });
   }
 
@@ -245,6 +344,7 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     sourceUrl:    `/api/uploads/${jobId}-src.mp4`,
     lumaUrl:      `/api/videos-files/${jobId}-luma.mp4`,
     faceLocked,
+    demoMode:     false,
     jobId,
   });
 });
@@ -268,11 +368,13 @@ router.post("/videos/bg-replace/fix-face", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "targetVideoUrl and faceSourceUrl are required" });
   }
 
+  const demo = isDemoMode();
+
   const token = process.env.REPLICATE_API_TOKEN;
-  if (!token) return res.status(500).json({ error: "REPLICATE_API_TOKEN not set" });
+  if (!demo && !token) return res.status(500).json({ error: "REPLICATE_API_TOKEN not set" });
 
   const domain = getDomain();
-  if (!domain) return res.status(500).json({ error: "Could not determine public domain" });
+  if (!demo && !domain) return res.status(500).json({ error: "Could not determine public domain" });
 
   await mkdir(UPLOADS_DIR, { recursive: true });
   await mkdir(VIDEOS_DIR,  { recursive: true });
@@ -294,6 +396,52 @@ router.post("/videos/bg-replace/fix-face", requireAuth, async (req, res) => {
       error: "targetVideoUrl and faceSourceUrl must be app-relative paths under /api/uploads/ or /api/videos-files/",
     });
   }
+
+  // ---------------------------------------------------------------------
+  // DEMO MODE: skip the paid roop_face_swap and instead apply a small
+  // additional color tweak to the existing target so the user sees a
+  // visibly different "after fix-face" result without burning credits.
+  // ---------------------------------------------------------------------
+  if (demo) {
+    // Map the public URL back to its on-disk location. The express static
+    // mounts in app.ts rename `/api/videos-files` → `public/videos`, so we
+    // can't just strip `/api/`. We also strictly validate that the remainder
+    // is a single safe filename — no separators, no quotes, no shell chars —
+    // before passing it to ffmpeg.
+    const SAFE_BASENAME = /^[A-Za-z0-9._-]+$/;
+    const urlToDisk = (u: string): string | null => {
+      let rest: string;
+      let dir: string;
+      if (u.startsWith("/api/uploads/"))           { dir = UPLOADS_DIR; rest = u.slice("/api/uploads/".length); }
+      else if (u.startsWith("/api/videos-files/")) { dir = VIDEOS_DIR;  rest = u.slice("/api/videos-files/".length); }
+      else return null;
+      if (!SAFE_BASENAME.test(rest)) return null;
+      return path.join(dir, rest);
+    };
+    const targetLocal = urlToDisk(targetVideoUrl);
+    if (!targetLocal) {
+      return res.status(400).json({ error: "Could not resolve targetVideoUrl to a local file" });
+    }
+    const outPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
+    try {
+      await applyDemoEffect(targetLocal, outPath, "facelock pass", "facelock");
+    } catch (err: any) {
+      req.log.error({ err: err.message }, "bg-replace fix-face: demo render failed");
+      return res.status(500).json({ error: `Face-fix demo render failed: ${err.message}` });
+    }
+    try {
+      await makeThumbnail(outPath, path.join(THUMBS_DIR, `${jobId}.jpg`));
+    } catch (err: any) {
+      req.log.warn({ err: err.message }, "bg-replace fix-face: demo thumbnail failed");
+    }
+    return res.json({
+      videoUrl:     `/api/videos-files/${jobId}-out.mp4`,
+      thumbnailUrl: `/api/thumbs/${jobId}.jpg`,
+      demoMode:     true,
+      jobId,
+    });
+  }
+
   const targetAbs  = `https://${domain}${targetVideoUrl}`;
   const faceSrcAbs = `https://${domain}${faceSourceUrl}`;
 
@@ -353,6 +501,7 @@ router.post("/videos/bg-replace/fix-face", requireAuth, async (req, res) => {
   return res.json({
     videoUrl:     `/api/videos-files/${jobId}-out.mp4`,
     thumbnailUrl: `/api/thumbs/${jobId}.jpg`,
+    demoMode:     false,
     jobId,
   });
 });
