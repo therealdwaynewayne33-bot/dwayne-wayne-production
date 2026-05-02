@@ -17,6 +17,7 @@ export default function VideoDetailPage({ id }: { id: number }) {
   const [playing, setPlaying] = useState(false);
   const [trimStart, setTrimStart] = useState(0);
   const [trimEnd, setTrimEnd] = useState(100);
+  const [videoError, setVideoError] = useState(false);
   const [, setLocation] = useLocation();
   const videoRef = useRef<HTMLVideoElement>(null);
   const queryClient = useQueryClient();
@@ -112,17 +113,33 @@ export default function VideoDetailPage({ id }: { id: number }) {
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-2 space-y-4">
             <div className="relative rounded-xl overflow-hidden bg-black aspect-video border border-card-border">
-              {video.status === "completed" && video.videoUrl ? (
+              {video.status === "completed" && video.videoUrl && !videoError ? (
                 <video
                   ref={videoRef}
                   src={video.videoUrl}
                   className="w-full h-full object-cover"
                   onEnded={() => setPlaying(false)}
                   poster={video.thumbnailUrl ?? undefined}
+                  onError={(e) => { e.stopPropagation(); setVideoError(true); }}
                 />
               ) : (
                 <div className="absolute inset-0 flex flex-col items-center justify-center">
-                  {video.status === "processing" || video.status === "queued" ? (
+                  {videoError ? (
+                    <>
+                      <div className="w-16 h-16 rounded-full bg-primary/20 flex items-center justify-center mb-4">
+                        <Play className="w-8 h-8 text-primary" />
+                      </div>
+                      <p className="text-sm text-muted-foreground">Video preview unavailable</p>
+                      <a
+                        href={video.videoUrl ?? ""}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-xs text-primary underline mt-2 hover:text-primary/80"
+                      >
+                        Open video directly
+                      </a>
+                    </>
+                  ) : video.status === "processing" || video.status === "queued" ? (
                     <>
                       <div className="w-16 h-16 rounded-full bg-primary/20 flex items-center justify-center mb-4 glow-pulse">
                         <Sparkles className="w-8 h-8 text-primary" />
@@ -139,7 +156,7 @@ export default function VideoDetailPage({ id }: { id: number }) {
                   )}
                 </div>
               )}
-              {video.status === "completed" && video.videoUrl && (
+              {video.status === "completed" && video.videoUrl && !videoError && (
                 <button
                   data-testid="button-play-pause"
                   onClick={togglePlay}

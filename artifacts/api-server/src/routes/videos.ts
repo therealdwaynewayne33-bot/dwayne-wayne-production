@@ -27,7 +27,7 @@ function simulateProcessing(videoId: number) {
     setTimeout(async () => {
       await db.update(videosTable).set({
         status: "completed",
-        videoUrl: `https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4`,
+        videoUrl: `https://storage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4`,
         thumbnailUrl: `https://picsum.photos/seed/${videoId}/640/360`,
         duration: Math.round((15 + Math.random() * 45) * 10) / 10,
       }).where(eq(videosTable.id, videoId));
