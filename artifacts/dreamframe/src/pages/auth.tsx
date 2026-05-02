@@ -103,7 +103,7 @@ export default function AuthPage() {
         </div>
       </div>
 
-      <div className="w-full lg:w-[440px] flex items-center justify-center p-8 bg-card border-l border-border">
+      <div className="w-full lg:w-[440px] flex items-start justify-center p-8 pt-12 bg-card border-l border-border overflow-y-auto min-h-screen">
         <div className="w-full max-w-sm">
           <div className="flex items-center gap-2 mb-8 lg:hidden">
             <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center">
