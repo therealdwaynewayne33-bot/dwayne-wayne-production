@@ -244,47 +244,56 @@ router.post(
     //   - White-point matching is what real cinematographers do — it's true
     //     white balance, not crude colour shifting.
     //
+    //
+    //  STRATEGY:
+    //    1. AUTO WHITE BALANCE — force the target's brightest pixels (whites)
+    //       to be a true NEUTRAL grey (R=G=B). This is what real cameras do
+    //       and it ALWAYS produces clean white walls regardless of any
+    //       coloured cast in the reference photo.
+    //    2. EXPOSURE — lift brightness toward the reference if needed, but
+    //       never darken (we never want to dim user footage to match a dim ref).
+    //    3. The reference photo is used by GPT for the AI edit step but does
+    //       NOT propagate its colour cast into the colour correction. Most
+    //       reference photos have their own cast (fluorescent green, tungsten
+    //       yellow), so matching them blindly produces ugly tinted output.
+    //
     let sR = 1, sG = 1, sB = 1;
     let brightnessGain = 1;
     try {
       const [tR, tG, tB] = await whitePoint(targetFramePath);
-      const [rR, rG, rB] = await whitePoint(refFramePath);
-      // Wider clamp (0.55–1.55) lets us neutralise strong colour casts
-      // like warm sunlight bloom, which a 30% cap couldn't reach.
-      const clamp = (v: number) => Math.max(0.55, Math.min(1.55, v));
-      sR = clamp(rR / Math.max(1, tR));
-      sG = clamp(rG / Math.max(1, tG));
-      sB = clamp(rB / Math.max(1, tB));
+      // Neutralise: make brightest pixels true neutral grey. Compute the
+      // average luminance-target and scale each channel to match it.
+      const grayTarget = (tR + tG + tB) / 3;
+      const clamp = (v: number) => Math.max(0.55, Math.min(1.65, v));
+      sR = clamp(grayTarget / Math.max(1, tR));
+      sG = clamp(grayTarget / Math.max(1, tG));
+      sB = clamp(grayTarget / Math.max(1, tB));
 
-      // Brightness matching: if reference is brighter than target, lift exposure.
-      // We use ref/target luminance ratio, capped to avoid blown highlights.
+      // Brightness: lift toward reference if reference is brighter.
+      // Never go below 1.0 (gamma > 1 in ffmpeg's eq filter brightens).
       const tLum = await avgLuminance(targetFramePath);
       const rLum = await avgLuminance(refFramePath);
-      brightnessGain = Math.max(0.85, Math.min(1.35, rLum / Math.max(1, tLum)));
+      brightnessGain = Math.max(1.0, Math.min(1.40, rLum / Math.max(1, tLum)));
 
       req.log.info(
         {
           target_wp: [Math.round(tR), Math.round(tG), Math.round(tB)],
-          ref_wp:    [Math.round(rR), Math.round(rG), Math.round(rB)],
+          gray_target: Math.round(grayTarget),
           scale: { r: sR.toFixed(3), g: sG.toFixed(3), b: sB.toFixed(3) },
           target_lum: tLum.toFixed(1),
           ref_lum:    rLum.toFixed(1),
           brightnessGain: brightnessGain.toFixed(3),
         },
-        "v2v: white-balance + exposure"
+        "v2v: auto white-balance + brighten"
       );
     } catch (err: any) {
       req.log.warn({ err: err.message }, "v2v: whitePoint/luminance failed, falling back to identity");
     }
 
     // colorchannelmixer: per-channel multiplicative scaling = pure white balance.
-    // No additive shifts (which crush blacks) and no opacity (which limits effect).
     const wb_filter = `colorchannelmixer=rr=${sR}:gg=${sG}:bb=${sB}`;
-    // eq=gamma applies multiplicative brightness similar to camera exposure compensation.
-    // gamma=1.0 = no change; <1 = darker, >1 = brighter (but inverse-mapped, see below).
-    // Actually we use eq=brightness in an additive sense; safer is to apply gain via
-    // colorchannelmixer's diagonal already plus an additional eq=gamma step.
-    const exposure_filter = `eq=gamma=${brightnessGain.toFixed(3)}:contrast=1.04:saturation=1.08`;
+    // eq=gamma > 1 brightens midtones without blowing highlights.
+    const exposure_filter = `eq=gamma=${brightnessGain.toFixed(3)}:contrast=1.03:saturation=1.05`;
 
     const outputPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
     const ffmpegCmd = [
