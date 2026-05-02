@@ -88,6 +88,32 @@ function getDomain(): string | null {
   return process.env.REPLIT_DEV_DOMAIN ?? process.env.REPLIT_DOMAINS?.split(",")[0] ?? null;
 }
 
+/**
+ * Map raw Replicate SDK errors into something a non-technical user can act on.
+ * In particular, surface 402/insufficient-credit failures clearly so people
+ * know to top up their Replicate balance instead of seeing a JSON dump.
+ */
+function friendlyReplicateError(err: any): { status: number; message: string } {
+  const msg = String(err?.message ?? err ?? "Unknown error");
+  if (msg.includes("402") || /insufficient credit/i.test(msg)) {
+    return {
+      status: 402,
+      message:
+        "Your Replicate account is out of credit. Add funds at https://replicate.com/account/billing and try again in a few minutes.",
+    };
+  }
+  if (msg.includes("401") || /unauthor/i.test(msg)) {
+    return { status: 401, message: "Replicate API token is missing or invalid." };
+  }
+  if (msg.includes("E006") || /input was invalid/i.test(msg)) {
+    return {
+      status: 422,
+      message: "Luma rejected the video. Try a different clip — it must be ≤9s after trimming and contain real motion.",
+    };
+  }
+  return { status: 500, message: msg };
+}
+
 // ---------------------------------------------------------------------------
 // POST /api/videos/bg-replace
 //
@@ -159,7 +185,8 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     lumaUrl = resolveUrl(output);
   } catch (err: any) {
     req.log.error({ err: err.message }, "bg-replace: luma/modify-video failed");
-    return res.status(500).json({ error: `Luma video generation failed: ${err.message}` });
+    const f = friendlyReplicateError(err);
+    return res.status(f.status).json({ error: f.message });
   }
 
   // Save Luma render to /api/videos-files
@@ -306,7 +333,8 @@ router.post("/videos/bg-replace/fix-face", requireAuth, async (req, res) => {
     resultUrl = resolveUrl(output);
   } catch (err: any) {
     req.log.error({ err: err.message }, "bg-replace fix-face: roop_face_swap failed");
-    return res.status(500).json({ error: `Face lock failed: ${err.message}` });
+    const f = friendlyReplicateError(err);
+    return res.status(f.status).json({ error: `Face lock failed — ${f.message}` });
   }
 
   const outPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
