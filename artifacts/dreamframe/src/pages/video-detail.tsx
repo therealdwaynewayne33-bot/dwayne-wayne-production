@@ -1,11 +1,11 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { Link } from "wouter";
 import { useGetVideo, useApplyStyle, useDeleteVideo, getGetVideoQueryKey } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Button } from "@/components/ui/button";
-import { ArrowLeft, Play, Pause, Download, Trash2, Sparkles } from "lucide-react";
+import { ArrowLeft, Play, Trash2, Sparkles, ExternalLink } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
 import { useLocation } from "wouter";
@@ -14,12 +14,9 @@ type Style = "realistic" | "cartoon" | "animated-3d" | "cinematic";
 const STYLES: Style[] = ["realistic", "cartoon", "animated-3d", "cinematic"];
 
 export default function VideoDetailPage({ id }: { id: number }) {
-  const [playing, setPlaying] = useState(false);
   const [trimStart, setTrimStart] = useState(0);
   const [trimEnd, setTrimEnd] = useState(100);
-  const [videoError, setVideoError] = useState(false);
   const [, setLocation] = useLocation();
-  const videoRef = useRef<HTMLVideoElement>(null);
   const queryClient = useQueryClient();
   const { toast } = useToast();
 
@@ -53,16 +50,6 @@ export default function VideoDetailPage({ id }: { id: number }) {
         setLocation("/projects");
       },
     });
-  };
-
-  const togglePlay = () => {
-    if (!videoRef.current) return;
-    if (playing) {
-      videoRef.current.pause();
-    } else {
-      videoRef.current.play();
-    }
-    setPlaying(!playing);
   };
 
   if (isLoading) {
@@ -113,33 +100,37 @@ export default function VideoDetailPage({ id }: { id: number }) {
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-2 space-y-4">
             <div className="relative rounded-xl overflow-hidden bg-black aspect-video border border-card-border">
-              {video.status === "completed" && video.videoUrl && !videoError ? (
-                <video
-                  ref={videoRef}
-                  src={video.videoUrl}
-                  className="w-full h-full object-cover"
-                  onEnded={() => setPlaying(false)}
-                  poster={video.thumbnailUrl ?? undefined}
-                  onError={(e) => { e.stopPropagation(); setVideoError(true); }}
-                />
+              {video.status === "completed" && video.thumbnailUrl ? (
+                <>
+                  <img
+                    src={video.thumbnailUrl}
+                    alt={video.title}
+                    className="w-full h-full object-cover"
+                  />
+                  <div className="absolute inset-0 bg-black/30 flex items-center justify-center">
+                    <a
+                      data-testid="button-play-pause"
+                      href={video.videoUrl ?? "#"}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="w-16 h-16 rounded-full bg-white/90 hover:bg-white flex items-center justify-center shadow-2xl transition-all hover:scale-105"
+                    >
+                      <Play className="w-7 h-7 text-black ml-1" />
+                    </a>
+                  </div>
+                  <a
+                    data-testid="button-download"
+                    href={video.videoUrl ?? "#"}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="absolute bottom-4 right-4 flex items-center gap-1.5 px-3 py-2 rounded-lg bg-black/60 hover:bg-black/80 text-white text-xs font-medium transition-all"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" /> Open video
+                  </a>
+                </>
               ) : (
                 <div className="absolute inset-0 flex flex-col items-center justify-center">
-                  {videoError ? (
-                    <>
-                      <div className="w-16 h-16 rounded-full bg-primary/20 flex items-center justify-center mb-4">
-                        <Play className="w-8 h-8 text-primary" />
-                      </div>
-                      <p className="text-sm text-muted-foreground">Video preview unavailable</p>
-                      <a
-                        href={video.videoUrl ?? ""}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-xs text-primary underline mt-2 hover:text-primary/80"
-                      >
-                        Open video directly
-                      </a>
-                    </>
-                  ) : video.status === "processing" || video.status === "queued" ? (
+                  {video.status === "processing" || video.status === "queued" ? (
                     <>
                       <div className="w-16 h-16 rounded-full bg-primary/20 flex items-center justify-center mb-4 glow-pulse">
                         <Sparkles className="w-8 h-8 text-primary" />
@@ -155,27 +146,6 @@ export default function VideoDetailPage({ id }: { id: number }) {
                     <p className="text-sm text-muted-foreground">No preview available</p>
                   )}
                 </div>
-              )}
-              {video.status === "completed" && video.videoUrl && !videoError && (
-                <button
-                  data-testid="button-play-pause"
-                  onClick={togglePlay}
-                  className="absolute bottom-4 left-4 w-10 h-10 rounded-full bg-black/60 hover:bg-black/80 flex items-center justify-center text-white transition-all"
-                >
-                  {playing ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5 ml-0.5" />}
-                </button>
-              )}
-              {video.status === "completed" && video.videoUrl && (
-                <a
-                  data-testid="button-download"
-                  href={video.videoUrl}
-                  download
-                  target="_blank"
-                  rel="noreferrer"
-                  className="absolute bottom-4 right-4 flex items-center gap-1.5 px-3 py-2 rounded-lg bg-black/60 hover:bg-black/80 text-white text-xs font-medium transition-all"
-                >
-                  <Download className="w-3.5 h-3.5" /> Download
-                </a>
               )}
             </div>
 
