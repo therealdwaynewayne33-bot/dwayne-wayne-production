@@ -92,6 +92,19 @@ router.post(
       vidDuration = parseFloat(parts[2]) || 5;
     } catch { /* defaults */ }
 
+    // Cap output at 1080p to keep 4K-input encodes fast.
+    // Maintain aspect ratio, ensure even dimensions for libx264.
+    const MAX_DIM = 1920;
+    let outW = vidWidth, outH = vidHeight;
+    if (vidWidth > MAX_DIM || vidHeight > MAX_DIM) {
+      const scale = MAX_DIM / Math.max(vidWidth, vidHeight);
+      outW = Math.round(vidWidth  * scale / 2) * 2;
+      outH = Math.round(vidHeight * scale / 2) * 2;
+    } else {
+      outW = Math.round(vidWidth  / 2) * 2;
+      outH = Math.round(vidHeight / 2) * 2;
+    }
+
     // 3. Extract a mid-point frame from each video
     const targetFramePath = path.join(UPLOADS_DIR, `${jobId}-target-frame.png`);
     const refFramePath    = path.join(UPLOADS_DIR, `${jobId}-ref-frame.png`);
@@ -131,15 +144,20 @@ router.post(
       return res.status(500).json({ error: `AI transfer failed: ${err.message}` });
     }
 
-    // 5. Apply the edited frame's "look" across the whole target video.
+    // 5. Apply the edited frame's "look" across every target frame.
     //
-    //  Pipeline (single-pass FFmpeg):
-    //   - bg_amb = heavy blur of edited frame → carries its colour cast
-    //   - softlight blend that ambient onto every target frame at 50%
-    //     (higher than bg-replace because here the user explicitly wants the
-    //      reference to influence the target, not just match lighting)
-    //   - Mild contrast/saturation tweak unifies the look
-    //   - Light grain so the AI-derived cast doesn't look digital
+    //  KEY: we extract the AI-edited frame's AVERAGE COLOR (scale to 2x2,
+    //  then back up). This produces a true UNIFORM colour cast — every pixel
+    //  of "ambient" is the same colour, so the softlight blend cannot create
+    //  a vignette or shadow. (gblur, even at sigma=70, leaves spatial
+    //  structure that produces a dark patch in the centre of the frame.)
+    //
+    //  Pipeline:
+    //   - Downscale source to outW×outH (caps 4K at 1080p, keeps encoding fast)
+    //   - ambient = solid colour image at outW×outH coloured by AI frame avg
+    //   - softlight blend at 40% — colour cast applied without darkening
+    //   - Mild contrast + saturation amplifies the transferred look
+    //   - Tiny grain unifies the texture
     //
     const outputPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
     const ffmpegCmd = [
@@ -147,10 +165,10 @@ router.post(
       `-i "${targetPath}"`,
       `-loop 1 -i "${editedFramePath}"`,
       `-filter_complex`,
-      `"[1:v]scale=${vidWidth}:${vidHeight}:force_original_aspect_ratio=increase,crop=${vidWidth}:${vidHeight},gblur=sigma=70,format=yuv420p[ambient];` +
-      `[0:v]format=yuv420p[tgt];` +
-      `[tgt][ambient]blend=all_mode=softlight:all_opacity=0.50:shortest=1,` +
-      `eq=contrast=1.05:saturation=1.08,` +
+      `"[0:v]scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,format=yuv420p[tgt];` +
+      `[1:v]scale=2:2,scale=${outW}:${outH},format=yuv420p[ambient];` +
+      `[tgt][ambient]blend=all_mode=softlight:all_opacity=0.40:shortest=1,` +
+      `eq=contrast=1.05:saturation=1.10,` +
       `noise=alls=4:allf=t+u[out]"`,
       `-map "[out]" -map "0:a?"`,
       `-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p`,
