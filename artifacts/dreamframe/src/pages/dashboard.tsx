@@ -3,7 +3,6 @@ import { useGetDashboardSummary, useGetRecentActivity, useGetStyleBreakdown, get
 import { AppLayout } from "@/components/layout/AppLayout";
 import { useAuth } from "@/lib/auth";
 import { Plus, Video, FolderOpen, Users, TrendingUp, Clock, Zap, Crown } from "lucide-react";
-import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from "recharts";
 
 const STYLE_COLORS: Record<string, string> = {
   realistic: "#8b5cf6",
@@ -27,6 +26,28 @@ function timeAgo(dateStr: string) {
   const hrs = Math.floor(mins / 60);
   if (hrs < 24) return `${hrs}h ago`;
   return `${Math.floor(hrs / 24)}d ago`;
+}
+
+function StyleDonut({ data }: { data: { style: string; count: number }[] }) {
+  const total = data.reduce((sum, d) => sum + d.count, 0);
+  if (total === 0) return null;
+  let cumulative = 0;
+  const stops = data.map((d) => {
+    const pct = (d.count / total) * 100;
+    const color = STYLE_COLORS[d.style] ?? "#8b5cf6";
+    const stop = `${color} ${cumulative}% ${cumulative + pct}%`;
+    cumulative += pct;
+    return stop;
+  });
+  return (
+    <div className="relative w-24 h-24 mx-auto mb-3">
+      <div
+        className="w-full h-full rounded-full"
+        style={{ background: `conic-gradient(${stops.join(", ")})` }}
+      />
+      <div className="absolute inset-[28%] rounded-full bg-card" />
+    </div>
+  );
 }
 
 export default function DashboardPage() {
@@ -137,16 +158,7 @@ export default function DashboardPage() {
                 <p className="text-xs text-muted-foreground text-center py-4">Generate videos to see style stats</p>
               ) : (
                 <>
-                  <ResponsiveContainer width="100%" height={120}>
-                    <PieChart>
-                      <Pie data={styleBreakdown} cx="50%" cy="50%" innerRadius={35} outerRadius={55} paddingAngle={2} dataKey="count">
-                        {styleBreakdown.map((entry, index) => (
-                          <Cell key={index} fill={STYLE_COLORS[entry.style] ?? "#8b5cf6"} />
-                        ))}
-                      </Pie>
-                      <Tooltip formatter={(v, n) => [v, n]} contentStyle={{ background: "hsl(228 18% 10%)", border: "1px solid hsl(228 15% 18%)", borderRadius: 8 }} />
-                    </PieChart>
-                  </ResponsiveContainer>
+                  <StyleDonut data={styleBreakdown} />
                   <div className="space-y-1 mt-2">
                     {styleBreakdown.map((s) => (
                       <div key={s.style} className="flex items-center gap-2 text-xs">
