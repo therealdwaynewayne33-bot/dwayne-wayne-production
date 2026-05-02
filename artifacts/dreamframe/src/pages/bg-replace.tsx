@@ -4,7 +4,10 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
-import { Upload, Sparkles, Layers, Play, Pause, RotateCcw, Volume2, VolumeX, CheckCircle2, X } from "lucide-react";
+import {
+  Upload, Sparkles, Layers, Play, Pause, RotateCcw, Volume2, VolumeX,
+  CheckCircle2, X, ShieldCheck, Wand2,
+} from "lucide-react";
 
 function fmt(s: number) {
   return `${Math.floor(s / 60)}:${Math.floor(s % 60).toString().padStart(2, "0")}`;
@@ -74,25 +77,35 @@ function VideoPlayer({ src, thumbnail }: { src: string; thumbnail?: string }) {
 
 type Stage = "idle" | "processing" | "done" | "error";
 
+type BgResult = {
+  videoUrl: string;
+  thumbnailUrl?: string;
+  sourceUrl?: string;
+  lumaUrl?: string;
+  faceLocked?: boolean;
+};
+
 const PRESETS = [
-  { label: "White walls",     prompt: "White walls" },
-  { label: "Wooden floor",    prompt: "Wooden floor" },
-  { label: "Tropical beach",  prompt: "Replace the background with a tropical beach at sunset" },
-  { label: "Cyberpunk city",  prompt: "Replace the background with a neon-lit cyberpunk city at night" },
-  { label: "Studio backdrop", prompt: "Plain white studio backdrop, professional photography look" },
-  { label: "Dark walls",      prompt: "Dark charcoal walls" },
-  { label: "Brick wall",      prompt: "Exposed brick wall" },
-  { label: "Forest",          prompt: "Replace the background with a lush green forest" },
+  { label: "White walls",     prompt: "Replace the background with clean white studio walls, soft natural lighting" },
+  { label: "Wooden floor",    prompt: "Place the subject in a warm wooden-floor interior, soft daylight" },
+  { label: "Tropical beach",  prompt: "Place the subject on a tropical beach at sunset with palm trees and ocean behind" },
+  { label: "Cyberpunk city",  prompt: "Place the subject in a neon-lit cyberpunk city street at night, rain reflections" },
+  { label: "Studio backdrop", prompt: "Plain seamless white studio backdrop, professional photography lighting" },
+  { label: "Dark walls",      prompt: "Place the subject in a moody dark-charcoal interior with dramatic side lighting" },
+  { label: "Brick wall",      prompt: "Place the subject in front of an exposed red brick wall, warm tungsten lighting" },
+  { label: "Forest",          prompt: "Place the subject in a lush green forest with dappled sunlight through the canopy" },
 ];
 
 export default function BgReplacePage() {
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [bgPrompt, setBgPrompt] = useState("");
+  const [lockFace, setLockFace] = useState(true);
   const [stage, setStage] = useState<Stage>("idle");
-  const [result, setResult] = useState<{ videoUrl: string; thumbnailUrl?: string } | null>(null);
+  const [result, setResult] = useState<BgResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
+  const [fixing, setFixing] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
 
@@ -104,6 +117,7 @@ export default function BgReplacePage() {
 
   const handleFile = (f: File) => {
     if (!isVideoFile(f)) { toast({ title: "Please upload a video file (MP4, MOV, WebM…)", variant: "destructive" }); return; }
+    if (f.size > 100 * 1024 * 1024) { toast({ title: "Video must be under 100 MB (Luma limit)", variant: "destructive" }); return; }
     setFile(f);
     setPreviewUrl(URL.createObjectURL(f));
     setResult(null);
@@ -119,7 +133,7 @@ export default function BgReplacePage() {
 
   const handleSubmit = async () => {
     if (!file) { toast({ title: "Upload a video first", variant: "destructive" }); return; }
-    if (!bgPrompt.trim()) { toast({ title: "Enter a background description", variant: "destructive" }); return; }
+    if (!bgPrompt.trim()) { toast({ title: "Describe the new scene first", variant: "destructive" }); return; }
 
     setStage("processing");
     setError(null);
@@ -127,6 +141,7 @@ export default function BgReplacePage() {
     const form = new FormData();
     form.append("video", file);
     form.append("backgroundPrompt", bgPrompt.trim());
+    form.append("lockFace", String(lockFace));
 
     const token = localStorage.getItem("dreamframe_token");
     try {
@@ -146,21 +161,64 @@ export default function BgReplacePage() {
     }
   };
 
-  const reset = () => { setFile(null); setPreviewUrl(null); setResult(null); setError(null); setStage("idle"); };
+  const handleFixFace = async () => {
+    if (!result?.lumaUrl || !result?.sourceUrl) {
+      toast({ title: "Missing source video for face fix", variant: "destructive" });
+      return;
+    }
+    setFixing(true);
+    setError(null);
+    const token = localStorage.getItem("dreamframe_token");
+    try {
+      const resp = await fetch("/api/videos/bg-replace/fix-face", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        credentials: "include",
+        body: JSON.stringify({
+          // Always face-swap against the clean Luma render (not a previously-swapped one)
+          targetVideoUrl: result.lumaUrl,
+          faceSourceUrl:  result.sourceUrl,
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error ?? "Face fix failed");
+      setResult({
+        ...result,
+        videoUrl: data.videoUrl,
+        thumbnailUrl: data.thumbnailUrl,
+        faceLocked: true,
+      });
+      toast({ title: "Face locked back on", description: "Your original face is now stamped on the render." });
+    } catch (err: any) {
+      setError(err.message ?? "Face fix failed");
+    } finally {
+      setFixing(false);
+    }
+  };
+
+  const reset = () => {
+    setFile(null); setPreviewUrl(null); setResult(null); setError(null);
+    setStage("idle"); setBgPrompt("");
+  };
 
   return (
     <AppLayout>
       <div className="max-w-5xl mx-auto px-8 py-14">
         {/* Header */}
         <div className="mb-12">
-          <p className="text-xs text-white/30 uppercase tracking-widest mb-2">AI compositing</p>
+          <p className="text-xs text-white/30 uppercase tracking-widest mb-2">Luma Ray-2 · video to video</p>
           <h1 className="text-4xl font-semibold text-white tracking-tight">Background Replace</h1>
-          <p className="text-sm text-white/30 mt-2">Drop a video — AI removes the background and renders a new AI-generated scene behind it</p>
+          <p className="text-sm text-white/30 mt-2">
+            Drop a video — Luma re-renders the entire scene from your prompt while keeping the motion. Optional face-lock stamps your original face back on.
+          </p>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-10">
           {/* Left: inputs */}
-          <div className="space-y-8">
+          <div className="space-y-7">
             {/* Drop zone */}
             <div>
               <p className="text-[11px] text-white/30 uppercase tracking-widest mb-3">Your video</p>
@@ -192,7 +250,7 @@ export default function BgReplacePage() {
                     </div>
                     <div>
                       <p className="text-sm font-medium text-white/50">Drop your video here</p>
-                      <p className="text-xs text-white/20 mt-1">MP4, MOV, WebM · up to 200 MB</p>
+                      <p className="text-xs text-white/20 mt-1">MP4, MOV, WebM · up to 100 MB · max 30 seconds</p>
                     </div>
                     <button onClick={() => fileRef.current?.click()}
                       className="text-xs text-white/40 hover:text-white transition-colors font-medium">Browse file</button>
@@ -205,12 +263,14 @@ export default function BgReplacePage() {
 
             {/* Background prompt */}
             <div>
-              <p className="text-[11px] text-white/30 uppercase tracking-widest mb-3">What to change</p>
+              <p className="text-[11px] text-white/30 uppercase tracking-widest mb-3">Describe the new scene</p>
               <Input data-testid="input-bg-prompt"
-                placeholder='e.g. "White walls" or "Wooden floor" or "Tropical beach"'
+                placeholder='e.g. "Place the subject on a tropical beach at sunset"'
                 value={bgPrompt} onChange={(e) => setBgPrompt(e.target.value)}
                 className="bg-white/5 border-white/10 text-white placeholder:text-white/25 focus-visible:ring-white/20 mb-2" />
-              <p className="text-[11px] text-white/20 mb-3">AI sees your actual scene and changes only what you specify — everything else stays the same</p>
+              <p className="text-[11px] text-white/20 mb-3">
+                Luma re-renders the whole scene from this prompt while keeping your motion intact
+              </p>
               <div className="flex flex-wrap gap-2">
                 {PRESETS.map((p) => (
                   <button key={p.label} onClick={() => setBgPrompt(p.prompt)}
@@ -224,6 +284,35 @@ export default function BgReplacePage() {
               </div>
             </div>
 
+            {/* Lock my face toggle */}
+            <div className="rounded-2xl border border-white/8 bg-white/[0.02] p-4 flex items-start gap-4">
+              <button
+                data-testid="toggle-lock-face"
+                onClick={() => setLockFace(v => !v)}
+                role="switch"
+                aria-checked={lockFace}
+                className={cn(
+                  "relative w-10 h-6 rounded-full transition-colors shrink-0 mt-0.5",
+                  lockFace ? "bg-white" : "bg-white/15"
+                )}>
+                <span
+                  className={cn(
+                    "absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-black transition-transform",
+                    lockFace ? "translate-x-4" : "translate-x-0"
+                  )}
+                />
+              </button>
+              <div className="flex-1">
+                <div className="flex items-center gap-2 mb-1">
+                  <ShieldCheck className={cn("w-3.5 h-3.5", lockFace ? "text-white" : "text-white/30")} />
+                  <p className={cn("text-sm font-medium", lockFace ? "text-white" : "text-white/50")}>Lock my face</p>
+                </div>
+                <p className="text-[11px] text-white/30 leading-relaxed">
+                  After Luma re-renders the scene, we stamp your original face back on every frame so your character stays recognizable. Adds about a minute and a small extra cost — recommended for anything with people.
+                </p>
+              </div>
+            </div>
+
             {/* Submit */}
             <Button data-testid="button-replace-bg" onClick={handleSubmit}
               disabled={!file || !bgPrompt.trim() || stage === "processing"}
@@ -231,7 +320,7 @@ export default function BgReplacePage() {
               {stage === "processing" ? (
                 <>
                   <div className="w-4 h-4 rounded-full border-2 border-black/20 border-t-black animate-spin" />
-                  Processing...
+                  Rendering with Luma...
                 </>
               ) : (
                 <>
@@ -246,9 +335,8 @@ export default function BgReplacePage() {
                 <p className="text-xs font-semibold text-white/50 uppercase tracking-widest">Pipeline</p>
                 {[
                   "Uploading your video",
-                  "AI background removal",
-                  "Generating new background",
-                  "Compositing foreground + background",
+                  "Luma Ray-2 re-rendering scene",
+                  ...(lockFace ? ["Locking your face back on every frame"] : []),
                   "Encoding final video",
                 ].map((step, i) => (
                   <div key={step} className="flex items-center gap-3">
@@ -256,7 +344,9 @@ export default function BgReplacePage() {
                     <span className="text-xs text-white/40">{step}</span>
                   </div>
                 ))}
-                <p className="text-[11px] text-white/20 pt-1">Takes 2–4 minutes depending on video length</p>
+                <p className="text-[11px] text-white/20 pt-1">
+                  Takes about {lockFace ? "4–6" : "3–4"} minutes — Luma renders in the cloud
+                </p>
               </div>
             )}
 
@@ -271,11 +361,43 @@ export default function BgReplacePage() {
           <div>
             {stage === "done" && result ? (
               <div className="space-y-5">
-                <div className="flex items-center gap-2 text-sm font-medium text-white/60 mb-2">
-                  <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                  <span>Background replaced</span>
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-2 text-sm font-medium text-white/60">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                    <span>Scene re-rendered</span>
+                  </div>
+                  {result.faceLocked && (
+                    <div className="flex items-center gap-1.5 text-[11px] text-emerald-400/80 bg-emerald-400/5 px-2.5 py-1 rounded-full border border-emerald-400/15">
+                      <ShieldCheck className="w-3 h-3" />
+                      <span>Face locked</span>
+                    </div>
+                  )}
                 </div>
                 <VideoPlayer src={result.videoUrl} thumbnail={result.thumbnailUrl} />
+
+                {/* Fix face button */}
+                {result.lumaUrl && result.sourceUrl && (
+                  <Button
+                    data-testid="button-fix-face"
+                    onClick={handleFixFace}
+                    disabled={fixing}
+                    variant="outline"
+                    className="w-full border-white/10 text-white/70 hover:text-white hover:border-white/25 hover:bg-white/5 rounded-full gap-2"
+                  >
+                    {fixing ? (
+                      <>
+                        <div className="w-3.5 h-3.5 rounded-full border-2 border-white/20 border-t-white animate-spin" />
+                        Re-locking face...
+                      </>
+                    ) : (
+                      <>
+                        <Wand2 className="w-3.5 h-3.5" />
+                        {result.faceLocked ? "Re-run face lock" : "Fix face"}
+                      </>
+                    )}
+                  </Button>
+                )}
+
                 <a href={result.videoUrl} download className="block">
                   <Button variant="outline" className="w-full border-white/10 text-white/50 hover:text-white hover:border-white/25 hover:bg-white/5 rounded-full">
                     Download video
@@ -292,13 +414,13 @@ export default function BgReplacePage() {
                 </div>
                 <div>
                   <p className="text-sm font-medium text-white/25 mb-1">Result appears here</p>
-                  <p className="text-xs text-white/15">Upload a video and describe the background</p>
+                  <p className="text-xs text-white/15">Upload a video and describe the new scene</p>
                 </div>
                 <div className="text-[11px] text-white/15 space-y-1.5 text-left w-full max-w-xs">
                   <p className="text-white/25 font-medium mb-2">How it works</p>
-                  <p>1. AI removes background from every frame</p>
-                  <p>2. OpenAI generates your new background</p>
-                  <p>3. FFmpeg composites the final video</p>
+                  <p>1. Luma Ray-2 re-renders the entire scene from your prompt</p>
+                  <p>2. Your motion and framing are preserved</p>
+                  <p>3. Optional face lock stamps your original face back on</p>
                 </div>
               </div>
             )}

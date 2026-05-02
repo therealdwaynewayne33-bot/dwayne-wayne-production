@@ -2,12 +2,11 @@ import { Router } from "express";
 import multer from "multer";
 import path from "path";
 import { fileURLToPath } from "url";
-import { mkdir, writeFile, readFile } from "fs/promises";
+import { mkdir, writeFile } from "fs/promises";
 import { exec } from "child_process";
 import { promisify } from "util";
 import Replicate from "replicate";
 import { requireAuth } from "../middlewares/requireAuth";
-import { editImages } from "@workspace/integrations-openai-ai-server/image";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOADS_DIR = path.join(__dirname, "../public/uploads");
@@ -15,55 +14,14 @@ const VIDEOS_DIR  = path.join(__dirname, "../public/videos");
 const THUMBS_DIR  = path.join(__dirname, "../public/thumbs");
 const execAsync   = promisify(exec);
 
-/**
- * Read a downsampled PPM and return all pixels with luminance.
- * Used for cheap colour / brightness sampling of an image.
- */
-async function samplePixels(imagePath: string, size = 16) {
-  const ppmPath = `${imagePath}.${size}.ppm`;
-  await execAsync(`ffmpeg -y -i "${imagePath}" -vf scale=${size}:${size} -frames:v 1 "${ppmPath}"`);
-  const buf = await readFile(ppmPath);
-  let nl = 0, idx = 0;
-  while (nl < 3 && idx < buf.length) {
-    if (buf[idx] === 0x0a) nl++;
-    idx++;
-  }
-  const pixels: Array<{ r: number; g: number; b: number; lum: number }> = [];
-  for (let i = idx; i < buf.length; i += 3) {
-    const r = buf[i], g = buf[i + 1], b = buf[i + 2];
-    pixels.push({ r, g, b, lum: 0.299 * r + 0.587 * g + 0.114 * b });
-  }
-  return pixels;
-}
-
-async function avgLuminance(imagePath: string): Promise<number> {
-  const px = await samplePixels(imagePath, 16);
-  let s = 0;
-  for (const p of px) s += p.lum;
-  return s / px.length;
-}
-
-/**
- * Sample the average colour of the brightest 8% of pixels — these are
- * the "whites" of the image (walls, ceilings, paper, sky). Used to
- * white-balance the AI-generated background to true neutral white.
- */
-async function whitePoint(imagePath: string): Promise<[number, number, number]> {
-  const px = await samplePixels(imagePath, 32);
-  px.sort((a, b) => b.lum - a.lum);
-  const topN = Math.max(16, Math.floor(px.length * 0.08));
-  const top = px.slice(0, topN);
-  let sr = 0, sg = 0, sb = 0;
-  for (const p of top) { sr += p.r; sg += p.g; sb += p.b; }
-  return [sr / topN, sg / topN, sb / topN];
-}
-
 const router = Router();
 
 const VIDEO_EXTS = new Set([".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v", ".3gp"]);
+
+// luma/modify-video accepts up to 100 MB / 30 s source clips
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 200 * 1024 * 1024 },
+  limits: { fileSize: 100 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const ext = "." + (file.originalname.split(".").pop() ?? "").toLowerCase();
     if (file.mimetype.startsWith("video/") || VIDEO_EXTS.has(ext)) cb(null, true);
@@ -81,12 +39,51 @@ function resolveUrl(output: unknown): string {
   throw new Error("Unexpected output format from Replicate model");
 }
 
+async function makeThumbnail(videoPath: string, outPath: string) {
+  await execAsync(`ffmpeg -y -i "${videoPath}" -ss 0.5 -frames:v 1 -q:v 3 "${outPath}"`);
+}
+
+async function extractFaceFrame(videoOrImagePath: string, outPath: string) {
+  // Grab a frame ~0.5 s in (well past any black intro) for a clean face.
+  await execAsync(`ffmpeg -y -ss 0.5 -i "${videoOrImagePath}" -frames:v 1 -q:v 2 "${outPath}"`);
+}
+
+async function downloadToFile(url: string, filePath: string) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Failed to download ${url}: ${r.status}`);
+  await writeFile(filePath, Buffer.from(await r.arrayBuffer()));
+}
+
+function getDomain(): string | null {
+  return process.env.REPLIT_DEV_DOMAIN ?? process.env.REPLIT_DOMAINS?.split(",")[0] ?? null;
+}
+
+// ---------------------------------------------------------------------------
 // POST /api/videos/bg-replace
+//
+// Pipeline:
+//   1. Save uploaded video, expose a public URL
+//   2. Call luma/modify-video → re-renders the entire scene from the prompt
+//      while preserving motion (this is the same model behind Luma Dream
+//      Machine's "Modify" feature)
+//   3. If lockFace is true: extract a face frame from the source and run
+//      arabyai-replicate/roop_face_swap on the Luma output to stamp the
+//      original face back on (hard face lock)
+//   4. Generate a thumbnail and return URLs
+// ---------------------------------------------------------------------------
 router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No video file provided" });
 
-  const backgroundPrompt = (req.body?.backgroundPrompt as string | undefined)?.trim();
-  if (!backgroundPrompt) return res.status(400).json({ error: "backgroundPrompt is required" });
+  const prompt = (req.body?.backgroundPrompt as string | undefined)?.trim();
+  if (!prompt) return res.status(400).json({ error: "backgroundPrompt is required" });
+
+  const lockFace = String(req.body?.lockFace ?? "true").toLowerCase() === "true";
+
+  const token = process.env.REPLICATE_API_TOKEN;
+  if (!token) return res.status(500).json({ error: "REPLICATE_API_TOKEN not set" });
+
+  const domain = getDomain();
+  if (!domain) return res.status(500).json({ error: "Could not determine public domain" });
 
   const jobId = `bgr-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
@@ -94,200 +91,184 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
   await mkdir(VIDEOS_DIR,  { recursive: true });
   await mkdir(THUMBS_DIR,  { recursive: true });
 
-  // 1. Save original video
+  // 1. Save source video to disk and serve publicly so Replicate can fetch it
   const srcPath = path.join(UPLOADS_DIR, `${jobId}-src.mp4`);
   await writeFile(srcPath, req.file.buffer);
-
-  const domain = process.env.REPLIT_DEV_DOMAIN ?? process.env.REPLIT_DOMAINS?.split(",")[0];
-  if (!domain) return res.status(500).json({ error: "Could not determine public domain" });
-
-  const publicVideoUrl = `https://${domain}/api/uploads/${jobId}-src.mp4`;
-  const token = process.env.REPLICATE_API_TOKEN;
-  if (!token) return res.status(500).json({ error: "REPLICATE_API_TOKEN not set" });
+  const srcPublicUrl = `https://${domain}/api/uploads/${jobId}-src.mp4`;
 
   const replicate = new Replicate({ auth: token });
 
-  // 2. Run Robust Video Matting to get alpha mask
-  let alphaMaskUrl: string;
+  // 2. Luma video-to-video re-render
+  req.log.info({ jobId, prompt, lockFace }, "bg-replace: calling luma/modify-video");
+  let lumaUrl: string;
   try {
-    const output = await replicate.run(
-      "arielreplicate/robust_video_matting:73d2128a371922d5d1abf0712a1d974be0e4e2358cc1218e4e34714767232bac",
-      { input: { input_video: publicVideoUrl, output_type: "alpha-mask" } },
-    );
-    alphaMaskUrl = resolveUrl(output);
-  } catch (err: any) {
-    return res.status(500).json({ error: `Background removal failed: ${err.message}` });
-  }
-
-  // 3. Download alpha mask video
-  const maskPath = path.join(UPLOADS_DIR, `${jobId}-mask.mp4`);
-  const maskResp = await fetch(alphaMaskUrl);
-  if (!maskResp.ok) return res.status(500).json({ error: "Failed to download alpha mask" });
-  await writeFile(maskPath, Buffer.from(await maskResp.arrayBuffer()));
-
-  // 4. Get video dimensions + duration
-  let vidWidth = 1280, vidHeight = 720, vidDuration = 5;
-  try {
-    const { stdout } = await execAsync(
-      `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -show_entries format=duration -of csv=p=0 "${srcPath}"`
-    );
-    const parts = stdout.trim().split(/[\n,]/);
-    vidWidth    = parseInt(parts[0], 10) || 1280;
-    vidHeight   = parseInt(parts[1], 10) || 720;
-    vidDuration = parseFloat(parts[2]) || 5;
-  } catch { /* use defaults */ }
-
-  // 5. Extract TWO candidate context frames for GPT:
-  //    - Very first frame (0.1s): often has least subject overlap, best for bg context
-  //    - Near-last frame: fallback if first is too dark/transitional
-  //    We pass whichever gives GPT the clearest background.
-  const contextFramePath = path.join(UPLOADS_DIR, `${jobId}-context.png`);
-  try {
-    // Try first frame (0.1s) — before subject has fully entered the scene
-    await execAsync(
-      `ffmpeg -y -ss 0.1 -i "${srcPath}" -vframes 1 -q:v 2 "${contextFramePath}"`
-    );
-  } catch (err: any) {
-    return res.status(500).json({ error: `Frame extraction failed: ${err.message}` });
-  }
-
-  // 6. GPT-Image-1 targeted edit:
-  //    We give it the real scene frame and a strict instruction to ONLY change
-  //    what was asked — everything architectural (door frames, windows, built-ins)
-  //    must stay identical.
-  const bgPath = path.join(UPLOADS_DIR, `${jobId}-bg.png`);
-  try {
-    const editInstruction =
-      `You are editing the BACKGROUND ONLY of this real interior photograph. ` +
-      `Make ONLY this change: "${backgroundPrompt}". ` +
-      `Treat this like a real-world repaint or redecoration job — NOT a stylised render. ` +
-      `ABSOLUTE RULES: ` +
-      `(1) If the change is a colour (e.g. "white walls", "blue walls"), use REAL MATTE INTERIOR PAINT — low saturation, realistic flat finish, like Dulux/Benjamin Moore wall paint. NEVER use vivid, glossy, or over-saturated colour. ` +
-      `(2) NEVER touch door frames, doorways, windows, archways, skirting boards, stairs or any architectural structure — these are FIXED. ` +
-      `(3) NEVER change the floor, ceiling, or any surface not mentioned. ` +
-      `(4) NEVER add or remove furniture, objects, or decorations unless explicitly requested. ` +
-      `(5) Keep the EXACT same camera angle, perspective, lighting direction, shadows, and colour temperature of the original photo. ` +
-      `(6) If any people appear, remove them naturally — inpaint the background behind where they stood. ` +
-      `(7) Output must look like a normal real-life photo of the same room with one realistic change applied — same exposure, same warmth, same noise level as the input. ` +
-      `(8) Change ONLY the specific surface or element named. Nothing else.`;
-
-    const bgBuffer = await editImages([contextFramePath], editInstruction);
-    await writeFile(bgPath, bgBuffer);
-  } catch (err: any) {
-    return res.status(500).json({ error: `Background editing failed: ${err.message}` });
-  }
-
-  // 7. EXPOSURE + WHITE-BALANCE MATCHING.
-  //    (a) Sample brightness of bg vs source so we can lift the subject
-  //        toward the new environment's exposure level. Without this, a
-  //        dark-lit subject pasted on a bright wall looks like a silhouette.
-  //    (b) Sample the bg's white point and compute neutralisation scales so
-  //        the walls/ceiling come out as TRUE WHITE PAINT, not cream/yellow/
-  //        green. The AI image gen often produces slightly tinted whites.
-  let subjectBrightness = 1.0;     // gamma multiplier for subject (>1 brightens)
-  let ambientOpacity   = 0.30;     // softlight strength of bg colour onto subject
-  let bgWbR = 1.0, bgWbG = 1.0, bgWbB = 1.0;  // bg white-balance scales
-  try {
-    // Sample mid-frame of source video for subject exposure estimate.
-    const srcMidFrame = path.join(UPLOADS_DIR, `${jobId}-srcmid.png`);
-    await execAsync(
-      `ffmpeg -y -ss ${(vidDuration / 2).toFixed(2)} -i "${srcPath}" -vframes 1 -q:v 2 "${srcMidFrame}"`
-    );
-    const srcLum = await avgLuminance(srcMidFrame);
-    const bgLum  = await avgLuminance(bgPath);
-    const ratio  = bgLum / Math.max(1, srcLum);
-    subjectBrightness = Math.max(1.0, Math.min(1.55, Math.pow(ratio, 0.85)));
-    ambientOpacity    = ratio > 1.4 ? 0.40 : 0.30;
-
-    // Auto white-balance the AI background — force its brightest pixels
-    // (the walls) to be true neutral grey/white. This gives "real paint"
-    // walls regardless of any tint in the AI output.
-    const [bR, bG, bB] = await whitePoint(bgPath);
-    const grayTarget = (bR + bG + bB) / 3;
-    const clamp = (v: number) => Math.max(0.7, Math.min(1.5, v));
-    bgWbR = clamp(grayTarget / Math.max(1, bR));
-    bgWbG = clamp(grayTarget / Math.max(1, bG));
-    bgWbB = clamp(grayTarget / Math.max(1, bB));
-
-    req.log.info(
-      {
-        srcLum: srcLum.toFixed(1),
-        bgLum:  bgLum.toFixed(1),
-        ratio:  ratio.toFixed(3),
-        subjectBrightness: subjectBrightness.toFixed(3),
-        ambientOpacity,
-        bg_wp:    [Math.round(bR), Math.round(bG), Math.round(bB)],
-        bg_scale: { r: bgWbR.toFixed(3), g: bgWbG.toFixed(3), b: bgWbB.toFixed(3) },
+    const output = await replicate.run("luma/modify-video", {
+      input: {
+        video: srcPublicUrl,
+        prompt,
+        // flex_1 keeps recognizable elements (pose, framing, motion) while
+        // allowing meaningful stylistic / background change. lockFace will
+        // stamp the original face back on after rendering.
+        mode: "flex_1",
       },
-      "bg-replace: exposure + white-balance"
-    );
+    });
+    lumaUrl = resolveUrl(output);
   } catch (err: any) {
-    req.log.warn({ err: err.message }, "bg-replace: exposure/wb sampling failed, using defaults");
+    req.log.error({ err: err.message }, "bg-replace: luma/modify-video failed");
+    return res.status(500).json({ error: `Luma video generation failed: ${err.message}` });
   }
 
-  // 8. FFmpeg composite — environmental colour-bake pipeline.
-  //
-  //  PROBLEM SOLVED: "green screen look" — character looks pasted on because
-  //  their lighting / colour temperature doesn't match the new background.
-  //
-  //  PIPELINE:
-  //   1. bg_main         — light DOF blur (sigma=2) so subject pops vs bg.
-  //   2. bg_ambient      — heavy blur (sigma=80) of bg → averages to bg colour.
-  //   3. mask_soft       — sigma=2.5 mask blur (softer edges = no halo).
-  //   4. src_lit         — eq=gamma lift on the source so subject brightness
-  //                        matches the new environment's exposure level.
-  //   5. src_tinted      — softlight bg_ambient over src_lit at ~30–40% so
-  //                        skin/clothes pick up the new room's colour cast.
-  //   6. alphamerge      — cut tinted+lit subject out with feathered mask.
-  //   7. overlay         — composite onto bg_main.
-  //   8. NO final whole-frame tint — that was greening the walls. Just a
-  //      tiny contrast/grain pass to unify the layers.
-  //
-  const outputPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
-  const ffmpegCmd = [
-    `ffmpeg -y`,
-    `-i "${srcPath}"`,
-    `-i "${maskPath}"`,
-    `-loop 1 -i "${bgPath}"`,
-    `-filter_complex`,
-    `"[2:v]scale=${vidWidth}:${vidHeight}:force_original_aspect_ratio=increase,crop=${vidWidth}:${vidHeight},` +
-    // Force walls to TRUE WHITE PAINT — neutralise any colour tint in the AI bg.
-    `colorchannelmixer=rr=${bgWbR.toFixed(3)}:gg=${bgWbG.toFixed(3)}:bb=${bgWbB.toFixed(3)}[bg_clean];` +
-    `[bg_clean]split=2[bg_for_dof][bg_for_amb];` +
-    `[bg_for_dof]gblur=sigma=2,format=yuv420p[bg_main];` +
-    `[bg_for_amb]gblur=sigma=80,format=yuv420p[bg_ambient];` +
-    `[1:v]format=gray,gblur=sigma=2.5[mask_soft];` +
-    // Lift subject brightness FIRST so dark subjects don't look like silhouettes
-    // when placed on bright walls.
-    `[0:v]eq=gamma=${subjectBrightness.toFixed(3)}:contrast=1.02[src_lit];` +
-    // Bake bg's colour cast INTO the subject before cutting it out.
-    `[src_lit][bg_ambient]blend=all_mode=softlight:all_opacity=${ambientOpacity.toFixed(2)}:shortest=1,format=yuva420p[src_tinted];` +
-    `[src_tinted][mask_soft]alphamerge[fg];` +
-    `[bg_main][fg]overlay=shortest=1,` +
-    `eq=contrast=1.02:saturation=1.02,` +
-    `noise=alls=3:allf=t+u[out]"`,
-    `-map "[out]" -map "0:a?"`,
-    `-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p`,
-    `-c:a copy`,
-    `-movflags +faststart`,
-    `"${outputPath}"`,
-  ].join(" ");
-
+  // Save Luma render to /api/videos-files
+  const lumaPath = path.join(VIDEOS_DIR, `${jobId}-luma.mp4`);
   try {
-    await execAsync(ffmpegCmd);
+    await downloadToFile(lumaUrl, lumaPath);
   } catch (err: any) {
-    return res.status(500).json({ error: `Video compositing failed: ${err.message}` });
+    return res.status(500).json({ error: `Failed to download Luma output: ${err.message}` });
   }
 
-  // 8. Thumbnail
-  const thumbPath = path.join(THUMBS_DIR, `${jobId}-thumb.png`);
+  let finalRelative = `${jobId}-luma.mp4`;
+  let finalPath = lumaPath;
+  let faceLocked = false;
+
+  // 3. Optional: face lock via Roop video face-swap
+  if (lockFace) {
+    try {
+      const facePath = path.join(UPLOADS_DIR, `${jobId}-face.jpg`);
+      await extractFaceFrame(srcPath, facePath);
+
+      const facePublicUrl = `https://${domain}/api/uploads/${jobId}-face.jpg`;
+      const lumaPublicUrl = `https://${domain}/api/videos-files/${jobId}-luma.mp4`;
+
+      req.log.info({ jobId }, "bg-replace: locking face via roop_face_swap");
+      const swapOut = await replicate.run("arabyai-replicate/roop_face_swap", {
+        input: {
+          swap_image:   facePublicUrl,
+          target_video: lumaPublicUrl,
+        },
+      });
+      const swapUrl = resolveUrl(swapOut);
+
+      const outPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
+      await downloadToFile(swapUrl, outPath);
+      finalPath = outPath;
+      finalRelative = `${jobId}-out.mp4`;
+      faceLocked = true;
+    } catch (err: any) {
+      // Don't fail the whole job — return the Luma render and let the user
+      // hit the "Fix face" button on the result if they want to retry.
+      req.log.warn({ err: err.message }, "bg-replace: face lock failed; returning Luma render unmodified");
+    }
+  }
+
+  // 4. Thumbnail
   try {
-    await execAsync(`ffmpeg -y -i "${outputPath}" -vframes 1 -q:v 2 "${thumbPath}"`);
-  } catch { /* optional */ }
+    await makeThumbnail(finalPath, path.join(THUMBS_DIR, `${jobId}.jpg`));
+  } catch (err: any) {
+    req.log.warn({ err: err.message }, "bg-replace: thumbnail generation failed");
+  }
+
+  return res.json({
+    videoUrl:     `/api/videos-files/${finalRelative}`,
+    thumbnailUrl: `/api/thumbs/${jobId}.jpg`,
+    // URLs the client can pass back to /fix-face to re-run only the face step
+    sourceUrl:    `/api/uploads/${jobId}-src.mp4`,
+    lumaUrl:      `/api/videos-files/${jobId}-luma.mp4`,
+    faceLocked,
+    jobId,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/videos/bg-replace/fix-face
+//
+// Re-runs ONLY the face-swap step against an already-rendered video, using
+// the original source video as the face reference. Cheap (~$0.10) and fast
+// (~1–2 min) compared to a full re-render.
+//
+// Body: { targetVideoUrl, faceSourceUrl }
+// ---------------------------------------------------------------------------
+router.post("/videos/bg-replace/fix-face", requireAuth, async (req, res) => {
+  const { targetVideoUrl, faceSourceUrl } = req.body as {
+    targetVideoUrl?: string;
+    faceSourceUrl?:  string;
+  };
+
+  if (!targetVideoUrl || !faceSourceUrl) {
+    return res.status(400).json({ error: "targetVideoUrl and faceSourceUrl are required" });
+  }
+
+  const token = process.env.REPLICATE_API_TOKEN;
+  if (!token) return res.status(500).json({ error: "REPLICATE_API_TOKEN not set" });
+
+  const domain = getDomain();
+  if (!domain) return res.status(500).json({ error: "Could not determine public domain" });
+
+  await mkdir(UPLOADS_DIR, { recursive: true });
+  await mkdir(VIDEOS_DIR,  { recursive: true });
+  await mkdir(THUMBS_DIR,  { recursive: true });
+
+  const jobId = `bgr-fix-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+  // Allow either absolute or app-relative URLs from the client
+  const toAbs = (u: string) => (u.startsWith("http") ? u : `https://${domain}${u}`);
+  const targetAbs  = toAbs(targetVideoUrl);
+  const faceSrcAbs = toAbs(faceSourceUrl);
+
+  // Download the face source (could be a video or an image) so we can extract
+  // a single clean face frame from it locally.
+  let faceSrcExt = ".mp4";
+  try {
+    faceSrcExt = path.extname(new URL(faceSrcAbs).pathname).toLowerCase() || ".mp4";
+  } catch { /* keep default */ }
+  const faceSrcPath = path.join(UPLOADS_DIR, `${jobId}-facesrc${faceSrcExt}`);
+
+  try {
+    await downloadToFile(faceSrcAbs, faceSrcPath);
+  } catch (err: any) {
+    return res.status(500).json({ error: `Failed to download face source: ${err.message}` });
+  }
+
+  const facePath = path.join(UPLOADS_DIR, `${jobId}-face.jpg`);
+  try {
+    await extractFaceFrame(faceSrcPath, facePath);
+  } catch (err: any) {
+    return res.status(500).json({ error: `Failed to extract face frame: ${err.message}` });
+  }
+  const facePublicUrl = `https://${domain}/api/uploads/${jobId}-face.jpg`;
+
+  const replicate = new Replicate({ auth: token });
+
+  req.log.info({ jobId, targetAbs }, "bg-replace fix-face: running roop_face_swap");
+  let resultUrl: string;
+  try {
+    const output = await replicate.run("arabyai-replicate/roop_face_swap", {
+      input: {
+        swap_image:   facePublicUrl,
+        target_video: targetAbs,
+      },
+    });
+    resultUrl = resolveUrl(output);
+  } catch (err: any) {
+    req.log.error({ err: err.message }, "bg-replace fix-face: roop_face_swap failed");
+    return res.status(500).json({ error: `Face lock failed: ${err.message}` });
+  }
+
+  const outPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
+  try {
+    await downloadToFile(resultUrl, outPath);
+  } catch (err: any) {
+    return res.status(500).json({ error: `Failed to download face-swap result: ${err.message}` });
+  }
+
+  try {
+    await makeThumbnail(outPath, path.join(THUMBS_DIR, `${jobId}.jpg`));
+  } catch (err: any) {
+    req.log.warn({ err: err.message }, "bg-replace fix-face: thumbnail generation failed");
+  }
 
   return res.json({
     videoUrl:     `/api/videos-files/${jobId}-out.mp4`,
-    thumbnailUrl: `/api/thumbs/${jobId}-thumb.png`,
+    thumbnailUrl: `/api/thumbs/${jobId}.jpg`,
     jobId,
   });
 });
