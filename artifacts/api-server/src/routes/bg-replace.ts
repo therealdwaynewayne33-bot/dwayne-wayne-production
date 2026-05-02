@@ -107,17 +107,21 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     return res.status(500).json({ error: `Frame extraction failed: ${err.message}` });
   }
 
-  // 6. Use GPT-Image-1 edit (inpainting-style) to change ONLY what was specified
-  //    The model sees the actual room/scene and applies a targeted edit, preserving
-  //    everything else (furniture, lighting, floor, objects, etc.)
+  // 6. Use GPT-Image-1 to make a targeted edit to the real background frame
+  //    The model sees the actual scene — camera angle, lighting, proportions — so it
+  //    only changes what was specified and keeps everything else identical.
   const bgPath = path.join(UPLOADS_DIR, `${jobId}-bg.png`);
   try {
     const editInstruction =
-      `You are editing the BACKGROUND of this video frame. ` +
-      `Apply this change to the background only: "${backgroundPrompt}". ` +
-      `IMPORTANT: Change ONLY what was specified. Keep all other elements exactly the same — ` +
-      `same room layout, same furniture, same floor, same objects, same lighting direction. ` +
-      `Remove any people or subjects from the result — output background only, no people.`;
+      `Edit the BACKGROUND of this scene. Change only: "${backgroundPrompt}". ` +
+      `Strict rules for realism: ` +
+      `(1) Keep the EXACT same camera angle, perspective and lens distortion. ` +
+      `(2) Keep the EXACT same lighting direction, colour temperature and shadow positions. ` +
+      `(3) Keep every unchanged surface, object and furniture piece pixel-perfect. ` +
+      `(4) Make the result look like a real photograph — same sensor noise level, ` +
+      `same depth of field, same sharpness falloff as the original. ` +
+      `(5) Remove all people — return only the background, no subjects. ` +
+      `(6) Do NOT add or remove any objects unless that was specifically requested.`;
 
     const bgBuffer = await editImages([contextFramePath], editInstruction);
     await writeFile(bgPath, bgBuffer);
@@ -125,7 +129,14 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     return res.status(500).json({ error: `Background editing failed: ${err.message}` });
   }
 
-  // 7. FFmpeg: alphamerge original onto AI-edited background + cinematic grade
+  // 7. FFmpeg composite — realism pipeline:
+  //
+  //  • Mask feathering  (gblur sigma=3) — soft edges instead of hard cutout
+  //  • Background DOF   (gblur sigma=3) — slight blur puts bg visually behind subject
+  //  • Film grain       (noise alls=8)  — both layers share same grain texture so
+  //                                       they feel like they came from the same camera
+  //  • Cinematic grade  (curves + colorchannelmixer + vignette)
+  //
   const outputPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
   const ffmpegCmd = [
     `ffmpeg -y`,
@@ -133,15 +144,16 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     `-i "${maskPath}"`,
     `-loop 1 -i "${bgPath}"`,
     `-filter_complex`,
-    `"[2:v]scale=${vidWidth}:${vidHeight}:force_original_aspect_ratio=increase,crop=${vidWidth}:${vidHeight}[bg];` +
+    `"[2:v]scale=${vidWidth}:${vidHeight}:force_original_aspect_ratio=increase,crop=${vidWidth}:${vidHeight},gblur=sigma=3[bg_dof];` +
+    `[1:v]format=gray,gblur=sigma=3[mask_soft];` +
     `[0:v]format=yuva420p[src_rgba];` +
-    `[1:v]format=gray[mask];` +
-    `[src_rgba][mask]alphamerge[fg];` +
-    `[bg][fg]overlay=shortest=1[comp];` +
+    `[src_rgba][mask_soft]alphamerge[fg];` +
+    `[bg_dof][fg]overlay=shortest=1[comp];` +
     `[comp]eq=contrast=1.08:brightness=0.0:saturation=0.82,` +
     `curves=all='0/0.05 0.25/0.27 0.75/0.78 1/0.96',` +
     `colorchannelmixer=rr=1.0:rg=0.01:rb=-0.03:gr=-0.01:gg=0.95:gb=0.06:br=-0.07:bg=0.07:bb=1.0,` +
-    `vignette=PI/5[out]"`,
+    `vignette=PI/5,` +
+    `noise=alls=8:allf=t+u[out]"`,
     `-map "[out]" -map "0:a?"`,
     `-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p`,
     `-c:a copy`,
