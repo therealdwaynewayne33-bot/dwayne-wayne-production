@@ -44,42 +44,55 @@ async function generateThumbnail(videoId: number, prompt: string): Promise<strin
   }
 }
 
-// Generate real video using Replicate minimax/video-01
+// Resolve Replicate output to a URL string
+function resolveReplicateUrl(output: unknown): string {
+  if (typeof output === "string") return output;
+  if (output && typeof (output as any).url === "function") return (output as any).url().href;
+  if (Array.isArray(output) && output.length > 0) {
+    const item = output[0];
+    return typeof item === "string" ? item : item.url().href;
+  }
+  throw new Error("Unexpected Replicate output format");
+}
+
+// Generate real video using AI
+// • Default model: wavespeedai/wan-2.1-t2v-720p  — high quality, sharp faces, great motion
+// • Face-lock fallback: minimax/video-01          — supports first_frame_image reference
 async function generateVideo(videoId: number, prompt: string, characterImageUrl?: string): Promise<{ videoUrl: string; duration: number }> {
   const token = process.env.REPLICATE_API_TOKEN;
   if (!token) throw new Error("REPLICATE_API_TOKEN not set");
 
   const replicate = new Replicate({ auth: token });
 
-  // Build input — if character face lock is enabled, pass image as first frame
-  const input: Record<string, unknown> = { prompt, prompt_optimizer: true };
+  let output: unknown;
+
   if (characterImageUrl) {
-    input.first_frame_image = characterImageUrl;
-  }
-
-  // Use minimax/video-01 — 6s video, good motion quality
-  const output = await replicate.run("minimax/video-01", { input }) as unknown;
-
-  // output is a ReadableStream or URL string depending on SDK version
-  let videoUrl: string;
-  if (typeof output === "string") {
-    videoUrl = output;
-  } else if (output && typeof (output as any).url === "function") {
-    videoUrl = (output as any).url().href;
-  } else if (Array.isArray(output) && output.length > 0) {
-    const item = output[0];
-    videoUrl = typeof item === "string" ? item : item.url().href;
+    // Face-lock: use minimax which supports first_frame_image
+    output = await replicate.run("minimax/video-01", {
+      input: { prompt, prompt_optimizer: true, first_frame_image: characterImageUrl },
+    });
   } else {
-    throw new Error("Unexpected Replicate output format");
+    // Default: Wan 2.1 — sharper 720p, better face rendering, more natural motion
+    output = await replicate.run("wavespeedai/wan-2.1-t2v-720p", {
+      input: {
+        prompt,
+        aspect_ratio: "16:9",
+        fast_mode: "Balanced",
+        sample_steps: 30,
+        negative_prompt: "blur, low quality, distorted face, watermark, text",
+        disable_safety_checker: false,
+      },
+    });
   }
 
-  // Download and serve locally so the URL works reliably
+  const remoteUrl = resolveReplicateUrl(output);
+
+  // Download and serve locally so the URL stays valid
   await mkdir(VIDEOS_DIR, { recursive: true });
-  const videoResp = await fetch(videoUrl);
+  const videoResp = await fetch(remoteUrl);
   if (!videoResp.ok) throw new Error(`Failed to fetch video: ${videoResp.status}`);
   const buf = Buffer.from(await videoResp.arrayBuffer());
-  const localPath = path.join(VIDEOS_DIR, `${videoId}.mp4`);
-  await writeFile(localPath, buf);
+  await writeFile(path.join(VIDEOS_DIR, `${videoId}.mp4`), buf);
 
   return { videoUrl: `/api/videos-files/${videoId}.mp4`, duration: 6 };
 }
