@@ -7,7 +7,7 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import Replicate from "replicate";
 import { requireAuth } from "../middlewares/requireAuth";
-import { generateImageBuffer } from "@workspace/integrations-openai-ai-server/image";
+import { editImages } from "@workspace/integrations-openai-ai-server/image";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOADS_DIR = path.join(__dirname, "../public/uploads");
@@ -51,7 +51,7 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
   await mkdir(VIDEOS_DIR,  { recursive: true });
   await mkdir(THUMBS_DIR,  { recursive: true });
 
-  // 1. Save original video — we need it for the final composite
+  // 1. Save original video
   const srcPath = path.join(UPLOADS_DIR, `${jobId}-src.mp4`);
   await writeFile(srcPath, req.file.buffer);
 
@@ -59,15 +59,12 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
   if (!domain) return res.status(500).json({ error: "Could not determine public domain" });
 
   const publicVideoUrl = `https://${domain}/api/uploads/${jobId}-src.mp4`;
-
   const token = process.env.REPLICATE_API_TOKEN;
   if (!token) return res.status(500).json({ error: "REPLICATE_API_TOKEN not set" });
 
   const replicate = new Replicate({ auth: token });
 
-  // 2. Get alpha-mask from Robust Video Matting
-  //    White = character (keep), Black = background (remove)
-  //    This avoids chromakey color-spill that was turning her into a shadow
+  // 2. Run Robust Video Matting to get alpha mask
   let alphaMaskUrl: string;
   try {
     const output = await replicate.run(
@@ -79,48 +76,56 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     return res.status(500).json({ error: `Background removal failed: ${err.message}` });
   }
 
-  // 3. Download the alpha mask video
+  // 3. Download alpha mask video
   const maskPath = path.join(UPLOADS_DIR, `${jobId}-mask.mp4`);
   const maskResp = await fetch(alphaMaskUrl);
   if (!maskResp.ok) return res.status(500).json({ error: "Failed to download alpha mask" });
   await writeFile(maskPath, Buffer.from(await maskResp.arrayBuffer()));
 
-  // 4. Get original video dimensions
-  let vidWidth = 1280, vidHeight = 720;
+  // 4. Get video dimensions + duration
+  let vidWidth = 1280, vidHeight = 720, vidDuration = 5;
   try {
     const { stdout } = await execAsync(
-      `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "${srcPath}"`
+      `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -show_entries format=duration -of csv=p=0 "${srcPath}"`
     );
-    const parts = stdout.trim().split(",");
-    if (parts.length === 2) {
-      vidWidth  = parseInt(parts[0], 10) || 1280;
-      vidHeight = parseInt(parts[1], 10) || 720;
-    }
+    const parts = stdout.trim().split(/[\n,]/);
+    vidWidth    = parseInt(parts[0], 10) || 1280;
+    vidHeight   = parseInt(parts[1], 10) || 720;
+    vidDuration = parseFloat(parts[2]) || 5;
   } catch { /* use defaults */ }
 
-  // 5. Generate new AI background image
-  const bgPath = path.join(UPLOADS_DIR, `${jobId}-bg.png`);
+  // 5. Extract a mid-point frame from the source video for background context
+  //    This gives GPT-Image-1 the actual scene so it can make targeted edits
+  //    (e.g. "white walls" only changes the walls, not the whole room)
+  const contextFramePath = path.join(UPLOADS_DIR, `${jobId}-context.png`);
+  const midSec = (vidDuration / 2).toFixed(2);
   try {
-    const bgBuffer = await generateImageBuffer(
-      `${backgroundPrompt}. Cinematic, high quality background scene, no people, wide shot.`,
-      "1536x1024"
+    await execAsync(
+      `ffmpeg -y -ss ${midSec} -i "${srcPath}" -vframes 1 -q:v 2 "${contextFramePath}"`
     );
-    await writeFile(bgPath, bgBuffer);
   } catch (err: any) {
-    return res.status(500).json({ error: `Background generation failed: ${err.message}` });
+    return res.status(500).json({ error: `Frame extraction failed: ${err.message}` });
   }
 
-  // 6. FFmpeg composite using alphamerge (no chromakey — preserves real colors)
-  //
-  //   Pipeline:
-  //     [bg image]   → looped + scaled to video size                  → [bg]
-  //     [original]   → format yuva420p (adds alpha channel slot)      → [src_rgba]
-  //     [src_rgba] + [alpha-mask] → alphamerge (mask drives alpha)    → [fg]
-  //     [bg] + [fg]  → overlay (shortest=src video)                   → [out]
-  //
-  //   Key fix: -loop 1 on the PNG so it repeats for the full video duration
-  //   instead of stopping after frame 1 (which produced a 0:00 output).
-  //
+  // 6. Use GPT-Image-1 edit (inpainting-style) to change ONLY what was specified
+  //    The model sees the actual room/scene and applies a targeted edit, preserving
+  //    everything else (furniture, lighting, floor, objects, etc.)
+  const bgPath = path.join(UPLOADS_DIR, `${jobId}-bg.png`);
+  try {
+    const editInstruction =
+      `You are editing the BACKGROUND of this video frame. ` +
+      `Apply this change to the background only: "${backgroundPrompt}". ` +
+      `IMPORTANT: Change ONLY what was specified. Keep all other elements exactly the same — ` +
+      `same room layout, same furniture, same floor, same objects, same lighting direction. ` +
+      `Remove any people or subjects from the result — output background only, no people.`;
+
+    const bgBuffer = await editImages([contextFramePath], editInstruction);
+    await writeFile(bgPath, bgBuffer);
+  } catch (err: any) {
+    return res.status(500).json({ error: `Background editing failed: ${err.message}` });
+  }
+
+  // 7. FFmpeg: alphamerge original onto AI-edited background + cinematic grade
   const outputPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
   const ffmpegCmd = [
     `ffmpeg -y`,
@@ -133,11 +138,6 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     `[1:v]format=gray[mask];` +
     `[src_rgba][mask]alphamerge[fg];` +
     `[bg][fg]overlay=shortest=1[comp];` +
-    // ── Cinematic color grade ──────────────────────────────────────────────
-    // 1. eq: slight contrast boost + desaturate to ~85% (film doesn't pop like digital)
-    // 2. curves: lifted blacks (shadow raise) + compressed highlights → film look
-    // 3. colorchannelmixer: teal shadows / warm highlights (classic Hollywood grade)
-    // 4. vignette: subtle edge darkening to pull eye to center
     `[comp]eq=contrast=1.08:brightness=0.0:saturation=0.82,` +
     `curves=all='0/0.05 0.25/0.27 0.75/0.78 1/0.96',` +
     `colorchannelmixer=rr=1.0:rg=0.01:rb=-0.03:gr=-0.01:gg=0.95:gb=0.06:br=-0.07:bg=0.07:bb=1.0,` +
@@ -155,7 +155,7 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     return res.status(500).json({ error: `Video compositing failed: ${err.message}` });
   }
 
-  // 7. Generate thumbnail
+  // 8. Thumbnail
   const thumbPath = path.join(THUMBS_DIR, `${jobId}-thumb.png`);
   try {
     await execAsync(`ffmpeg -y -i "${outputPath}" -vframes 1 -q:v 2 "${thumbPath}"`);

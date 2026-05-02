@@ -75,12 +75,14 @@ function VideoPlayer({ src, thumbnail }: { src: string; thumbnail?: string }) {
 type Stage = "idle" | "processing" | "done" | "error";
 
 const PRESETS = [
-  { label: "Tropical beach", prompt: "A tropical beach at sunset with golden waves" },
-  { label: "Cyberpunk city", prompt: "A neon-lit cyberpunk city at night" },
-  { label: "Mountain range", prompt: "A misty mountain range at dawn" },
-  { label: "Modern office", prompt: "A cozy modern office with city views" },
-  { label: "Space station", prompt: "A futuristic space station interior" },
-  { label: "Forest", prompt: "A lush green forest with rays of sunlight" },
+  { label: "White walls",     prompt: "White walls" },
+  { label: "Wooden floor",    prompt: "Wooden floor" },
+  { label: "Tropical beach",  prompt: "Replace the background with a tropical beach at sunset" },
+  { label: "Cyberpunk city",  prompt: "Replace the background with a neon-lit cyberpunk city at night" },
+  { label: "Studio backdrop", prompt: "Plain white studio backdrop, professional photography look" },
+  { label: "Dark walls",      prompt: "Dark charcoal walls" },
+  { label: "Brick wall",      prompt: "Exposed brick wall" },
+  { label: "Forest",          prompt: "Replace the background with a lush green forest" },
 ];
 
 export default function BgReplacePage() {
@@ -203,11 +205,12 @@ export default function BgReplacePage() {
 
             {/* Background prompt */}
             <div>
-              <p className="text-[11px] text-white/30 uppercase tracking-widest mb-3">New background</p>
+              <p className="text-[11px] text-white/30 uppercase tracking-widest mb-3">What to change</p>
               <Input data-testid="input-bg-prompt"
-                placeholder="A futuristic city at night, neon lights..."
+                placeholder='e.g. "White walls" or "Wooden floor" or "Tropical beach"'
                 value={bgPrompt} onChange={(e) => setBgPrompt(e.target.value)}
-                className="bg-white/5 border-white/10 text-white placeholder:text-white/25 focus-visible:ring-white/20 mb-4" />
+                className="bg-white/5 border-white/10 text-white placeholder:text-white/25 focus-visible:ring-white/20 mb-2" />
+              <p className="text-[11px] text-white/20 mb-3">AI sees your actual scene and changes only what you specify — everything else stays the same</p>
               <div className="flex flex-wrap gap-2">
                 {PRESETS.map((p) => (
                   <button key={p.label} onClick={() => setBgPrompt(p.prompt)}
