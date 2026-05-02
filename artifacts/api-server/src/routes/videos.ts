@@ -27,14 +27,32 @@ const PLAN_LIMITS: Record<string, number> = {
   enterprise: Infinity,
 };
 
+const MOTION_PHASES = [
+  "starting position, just beginning to move",
+  "mid-motion, peak dynamic action, full stride",
+  "follow-through, opposite limbs extended",
+  "recovery step, returning to start position",
+];
+
 async function generateThumbnail(videoId: number, prompt: string): Promise<string> {
   try {
     await mkdir(THUMBS_DIR, { recursive: true });
-    const imagePrompt = `Cinematic still frame: ${prompt}. High quality, dramatic lighting, professional photography, wide shot.`;
-    const buffer = await generateImageBuffer(imagePrompt, "1536x1024");
-    const filePath = path.join(THUMBS_DIR, `${videoId}.png`);
-    await writeFile(filePath, buffer);
-    return `/api/thumbs/${videoId}.png`;
+    const base = `Cinematic action shot, full body visible: ${prompt}. High quality, dramatic lighting, 24mm lens, sharp focus.`;
+
+    const results = await Promise.allSettled(
+      MOTION_PHASES.map(async (phase, i) => {
+        const buf = await generateImageBuffer(`${base} ${phase}`, "1536x1024");
+        const fp = path.join(THUMBS_DIR, `${videoId}_${i}.png`);
+        await writeFile(fp, buf);
+        return `/api/thumbs/${videoId}_${i}.png`;
+      })
+    );
+
+    const frameUrls = results.map((r, i) =>
+      r.status === "fulfilled" ? r.value : `https://picsum.photos/seed/${videoId}${i}/640/360`
+    );
+
+    return `multi:${frameUrls.join(",")}`;
   } catch {
     return `https://picsum.photos/seed/${videoId}/640/360`;
   }

@@ -18,18 +18,26 @@ function fmt(secs: number) {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+const FRAME_INTERVAL_MS = 160; // ~6 fps animation
+
 function VideoPlayer({ src, duration, prompt }: { src: string; duration: number; prompt: string }) {
+  // Parse multi-frame format: "multi:url1,url2,url3,url4"
+  const frames = src.startsWith("multi:") ? src.slice(6).split(",") : [src];
+  const isMultiFrame = frames.length > 1;
+
   const [playing, setPlaying] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [ended, setEnded] = useState(false);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const tickMs = 100;
+  const [frameIdx, setFrameIdx] = useState(0);
+  const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const frameRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Progress ticker
   useEffect(() => {
     if (playing && !ended) {
-      intervalRef.current = setInterval(() => {
+      tickRef.current = setInterval(() => {
         setElapsed((prev) => {
-          const next = prev + tickMs / 1000;
+          const next = prev + 0.1;
           if (next >= duration) {
             setPlaying(false);
             setEnded(true);
@@ -37,18 +45,31 @@ function VideoPlayer({ src, duration, prompt }: { src: string; duration: number;
           }
           return next;
         });
-      }, tickMs);
+      }, 100);
     } else {
-      if (intervalRef.current) clearInterval(intervalRef.current);
+      if (tickRef.current) clearInterval(tickRef.current);
     }
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
+    return () => { if (tickRef.current) clearInterval(tickRef.current); };
   }, [playing, ended, duration]);
+
+  // Frame cycling — animates the character
+  useEffect(() => {
+    if (playing && isMultiFrame) {
+      frameRef.current = setInterval(() => {
+        setFrameIdx((i) => (i + 1) % frames.length);
+      }, FRAME_INTERVAL_MS);
+    } else {
+      if (frameRef.current) clearInterval(frameRef.current);
+    }
+    return () => { if (frameRef.current) clearInterval(frameRef.current); };
+  }, [playing, isMultiFrame, frames.length]);
 
   const progress = duration > 0 ? (elapsed / duration) * 100 : 0;
 
   const handlePlayPause = () => {
     if (ended) {
       setElapsed(0);
+      setFrameIdx(0);
       setEnded(false);
       setPlaying(true);
     } else {
@@ -62,41 +83,25 @@ function VideoPlayer({ src, duration, prompt }: { src: string; duration: number;
     setEnded(false);
   };
 
-  const kenBurnsStyle: React.CSSProperties = playing
-    ? {
-        animation: `kb-zoom ${duration}s linear forwards`,
-        animationDelay: `-${elapsed}s`,
-      }
-    : { transform: `scale(${1 + (elapsed / duration) * 0.12}) translateX(${-elapsed / duration * 2}%) translateY(${-elapsed / duration * 1}%)` };
+  const currentFrame = frames[frameIdx];
 
   return (
     <div className="rounded-xl overflow-hidden border border-card-border bg-black">
-      <style>{`
-        @keyframes kb-zoom {
-          0%   { transform: scale(1)    translateX(0%)    translateY(0%); }
-          25%  { transform: scale(1.04) translateX(-1%)   translateY(-0.5%); }
-          50%  { transform: scale(1.08) translateX(-2%)   translateY(-1%); }
-          75%  { transform: scale(1.1)  translateX(-1.5%) translateY(-0.5%); }
-          100% { transform: scale(1.12) translateX(-2%)   translateY(-1%); }
-        }
-      `}</style>
-
-      {/* Image with Ken Burns */}
-      <div className="relative aspect-video overflow-hidden">
+      {/* Frame display */}
+      <div className="relative aspect-video overflow-hidden bg-black">
         <img
-          key={playing ? "playing" : "paused"}
-          src={src}
+          src={currentFrame}
           alt={prompt}
           className="w-full h-full object-cover"
-          style={kenBurnsStyle}
+          style={{ imageRendering: "auto" }}
           draggable={false}
         />
 
-        {/* Cinematic bars */}
-        <div className="absolute inset-x-0 top-0 h-8 bg-gradient-to-b from-black/60 to-transparent pointer-events-none" />
-        <div className="absolute inset-x-0 bottom-0 h-8 bg-gradient-to-t from-black/60 to-transparent pointer-events-none" />
+        {/* Cinematic letterbox bars */}
+        <div className="absolute inset-x-0 top-0 h-6 bg-black pointer-events-none" />
+        <div className="absolute inset-x-0 bottom-0 h-6 bg-black pointer-events-none" />
 
-        {/* Centre play/pause overlay (only when paused and not started) */}
+        {/* Big play button — only before first press */}
         {!playing && elapsed === 0 && !ended && (
           <div className="absolute inset-0 flex items-center justify-center">
             <button
@@ -109,9 +114,9 @@ function VideoPlayer({ src, duration, prompt }: { src: string; duration: number;
           </div>
         )}
 
-        {/* Replay overlay when ended */}
+        {/* Replay overlay */}
         {ended && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/50">
+          <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/60">
             <button
               onClick={handlePlayPause}
               className="w-14 h-14 rounded-full bg-white/90 hover:bg-white flex items-center justify-center shadow-2xl transition-all hover:scale-105 mb-2"
@@ -122,32 +127,27 @@ function VideoPlayer({ src, duration, prompt }: { src: string; duration: number;
           </div>
         )}
 
-        {/* Top-left label */}
-        <div className="absolute top-3 left-3 px-2 py-0.5 rounded bg-black/60 text-white text-[10px] uppercase tracking-widest font-semibold pointer-events-none">
-          AI Generated
-        </div>
+        {/* Frame counter badge */}
+        {isMultiFrame && (
+          <div className="absolute top-8 left-3 px-2 py-0.5 rounded bg-black/70 text-white text-[10px] uppercase tracking-widest font-semibold pointer-events-none">
+            AI Generated · {frames.length} frames
+          </div>
+        )}
       </div>
 
-      {/* Controls bar */}
+      {/* Controls */}
       <div className="bg-zinc-950 px-4 pt-2.5 pb-3 space-y-2">
-        {/* Progress slider */}
         <div className="relative h-1.5 bg-white/10 rounded-full overflow-hidden cursor-pointer">
           <div
-            className="absolute left-0 top-0 h-full bg-primary rounded-full transition-none"
+            className="absolute left-0 top-0 h-full bg-primary rounded-full"
             style={{ width: `${progress}%` }}
           />
           <input
-            type="range"
-            min={0}
-            max={100}
-            step={0.1}
-            value={progress}
+            type="range" min={0} max={100} step={0.1} value={progress}
             onChange={handleSeek}
             className="absolute inset-0 w-full opacity-0 cursor-pointer"
           />
         </div>
-
-        {/* Play/pause + time */}
         <div className="flex items-center gap-3">
           <button
             data-testid="button-play-pause"
