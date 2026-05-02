@@ -2,7 +2,7 @@ import { Router } from "express";
 import multer from "multer";
 import path from "path";
 import { fileURLToPath } from "url";
-import { mkdir, writeFile } from "fs/promises";
+import { mkdir, writeFile, readFile } from "fs/promises";
 import { exec } from "child_process";
 import { promisify } from "util";
 import { requireAuth } from "../middlewares/requireAuth";
@@ -40,6 +40,25 @@ const upload = multer({
 function isImageFile(file: Express.Multer.File): boolean {
   const ext = "." + (file.originalname.split(".").pop() ?? "").toLowerCase();
   return file.mimetype.startsWith("image/") || IMAGE_EXTS.has(ext);
+}
+
+/**
+ * Compute the average RGB colour of an image by scaling it to a single pixel
+ * and reading the raw bytes from a PPM file.
+ *
+ * PPM (P6) layout:
+ *   "P6\n<width> <height>\n<maxval>\n<raw RGB bytes>"
+ */
+async function avgRGB(imagePath: string): Promise<[number, number, number]> {
+  const ppmPath = `${imagePath}.avg.ppm`;
+  await execAsync(`ffmpeg -y -i "${imagePath}" -vf scale=1:1 -frames:v 1 "${ppmPath}"`);
+  const buf = await readFile(ppmPath);
+  let nl = 0, idx = 0;
+  while (nl < 3 && idx < buf.length) {
+    if (buf[idx] === 0x0a) nl++;
+    idx++;
+  }
+  return [buf[idx], buf[idx + 1], buf[idx + 2]];
 }
 
 /**
@@ -171,32 +190,45 @@ router.post(
       return res.status(500).json({ error: `AI transfer failed: ${err.message}` });
     }
 
-    // 5. Apply the edited frame's "look" across every target frame.
+    // 5. Compute the colour DELTA between the original target frame and the
+    //    AI-edited target frame, then push the entire video toward the AI
+    //    look using ffmpeg's `colorbalance` filter.
     //
-    //  KEY: we extract the AI-edited frame's AVERAGE COLOR (scale to 2x2,
-    //  then back up). This produces a true UNIFORM colour cast — every pixel
-    //  of "ambient" is the same colour, so the softlight blend cannot create
-    //  a vignette or shadow. (gblur, even at sigma=70, leaves spatial
-    //  structure that produces a dark patch in the centre of the frame.)
+    //  Why this is better than the old softlight-blend approach:
+    //   - softlight blend is opacity-limited; subtle reference colours barely
+    //     shift the result.
+    //   - colorbalance with computed deltas is a TRUE colour transform: every
+    //     pixel gets the exact RGB shift needed to match the AI's intended tone.
+    //   - We boost the delta 1.6× so subtle reference looks (e.g. two indoor
+    //     videos with similar lighting) still produce a clearly visible grade.
     //
-    //  Pipeline:
-    //   - Downscale source to outW×outH (caps 4K at 1080p, keeps encoding fast)
-    //   - ambient = solid colour image at outW×outH coloured by AI frame avg
-    //   - softlight blend at 40% — colour cast applied without darkening
-    //   - Mild contrast + saturation amplifies the transferred look
-    //   - Tiny grain unifies the texture
-    //
+    let cr = 0, cg = 0, cb = 0;
+    try {
+      const [er, eg, eb] = await avgRGB(editedFramePath);
+      const [tr, tg, tb] = await avgRGB(targetFramePath);
+      const BOOST = 1.6;
+      const clamp = (v: number) => Math.max(-1, Math.min(1, v));
+      cr = clamp(((er - tr) / 255) * BOOST);
+      cg = clamp(((eg - tg) / 255) * BOOST);
+      cb = clamp(((eb - tb) / 255) * BOOST);
+      req.log.info({ deltaR: cr.toFixed(3), deltaG: cg.toFixed(3), deltaB: cb.toFixed(3) }, "v2v: colour transfer deltas");
+    } catch (err: any) {
+      req.log.warn({ err: err.message }, "v2v: avgRGB failed, falling back to no-shift");
+    }
+
+    // colorbalance: rs/gs/bs = shadows, rm/gm/bm = midtones, rh/gh/bh = highlights
+    // Same delta for all three keeps the shift uniform across the tonal range.
+    const cb_filter = `colorbalance=rs=${cr}:gs=${cg}:bs=${cb}:rm=${cr}:gm=${cg}:bm=${cb}:rh=${cr}:gh=${cg}:bh=${cb}`;
+
     const outputPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
     const ffmpegCmd = [
       `ffmpeg -y`,
       `-i "${targetPath}"`,
-      `-loop 1 -i "${editedFramePath}"`,
       `-filter_complex`,
-      `"[0:v]scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,format=yuv420p[tgt];` +
-      `[1:v]scale=2:2,scale=${outW}:${outH},format=yuv420p[ambient];` +
-      `[tgt][ambient]blend=all_mode=softlight:all_opacity=0.40:shortest=1,` +
-      `eq=contrast=1.05:saturation=1.10,` +
-      `noise=alls=4:allf=t+u[out]"`,
+      `"[0:v]scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,format=yuv420p,` +
+      `${cb_filter},` +
+      `eq=contrast=1.06:saturation=1.12,` +
+      `noise=alls=3:allf=t+u[out]"`,
       `-map "[out]" -map "0:a?"`,
       `-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p`,
       `-c:a copy`,
