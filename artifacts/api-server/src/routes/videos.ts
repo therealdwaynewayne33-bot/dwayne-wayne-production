@@ -11,6 +11,13 @@ import {
   ListVideosQueryParams,
 } from "@workspace/api-zod";
 import { requireAuth } from "../middlewares/requireAuth";
+import { generateImageBuffer } from "@workspace/integrations-openai-ai-server/image";
+import { writeFile, mkdir } from "fs/promises";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const THUMBS_DIR = path.join(__dirname, "../public/thumbs");
 
 const router = Router();
 
@@ -20,21 +27,32 @@ const PLAN_LIMITS: Record<string, number> = {
   enterprise: Infinity,
 };
 
+async function generateThumbnail(videoId: number, prompt: string): Promise<string> {
+  try {
+    await mkdir(THUMBS_DIR, { recursive: true });
+    const imagePrompt = `Cinematic still frame: ${prompt}. High quality, dramatic lighting, professional photography, wide shot.`;
+    const buffer = await generateImageBuffer(imagePrompt, "1536x1024");
+    const filePath = path.join(THUMBS_DIR, `${videoId}.png`);
+    await writeFile(filePath, buffer);
+    return `/api/thumbs/${videoId}.png`;
+  } catch {
+    return `https://picsum.photos/seed/${videoId}/640/360`;
+  }
+}
 
-function simulateProcessing(videoId: number) {
+function simulateProcessing(videoId: number, prompt: string) {
   setTimeout(async () => {
     await db.update(videosTable).set({ status: "processing" }).where(eq(videosTable.id, videoId));
-    setTimeout(async () => {
-      await db.update(videosTable).set({
-        status: "completed",
-        videoUrl: `https://storage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4`,
-        thumbnailUrl: `https://picsum.photos/seed/${videoId}/640/360`,
-        duration: Math.round((15 + Math.random() * 45) * 10) / 10,
-      }).where(eq(videosTable.id, videoId));
-      await db.update(projectsTable).set({ status: "completed", updatedAt: new Date() }).where(
-        eq(projectsTable.id, (await db.select().from(videosTable).where(eq(videosTable.id, videoId)).limit(1))[0]?.projectId ?? -1)
-      );
-    }, 8000);
+    const thumbnailUrl = await generateThumbnail(videoId, prompt);
+    await db.update(videosTable).set({
+      status: "completed",
+      videoUrl: `https://storage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4`,
+      thumbnailUrl,
+      duration: Math.round((15 + Math.random() * 45) * 10) / 10,
+    }).where(eq(videosTable.id, videoId));
+    await db.update(projectsTable).set({ status: "completed", updatedAt: new Date() }).where(
+      eq(projectsTable.id, (await db.select().from(videosTable).where(eq(videosTable.id, videoId)).limit(1))[0]?.projectId ?? -1)
+    );
   }, 2000);
 }
 
@@ -83,7 +101,7 @@ router.post("/videos", requireAuth, async (req, res) => {
   }).returning();
   await db.insert(activityTable).values({ userId: req.session.userId!, type: "video_generated", description: `Started generating "${video.title}"`, resourceId: video.id, resourceType: "video" });
   await db.update(projectsTable).set({ status: "processing", updatedAt: new Date() }).where(eq(projectsTable.id, video.projectId));
-  simulateProcessing(video.id);
+  simulateProcessing(video.id, parsed.data.prompt);
   return res.status(201).json(video);
 });
 
@@ -111,7 +129,7 @@ router.post("/videos/:id/apply-style", requireAuth, async (req, res) => {
   const [video] = await db.update(videosTable).set({ style: body.data.style, status: "queued" }).where(and(eq(videosTable.id, params.data.id), eq(videosTable.userId, req.session.userId!))).returning();
   if (!video) return res.status(404).json({ error: "Video not found" });
   await db.insert(activityTable).values({ userId: req.session.userId!, type: "style_applied", description: `Applied ${body.data.style} style to "${video.title}"`, resourceId: video.id, resourceType: "video" });
-  simulateProcessing(video.id);
+  simulateProcessing(video.id, video.prompt);
   return res.json(video);
 });
 
