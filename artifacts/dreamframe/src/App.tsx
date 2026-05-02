@@ -12,6 +12,7 @@ import CharactersPage from "@/pages/characters";
 import CreatePage from "@/pages/create";
 import VideoDetailPage from "@/pages/video-detail";
 import PricingPage from "@/pages/pricing";
+import BgReplacePage from "@/pages/bg-replace";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -69,6 +70,7 @@ function CreateRoute() { return <ProtectedRoute component={CreatePage} />; }
 function ProjectsRoute() { return <ProtectedRoute component={ProjectsPage} />; }
 function CharactersRoute() { return <ProtectedRoute component={CharactersPage} />; }
 function PricingRoute() { return <ProtectedRoute component={PricingPage} />; }
+function BgReplaceRoute() { return <ProtectedRoute component={BgReplacePage} />; }
 
 function Router() {
   return (
@@ -76,6 +78,7 @@ function Router() {
       <Route path="/" component={AuthRoute} />
       <Route path="/dashboard" component={DashboardRoute} />
       <Route path="/create" component={CreateRoute} />
+      <Route path="/bg-replace" component={BgReplaceRoute} />
       <Route path="/projects" component={ProjectsRoute} />
       <Route path="/projects/:id" component={ProjectDetailRoute} />
       <Route path="/characters" component={CharactersRoute} />

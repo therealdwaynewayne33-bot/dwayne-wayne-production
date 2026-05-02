@@ -1,11 +1,12 @@
 import { Link, useLocation } from "wouter";
-import { LayoutDashboard, FolderOpen, Video, Users, Plus, LogOut, Sparkles, Crown } from "lucide-react";
+import { LayoutDashboard, FolderOpen, Users, Plus, LogOut, Sparkles, Crown, Layers } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import { cn } from "@/lib/utils";
 
 const navItems = [
   { label: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
   { label: "Create Video", href: "/create", icon: Plus },
+  { label: "BG Replace", href: "/bg-replace", icon: Layers, badge: "NEW" },
   { label: "Projects", href: "/projects", icon: FolderOpen },
   { label: "Characters", href: "/characters", icon: Users },
 ];
@@ -42,7 +43,7 @@ export function Sidebar() {
               >
                 <Icon className={cn("w-4 h-4 shrink-0", active ? "text-primary" : "")} />
                 {label}
-                {href === "/create" && (
+                {(href === "/create" || href === "/bg-replace") && (
                   <span className="ml-auto text-[10px] bg-primary/20 text-primary px-1.5 py-0.5 rounded font-semibold">NEW</span>
                 )}
               </div>
