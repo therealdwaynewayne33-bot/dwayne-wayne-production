@@ -65,8 +65,9 @@ Full-stack AI video generation platform (SaaS MVP). Dark cinematic UI with chara
 
 ## Workflows
 
-- **DreamFrame Frontend**: `PORT=19591 BASE_PATH=/ pnpm --filter @workspace/dreamframe run dev`
-- **API Server**: `PORT=8080 pnpm --filter @workspace/api-server run dev`
+Both services are managed as **artifact workflows** (auto-started by the Run button):
+- **artifacts/dreamframe: web** — frontend on port 5173 (PORT set via artifact.toml `[services.env]`)
+- **artifacts/api-server: API Server** — API on port 8080 (PORT set via artifact.toml `[services.env]`)
 
 ## Important Notes
 
