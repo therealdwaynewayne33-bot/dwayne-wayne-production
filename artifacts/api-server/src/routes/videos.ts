@@ -46,7 +46,7 @@ function simulateProcessing(videoId: number, prompt: string) {
     const thumbnailUrl = await generateThumbnail(videoId, prompt);
     await db.update(videosTable).set({
       status: "completed",
-      videoUrl: `https://storage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4`,
+      videoUrl: `https://www.w3schools.com/html/mov_bbb.mp4`,
       thumbnailUrl,
       duration: Math.round((15 + Math.random() * 45) * 10) / 10,
     }).where(eq(videosTable.id, videoId));
