@@ -62,6 +62,8 @@ app.use("/api/videos-files", express.static(path.join(__dirname, "../public/vide
 app.use("/api/char-files", express.static(path.join(__dirname, "../public/chars")));
 // Serve uploaded source videos (needed for Replicate to access them)
 app.use("/api/uploads", express.static(path.join(__dirname, "../public/uploads")));
+// Serve face-swap result images
+app.use("/api/swaps", express.static(path.join(__dirname, "../public/swaps")));
 
 app.use("/api", router);
 

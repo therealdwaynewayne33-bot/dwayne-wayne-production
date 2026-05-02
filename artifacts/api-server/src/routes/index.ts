@@ -7,6 +7,7 @@ import videosRouter from "./videos";
 import dashboardRouter from "./dashboard";
 import billingRouter from "./billing";
 import bgReplaceRouter from "./bg-replace";
+import faceSwapRouter from "./face-swap";
 
 const router: IRouter = Router();
 
@@ -18,5 +19,6 @@ router.use(videosRouter);
 router.use(dashboardRouter);
 router.use(billingRouter);
 router.use(bgReplaceRouter);
+router.use(faceSwapRouter);
 
 export default router;
