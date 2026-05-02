@@ -115,16 +115,18 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
   const bgPath = path.join(UPLOADS_DIR, `${jobId}-bg.png`);
   try {
     const editInstruction =
-      `You are editing the BACKGROUND ONLY of this scene frame. ` +
+      `You are editing the BACKGROUND ONLY of this real interior photograph. ` +
       `Make ONLY this change: "${backgroundPrompt}". ` +
-      `ABSOLUTE RULES — never break these: ` +
-      `(1) NEVER touch door frames, doorways, windows, archways, stairs or any architectural structure — these are FIXED and must remain pixel-perfect. ` +
-      `(2) NEVER change the floor, ceiling, or any surface not mentioned in the request. ` +
-      `(3) NEVER add or remove furniture, objects, or decorations unless explicitly requested. ` +
-      `(4) Keep the EXACT same camera angle, perspective, lighting direction and colour temperature. ` +
-      `(5) If any people appear in the frame, remove them naturally — inpaint the background behind where they stood. ` +
-      `(6) Output must look like a real photograph — match the original noise, grain, and sharpness level exactly. ` +
-      `(7) Change ONLY the specific surface or element named. Nothing else.`;
+      `Treat this like a real-world repaint or redecoration job — NOT a stylised render. ` +
+      `ABSOLUTE RULES: ` +
+      `(1) If the change is a colour (e.g. "white walls", "blue walls"), use REAL MATTE INTERIOR PAINT — low saturation, realistic flat finish, like Dulux/Benjamin Moore wall paint. NEVER use vivid, glossy, or over-saturated colour. ` +
+      `(2) NEVER touch door frames, doorways, windows, archways, skirting boards, stairs or any architectural structure — these are FIXED. ` +
+      `(3) NEVER change the floor, ceiling, or any surface not mentioned. ` +
+      `(4) NEVER add or remove furniture, objects, or decorations unless explicitly requested. ` +
+      `(5) Keep the EXACT same camera angle, perspective, lighting direction, shadows, and colour temperature of the original photo. ` +
+      `(6) If any people appear, remove them naturally — inpaint the background behind where they stood. ` +
+      `(7) Output must look like a normal real-life photo of the same room with one realistic change applied — same exposure, same warmth, same noise level as the input. ` +
+      `(8) Change ONLY the specific surface or element named. Nothing else.`;
 
     const bgBuffer = await editImages([contextFramePath], editInstruction);
     await writeFile(bgPath, bgBuffer);
@@ -132,13 +134,14 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     return res.status(500).json({ error: `Background editing failed: ${err.message}` });
   }
 
-  // 7. FFmpeg composite — confirmed working realism pipeline:
+  // 7. FFmpeg composite — natural look pipeline (NO color grading):
   //
-  //  • sigma=1 mask blur  — minimal feathering only, STOPS the green-screen halo glow
-  //                         that sigma=3 was causing (too much blur = transparent fringe)
-  //  • sigma=1 bg blur    — barely perceptible DOF, just enough to separate layers
-  //  • grain noise=6      — shared texture makes both layers feel from the same camera
-  //  • Cinematic grade    — curves + teal-orange + vignette
+  //  • sigma=1 mask blur  — minimal feathering, no halo
+  //  • sigma=1 bg blur    — tiny DOF separation only
+  //  • Light grain noise=3 — barely perceptible, just enough to unify the two layers'
+  //                          texture so the AI background doesn't look "too clean"
+  //  • NO color grade — character keeps natural colors. NO teal-orange, NO vignette,
+  //                      NO curves. Just a clean cutout placed onto the new background.
   //
   const outputPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
   const ffmpegCmd = [
@@ -147,16 +150,11 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     `-i "${maskPath}"`,
     `-loop 1 -i "${bgPath}"`,
     `-filter_complex`,
-    `"[2:v]scale=${vidWidth}:${vidHeight}:force_original_aspect_ratio=increase,crop=${vidWidth}:${vidHeight},gblur=sigma=1[bg];` +
+    `"[2:v]scale=${vidWidth}:${vidHeight}:force_original_aspect_ratio=increase,crop=${vidWidth}:${vidHeight},gblur=sigma=1,noise=alls=3:allf=t+u[bg];` +
     `[1:v]format=gray,gblur=sigma=1[mask_soft];` +
     `[0:v]format=yuva420p[src_rgba];` +
     `[src_rgba][mask_soft]alphamerge[fg];` +
-    `[bg][fg]overlay=shortest=1[comp];` +
-    `[comp]eq=contrast=1.08:brightness=0.0:saturation=0.82,` +
-    `curves=all='0/0.05 0.25/0.27 0.75/0.78 1/0.96',` +
-    `colorchannelmixer=rr=1.0:rg=0.01:rb=-0.03:gr=-0.01:gg=0.95:gb=0.06:br=-0.07:bg=0.07:bb=1.0,` +
-    `vignette=PI/5,` +
-    `noise=alls=6:allf=t+u[out]"`,
+    `[bg][fg]overlay=shortest=1[out]"`,
     `-map "[out]" -map "0:a?"`,
     `-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p`,
     `-c:a copy`,
