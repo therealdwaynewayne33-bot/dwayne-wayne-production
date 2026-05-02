@@ -132,7 +132,16 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     `[0:v]format=yuva420p[src_rgba];` +
     `[1:v]format=gray[mask];` +
     `[src_rgba][mask]alphamerge[fg];` +
-    `[bg][fg]overlay=shortest=1[out]"`,
+    `[bg][fg]overlay=shortest=1[comp];` +
+    // ── Cinematic color grade ──────────────────────────────────────────────
+    // 1. eq: slight contrast boost + desaturate to ~85% (film doesn't pop like digital)
+    // 2. curves: lifted blacks (shadow raise) + compressed highlights → film look
+    // 3. colorchannelmixer: teal shadows / warm highlights (classic Hollywood grade)
+    // 4. vignette: subtle edge darkening to pull eye to center
+    `[comp]eq=contrast=1.08:brightness=0.0:saturation=0.82,` +
+    `curves=all='0/0.05 0.25/0.27 0.75/0.78 1/0.96',` +
+    `colorchannelmixer=rr=1.0:rg=0.01:rb=-0.03:gr=-0.01:gg=0.95:gb=0.06:br=-0.07:bg=0.07:bb=1.0,` +
+    `vignette=PI/5[out]"`,
     `-map "[out]" -map "0:a?"`,
     `-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p`,
     `-c:a copy`,
