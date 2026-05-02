@@ -5,10 +5,10 @@ import { useAuth } from "@/lib/auth";
 import { Plus, Video, FolderOpen, Users, TrendingUp, Clock, Zap, Crown } from "lucide-react";
 
 const STYLE_COLORS: Record<string, string> = {
-  realistic: "#8b5cf6",
-  cartoon: "#06b6d4",
-  "animated-3d": "#f59e0b",
-  cinematic: "#ec4899",
+  realistic: "#ffffff",
+  cartoon: "#a0a0a0",
+  "animated-3d": "#606060",
+  cinematic: "#303030",
 };
 
 const ACTIVITY_ICONS: Record<string, string> = {
@@ -28,28 +28,6 @@ function timeAgo(dateStr: string) {
   return `${Math.floor(hrs / 24)}d ago`;
 }
 
-function StyleDonut({ data }: { data: { style: string; count: number }[] }) {
-  const total = data.reduce((sum, d) => sum + d.count, 0);
-  if (total === 0) return null;
-  let cumulative = 0;
-  const stops = data.map((d) => {
-    const pct = (d.count / total) * 100;
-    const color = STYLE_COLORS[d.style] ?? "#8b5cf6";
-    const stop = `${color} ${cumulative}% ${cumulative + pct}%`;
-    cumulative += pct;
-    return stop;
-  });
-  return (
-    <div className="relative w-24 h-24 mx-auto mb-3">
-      <div
-        className="w-full h-full rounded-full"
-        style={{ background: `conic-gradient(${stops.join(", ")})` }}
-      />
-      <div className="absolute inset-[28%] rounded-full bg-card" />
-    </div>
-  );
-}
-
 export default function DashboardPage() {
   const { user } = useAuth();
   const { data: summary, isLoading: summaryLoading } = useGetDashboardSummary({ query: { queryKey: getGetDashboardSummaryQueryKey() } });
@@ -60,115 +38,121 @@ export default function DashboardPage() {
 
   return (
     <AppLayout>
-      <div className="p-8 max-w-6xl mx-auto">
-        <div className="mb-8 flex items-end justify-between">
+      <div className="max-w-5xl mx-auto px-8 py-14">
+        {/* Header */}
+        <div className="mb-12 flex items-end justify-between">
           <div>
-            <p className="text-sm text-muted-foreground mb-1">Welcome back</p>
-            <h1 className="text-3xl font-bold text-foreground">{user?.name ?? "Studio"}</h1>
+            <p className="text-sm text-white/30 mb-2 uppercase tracking-widest font-medium">Welcome back</p>
+            <h1 className="text-4xl font-semibold text-white tracking-tight">{user?.name ?? "Studio"}</h1>
           </div>
           <Link href="/create">
-            <button data-testid="button-create-video" className="flex items-center gap-2 px-5 py-2.5 rounded-lg bg-primary text-white text-sm font-semibold hover:bg-primary/90 transition-colors shadow-lg shadow-primary/20">
+            <button data-testid="button-create-video"
+              className="flex items-center gap-2 px-5 py-2.5 rounded-full bg-white text-black text-sm font-semibold hover:bg-white/90 transition-all">
               <Plus className="w-4 h-4" />
-              Create Video
+              Create video
             </button>
           </Link>
         </div>
 
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+        {/* Stats */}
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-px bg-white/6 rounded-2xl overflow-hidden mb-14">
           {[
-            { label: "Total Projects", value: summary?.totalProjects ?? 0, icon: FolderOpen, color: "text-violet-400" },
-            { label: "Total Videos", value: summary?.totalVideos ?? 0, icon: Video, color: "text-cyan-400" },
-            { label: "Characters", value: summary?.totalCharacters ?? 0, icon: Users, color: "text-pink-400" },
-            { label: "Processing", value: summary?.processingCount ?? 0, icon: Zap, color: "text-amber-400" },
-          ].map(({ label, value, icon: Icon, color }) => (
-            <div key={label} data-testid={`stat-${label.toLowerCase().replace(" ", "-")}`} className="bg-card border border-card-border rounded-xl p-5">
-              <div className="flex items-center justify-between mb-3">
-                <span className="text-xs text-muted-foreground uppercase tracking-wide">{label}</span>
-                <Icon className={`w-4 h-4 ${color}`} />
+            { label: "Projects", value: summary?.totalProjects ?? 0, icon: FolderOpen },
+            { label: "Videos", value: summary?.totalVideos ?? 0, icon: Video },
+            { label: "Characters", value: summary?.totalCharacters ?? 0, icon: Users },
+            { label: "Processing", value: summary?.processingCount ?? 0, icon: Zap },
+          ].map(({ label, value, icon: Icon }) => (
+            <div key={label} data-testid={`stat-${label.toLowerCase().replace(" ", "-")}`}
+              className="bg-black px-7 py-6">
+              <div className="flex items-center justify-between mb-4">
+                <span className="text-xs text-white/30 uppercase tracking-widest">{label}</span>
+                <Icon className="w-4 h-4 text-white/20" />
               </div>
-              <div className="text-3xl font-bold text-foreground">{summaryLoading ? "—" : value}</div>
+              <div className="text-4xl font-semibold text-white tracking-tight">{summaryLoading ? "—" : value}</div>
             </div>
           ))}
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
-          <div className="lg:col-span-2 bg-card border border-card-border rounded-xl p-6">
-            <div className="flex items-center justify-between mb-5">
-              <h2 className="text-sm font-semibold text-foreground uppercase tracking-wide">Recent Activity</h2>
-              <Clock className="w-4 h-4 text-muted-foreground" />
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-10">
+          {/* Recent Activity */}
+          <div className="lg:col-span-2">
+            <div className="flex items-center justify-between mb-6">
+              <h2 className="text-xs font-semibold text-white/30 uppercase tracking-widest">Recent Activity</h2>
+              <Clock className="w-3.5 h-3.5 text-white/20" />
             </div>
             {!activity || activity.length === 0 ? (
-              <div className="text-center py-10 text-muted-foreground text-sm">
+              <div className="text-center py-16 text-white/20 text-sm">
                 No activity yet. Create your first video to get started.
               </div>
             ) : (
-              <div className="space-y-3">
+              <div className="divide-y divide-white/[0.05]">
                 {activity.slice(0, 8).map((item) => (
-                  <div key={item.id} data-testid={`activity-item-${item.id}`} className="flex items-center gap-3 py-2 border-b border-border/40 last:border-0">
-                    <span className="text-base">{ACTIVITY_ICONS[item.type] ?? "•"}</span>
+                  <div key={item.id} data-testid={`activity-item-${item.id}`}
+                    className="flex items-center gap-4 py-3.5">
+                    <span className="text-base opacity-60">{ACTIVITY_ICONS[item.type] ?? "•"}</span>
                     <div className="flex-1 min-w-0">
-                      <p className="text-sm text-foreground truncate">{item.description}</p>
+                      <p className="text-sm text-white/70 truncate">{item.description}</p>
                     </div>
-                    <span className="text-xs text-muted-foreground shrink-0">{timeAgo(item.createdAt.toString())}</span>
+                    <span className="text-xs text-white/25 shrink-0 tabular-nums">{timeAgo(item.createdAt.toString())}</span>
                   </div>
                 ))}
               </div>
             )}
           </div>
 
-          <div className="space-y-4">
-            <div className="bg-card border border-card-border rounded-xl p-6">
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-sm font-semibold text-foreground uppercase tracking-wide">Plan Usage</h2>
-                <TrendingUp className="w-4 h-4 text-muted-foreground" />
+          {/* Right column */}
+          <div className="space-y-10">
+            {/* Plan usage */}
+            <div>
+              <div className="flex items-center justify-between mb-5">
+                <h2 className="text-xs font-semibold text-white/30 uppercase tracking-widest">Usage</h2>
+                <TrendingUp className="w-3.5 h-3.5 text-white/20" />
               </div>
-              <div className="mb-2 flex justify-between text-sm">
-                <span className="text-muted-foreground capitalize">{user?.plan} plan</span>
-                <span className="text-foreground font-medium">{summary?.planUsed ?? 0} / {summary?.planLimit ?? 10}</span>
+              <div className="mb-3 flex justify-between text-sm">
+                <span className="text-white/40 capitalize">{user?.plan}</span>
+                <span className="text-white/60 font-medium tabular-nums">{summary?.planUsed ?? 0} / {summary?.planLimit ?? 10}</span>
               </div>
-              <div className="w-full h-2 rounded-full bg-secondary overflow-hidden">
+              <div className="w-full h-px bg-white/8 overflow-visible relative mb-1">
                 <div
                   data-testid="stat-plan-usage"
-                  className="h-full rounded-full bg-primary transition-all duration-500"
+                  className="h-px bg-white transition-all duration-700"
                   style={{ width: `${usagePercent}%` }}
                 />
               </div>
-              <p className="text-xs text-muted-foreground mt-2">{usagePercent}% used</p>
+              <p className="text-xs text-white/25">{usagePercent}% used</p>
               {user?.plan === "free" && (
                 <Link href="/pricing">
-                  <div className="mt-4 p-3 rounded-lg bg-primary/10 border border-primary/20 cursor-pointer hover:bg-primary/15 transition-colors flex items-center gap-2">
-                    <Crown className="w-3.5 h-3.5 text-primary shrink-0" />
-                    <p className="text-xs text-primary font-medium">Upgrade to Pro — 100 videos/month</p>
-                  </div>
-                </Link>
-              )}
-              {user?.plan === "pro" && usagePercent >= 80 && (
-                <Link href="/pricing">
-                  <div className="mt-4 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20 cursor-pointer hover:bg-amber-500/15 transition-colors flex items-center gap-2">
-                    <Crown className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                    <p className="text-xs text-amber-400 font-medium">Running low — upgrade to Enterprise</p>
+                  <div className="mt-5 flex items-center gap-2 cursor-pointer group">
+                    <Crown className="w-3.5 h-3.5 text-white/30 group-hover:text-white/60 transition-colors" />
+                    <p className="text-xs text-white/30 group-hover:text-white/60 transition-colors font-medium">Upgrade to Pro — 100 videos/month</p>
                   </div>
                 </Link>
               )}
             </div>
 
-            <div className="bg-card border border-card-border rounded-xl p-6">
-              <h2 className="text-sm font-semibold text-foreground uppercase tracking-wide mb-4">Styles Used</h2>
+            {/* Style breakdown */}
+            <div>
+              <h2 className="text-xs font-semibold text-white/30 uppercase tracking-widest mb-5">Styles</h2>
               {!styleBreakdown || styleBreakdown.length === 0 ? (
-                <p className="text-xs text-muted-foreground text-center py-4">Generate videos to see style stats</p>
+                <p className="text-xs text-white/20 py-2">Generate videos to see style stats</p>
               ) : (
-                <>
-                  <StyleDonut data={styleBreakdown} />
-                  <div className="space-y-1 mt-2">
-                    {styleBreakdown.map((s) => (
-                      <div key={s.style} className="flex items-center gap-2 text-xs">
-                        <div className="w-2 h-2 rounded-full" style={{ background: STYLE_COLORS[s.style] ?? "#8b5cf6" }} />
-                        <span className="text-muted-foreground capitalize">{s.style}</span>
-                        <span className="ml-auto text-foreground">{s.count}</span>
+                <div className="space-y-3">
+                  {styleBreakdown.map((s) => {
+                    const total = styleBreakdown.reduce((sum, d) => sum + d.count, 0);
+                    const pct = total > 0 ? Math.round((s.count / total) * 100) : 0;
+                    return (
+                      <div key={s.style}>
+                        <div className="flex items-center justify-between text-xs mb-1.5">
+                          <span className="text-white/40 capitalize">{s.style}</span>
+                          <span className="text-white/25 tabular-nums">{s.count}</span>
+                        </div>
+                        <div className="w-full h-px bg-white/6">
+                          <div className="h-px bg-white/40 transition-all" style={{ width: `${pct}%` }} />
+                        </div>
                       </div>
-                    ))}
-                  </div>
-                </>
+                    );
+                  })}
+                </div>
               )}
             </div>
           </div>

@@ -82,55 +82,56 @@ export default function CharactersPage() {
 
   return (
     <AppLayout>
-      <div className="p-8 max-w-6xl mx-auto">
-        <div className="flex items-center justify-between mb-8">
+      <div className="max-w-5xl mx-auto px-8 py-14">
+        <div className="flex items-end justify-between mb-12">
           <div>
-            <h1 className="text-2xl font-bold text-foreground">Character Library</h1>
-            <p className="text-sm text-muted-foreground mt-1">{characters?.length ?? 0} characters saved</p>
+            <p className="text-xs text-white/30 uppercase tracking-widest mb-2">Face-lock consistency</p>
+            <h1 className="text-4xl font-semibold text-white tracking-tight">Characters</h1>
           </div>
-          <Button data-testid="button-add-character" onClick={() => setOpen(true)} className="bg-primary hover:bg-primary/90 gap-2">
-            <Plus className="w-4 h-4" /> Add Character
+          <Button data-testid="button-add-character" onClick={() => setOpen(true)}
+            className="bg-white text-black hover:bg-white/90 rounded-full px-5 gap-2 font-semibold">
+            <Plus className="w-4 h-4" /> Add character
           </Button>
         </div>
 
         {isLoading ? (
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
             {[...Array(4)].map((_, i) => (
-              <div key={i} className="h-52 rounded-xl bg-card border border-card-border shimmer" />
+              <div key={i} className="h-52 rounded-2xl bg-white/4 shimmer" />
             ))}
           </div>
         ) : !characters || characters.length === 0 ? (
-          <div className="text-center py-24 text-muted-foreground border border-dashed border-border rounded-xl">
-            <Users className="w-12 h-12 mx-auto mb-4 opacity-30" />
-            <p className="text-lg font-medium">No characters yet</p>
-            <p className="text-sm mt-1">Upload a character to enable face-lock consistency across videos</p>
+          <div className="text-center py-28 border border-dashed border-white/8 rounded-2xl">
+            <Users className="w-10 h-10 mx-auto mb-5 text-white/15" />
+            <p className="text-lg font-medium text-white/25">No characters yet</p>
+            <p className="text-sm mt-2 text-white/15">Upload a face to enable face-lock consistency across videos</p>
           </div>
         ) : (
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
             {characters.map((char) => (
-              <div key={char.id} data-testid={`card-character-${char.id}`} className="group bg-card border border-card-border rounded-xl overflow-hidden hover:border-primary/40 transition-all duration-200">
-                <div className="h-36 bg-gradient-to-br from-primary/10 to-primary/5 flex items-center justify-center relative overflow-hidden">
-                  {char.imageUrl && char.imageUrl.startsWith("data:image") ? (
-                    <img src={char.imageUrl} alt={char.name} className="w-full h-full object-cover" />
-                  ) : char.imageUrl ? (
+              <div key={char.id} data-testid={`card-character-${char.id}`}
+                className="group border border-white/8 rounded-2xl overflow-hidden hover:border-white/20 transition-all duration-200 bg-white/[0.02]">
+                <div className="h-40 bg-white/5 flex items-center justify-center relative overflow-hidden">
+                  {char.imageUrl ? (
                     <img src={char.imageUrl} alt={char.name} className="w-full h-full object-cover" />
                   ) : (
-                    <div className="w-16 h-16 rounded-full bg-primary/20 flex items-center justify-center">
-                      <Users className="w-8 h-8 text-primary/40" />
+                    <div className="w-14 h-14 rounded-full bg-white/10 flex items-center justify-center">
+                      <Users className="w-7 h-7 text-white/20" />
                     </div>
                   )}
                   <button
                     data-testid={`button-delete-character-${char.id}`}
                     onClick={() => onDelete(char.id, char.name)}
-                    className="absolute top-2 right-2 p-1.5 rounded-md bg-black/60 hover:bg-destructive text-white opacity-0 group-hover:opacity-100 transition-all"
+                    className="absolute top-2 right-2 p-1.5 rounded-lg bg-black/70 hover:bg-red-500/80 text-white opacity-0 group-hover:opacity-100 transition-all"
                   >
                     <Trash2 className="w-3.5 h-3.5" />
                   </button>
                 </div>
-                <div className="p-3">
-                  <h3 data-testid={`text-character-name-${char.id}`} className="text-sm font-semibold text-foreground">{char.name}</h3>
-                  {char.description && <p className="text-xs text-muted-foreground mt-0.5 line-clamp-1">{char.description}</p>}
-                  <div className="flex items-center gap-1 mt-2 text-xs text-muted-foreground">
+                <div className="p-4">
+                  <h3 data-testid={`text-character-name-${char.id}`}
+                    className="text-sm font-semibold text-white">{char.name}</h3>
+                  {char.description && <p className="text-xs text-white/30 mt-1 line-clamp-1">{char.description}</p>}
+                  <div className="flex items-center gap-1 mt-3 text-xs text-white/20">
                     <Video className="w-3 h-3" />
                     <span data-testid={`text-character-videocount-${char.id}`}>{char.videoCount} videos</span>
                   </div>
@@ -141,15 +142,15 @@ export default function CharactersPage() {
         )}
 
         <Dialog open={open} onOpenChange={(v) => { setOpen(v); if (!v) { setPreviewUrl(null); setImageDataUrl(null); form.reset(); } }}>
-          <DialogContent className="bg-card border-card-border max-w-md">
+          <DialogContent className="bg-[#0a0a0a] border-white/10 max-w-md">
             <DialogHeader>
-              <DialogTitle>Add Character</DialogTitle>
+              <DialogTitle className="text-white">Add character</DialogTitle>
             </DialogHeader>
             <Form {...form}>
               <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
                 <div
                   data-testid="drop-zone"
-                  className={`border-2 border-dashed rounded-xl p-6 text-center cursor-pointer transition-all ${dragging ? "border-primary bg-primary/10" : "border-border hover:border-primary/50"}`}
+                  className={`border-2 border-dashed rounded-2xl p-6 text-center cursor-pointer transition-all ${dragging ? "border-white/40 bg-white/5" : "border-white/10 hover:border-white/20"}`}
                   onClick={() => fileRef.current?.click()}
                   onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
                   onDragLeave={() => setDragging(false)}
@@ -157,44 +158,49 @@ export default function CharactersPage() {
                 >
                   {previewUrl ? (
                     <div className="flex flex-col items-center gap-2">
-                      <img src={previewUrl} alt="Preview" className="w-24 h-24 rounded-full object-cover border-2 border-primary" />
-                      <p className="text-xs text-muted-foreground">Click to change</p>
+                      <img src={previewUrl} alt="Preview" className="w-24 h-24 rounded-full object-cover border-2 border-white/20" />
+                      <p className="text-xs text-white/30">Click to change</p>
                     </div>
                   ) : (
                     <div className="flex flex-col items-center gap-3">
-                      <div className="w-12 h-12 rounded-full bg-primary/10 flex items-center justify-center">
-                        {dragging ? <ImageIcon className="w-6 h-6 text-primary" /> : <Upload className="w-6 h-6 text-primary/60" />}
+                      <div className="w-12 h-12 rounded-full bg-white/6 flex items-center justify-center">
+                        {dragging ? <ImageIcon className="w-6 h-6 text-white/60" /> : <Upload className="w-6 h-6 text-white/30" />}
                       </div>
                       <div>
-                        <p className="text-sm text-foreground font-medium">Drop image here or click to upload</p>
-                        <p className="text-xs text-muted-foreground mt-0.5">PNG, JPG, WEBP — face clearly visible</p>
+                        <p className="text-sm text-white/60 font-medium">Drop image here or click to upload</p>
+                        <p className="text-xs text-white/25 mt-0.5">PNG, JPG, WEBP — face clearly visible</p>
                       </div>
                     </div>
                   )}
-                  <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])} />
+                  <input ref={fileRef} type="file" accept="image/*" className="hidden"
+                    onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])} />
                 </div>
                 <FormField control={form.control} name="name" render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Character name</FormLabel>
+                    <FormLabel className="text-white/40 text-xs uppercase tracking-wide">Character name</FormLabel>
                     <FormControl>
-                      <Input data-testid="input-character-name" placeholder="e.g. Maya Chen" {...field} className="bg-background" />
+                      <Input data-testid="input-character-name" placeholder="e.g. Maya Chen" {...field}
+                        className="bg-white/5 border-white/10 text-white placeholder:text-white/25" />
                     </FormControl>
                     <FormMessage />
                   </FormItem>
                 )} />
                 <FormField control={form.control} name="description" render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Description <span className="text-muted-foreground">(optional)</span></FormLabel>
+                    <FormLabel className="text-white/40 text-xs uppercase tracking-wide">Description <span className="normal-case text-white/20">(optional)</span></FormLabel>
                     <FormControl>
-                      <Input data-testid="input-character-description" placeholder="Role or notes..." {...field} className="bg-background" />
+                      <Input data-testid="input-character-description" placeholder="Role or notes..." {...field}
+                        className="bg-white/5 border-white/10 text-white placeholder:text-white/25" />
                     </FormControl>
                     <FormMessage />
                   </FormItem>
                 )} />
                 <div className="flex gap-3 justify-end pt-2">
-                  <Button type="button" variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
-                  <Button data-testid="button-save-character" type="submit" className="bg-primary hover:bg-primary/90" disabled={createCharacter.isPending}>
-                    {createCharacter.isPending ? "Saving..." : "Save Character"}
+                  <Button type="button" variant="outline" onClick={() => setOpen(false)}
+                    className="border-white/10 text-white/40 hover:text-white hover:bg-white/5">Cancel</Button>
+                  <Button data-testid="button-save-character" type="submit"
+                    className="bg-white text-black hover:bg-white/90 font-semibold" disabled={createCharacter.isPending}>
+                    {createCharacter.isPending ? "Saving..." : "Save character"}
                   </Button>
                 </div>
               </form>

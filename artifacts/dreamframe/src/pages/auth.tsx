@@ -37,7 +37,7 @@ export default function AuthPage() {
         queryClient.setQueryData(getGetMeQueryKey(), response.user);
         setLocation("/dashboard");
       },
-      onError: () => setError("Invalid email or password. Please try again."),
+      onError: () => setError("Invalid email or password."),
     });
   }
 
@@ -56,7 +56,7 @@ export default function AuthPage() {
       },
       onError: (err: any) => {
         if (err?.data?.error?.includes("already")) {
-          setError("That email is already registered. Try signing in instead.");
+          setError("That email is already registered. Try signing in.");
         } else {
           setError("Registration failed. Please try again.");
         }
@@ -66,145 +66,104 @@ export default function AuthPage() {
 
   const isPending = loginMutation.isPending || registerMutation.isPending;
 
+  const inputCls = "w-full px-4 py-3 rounded-xl border border-white/10 bg-white/5 text-white placeholder:text-white/25 focus:outline-none focus:border-white/30 focus:bg-white/8 text-sm transition-all";
+
   return (
-    <div className="min-h-screen bg-background flex items-center justify-center p-4">
-      <div className="w-full max-w-md">
-        <div className="text-center mb-8">
-          <div className="w-14 h-14 rounded-2xl bg-primary flex items-center justify-center mx-auto mb-4 shadow-lg shadow-primary/30">
-            <Sparkles className="w-7 h-7 text-white" />
-          </div>
-          <h1 className="text-2xl font-bold text-foreground">DreamFrame AI Studio</h1>
-          <p className="text-muted-foreground text-sm mt-1">Professional AI video generation</p>
+    <div className="min-h-screen bg-black flex flex-col items-center justify-center p-6">
+      {/* Logo */}
+      <div className="mb-10 text-center">
+        <div className="w-12 h-12 rounded-2xl bg-white flex items-center justify-center mx-auto mb-5">
+          <Sparkles className="w-6 h-6 text-black" />
+        </div>
+        <h1 className="text-2xl font-semibold text-white tracking-tight">DreamFrame AI Studio</h1>
+        <p className="text-white/30 text-sm mt-1.5">Professional AI video generation</p>
+      </div>
+
+      <div className="w-full max-w-sm">
+        {/* Tab switcher */}
+        <div className="flex border border-white/10 rounded-2xl p-1 mb-6 bg-white/[0.03]">
+          <button type="button" onClick={() => switchMode("login")}
+            className={`flex-1 py-2.5 rounded-xl text-sm font-semibold transition-all ${mode === "login" ? "bg-white text-black" : "text-white/40 hover:text-white/70"}`}>
+            Sign in
+          </button>
+          <button type="button" onClick={() => switchMode("register")}
+            className={`flex-1 py-2.5 rounded-xl text-sm font-semibold transition-all ${mode === "register" ? "bg-white text-black" : "text-white/40 hover:text-white/70"}`}>
+            Create account
+          </button>
         </div>
 
-        <div className="bg-card border border-border rounded-2xl p-8 shadow-xl">
-          <div className="flex rounded-lg border border-border bg-secondary/40 p-1 mb-6">
-            <button
-              type="button"
-              onClick={() => switchMode("login")}
-              className={`flex-1 py-2 rounded-md text-sm font-semibold transition-all ${mode === "login" ? "bg-card text-foreground shadow" : "text-muted-foreground hover:text-foreground"}`}
-            >
-              Sign in
-            </button>
-            <button
-              type="button"
-              onClick={() => switchMode("register")}
-              className={`flex-1 py-2 rounded-md text-sm font-semibold transition-all ${mode === "register" ? "bg-card text-foreground shadow" : "text-muted-foreground hover:text-foreground"}`}
-            >
-              Create account
-            </button>
+        {error && (
+          <div className="mb-5 px-4 py-3 rounded-xl bg-red-500/10 border border-red-500/20 text-sm text-red-400">
+            {error}
           </div>
+        )}
 
-          {error && (
-            <div className="mb-4 px-4 py-3 rounded-lg bg-destructive/10 border border-destructive/30 text-sm text-destructive">
-              {error}
+        {mode === "login" ? (
+          <form onSubmit={handleLogin} className="space-y-3">
+            <div>
+              <label htmlFor="l-email" className="block text-[11px] text-white/30 uppercase tracking-widest mb-2">Email</label>
+              <input id="l-email" type="email" autoComplete="email" placeholder="you@example.com"
+                value={email} onChange={e => setEmail(e.target.value)} className={inputCls} />
             </div>
-          )}
+            <div>
+              <label htmlFor="l-password" className="block text-[11px] text-white/30 uppercase tracking-widest mb-2">Password</label>
+              <div className="relative">
+                <input id="l-password" type={showPassword ? "text" : "password"} autoComplete="current-password"
+                  placeholder="••••••••" value={password} onChange={e => setPassword(e.target.value)}
+                  className={`${inputCls} pr-11`} />
+                <button type="button" onClick={() => setShowPassword(!showPassword)}
+                  className="absolute right-3.5 top-1/2 -translate-y-1/2 text-white/30 hover:text-white/60 transition-colors">
+                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+            </div>
+            <button type="submit" disabled={isPending}
+              className="w-full py-3 mt-2 rounded-xl bg-white text-black font-semibold text-sm hover:bg-white/90 transition-all disabled:opacity-50">
+              {isPending ? "Signing in..." : "Sign in"}
+            </button>
+          </form>
+        ) : (
+          <form onSubmit={handleRegister} className="space-y-3">
+            <div>
+              <label htmlFor="r-name" className="block text-[11px] text-white/30 uppercase tracking-widest mb-2">Full name</label>
+              <input id="r-name" type="text" autoComplete="name" placeholder="Alex Chen"
+                value={name} onChange={e => setName(e.target.value)} className={inputCls} />
+            </div>
+            <div>
+              <label htmlFor="r-email" className="block text-[11px] text-white/30 uppercase tracking-widest mb-2">Email</label>
+              <input id="r-email" type="email" autoComplete="email" placeholder="you@example.com"
+                value={email} onChange={e => setEmail(e.target.value)} className={inputCls} />
+            </div>
+            <div>
+              <label htmlFor="r-password" className="block text-[11px] text-white/30 uppercase tracking-widest mb-2">Password</label>
+              <div className="relative">
+                <input id="r-password" type={showPassword ? "text" : "password"} autoComplete="new-password"
+                  placeholder="Min 8 characters" value={password} onChange={e => setPassword(e.target.value)}
+                  className={`${inputCls} pr-11`} />
+                <button type="button" onClick={() => setShowPassword(!showPassword)}
+                  className="absolute right-3.5 top-1/2 -translate-y-1/2 text-white/30 hover:text-white/60 transition-colors">
+                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+            </div>
+            <button type="submit" disabled={isPending}
+              className="w-full py-3 mt-2 rounded-xl bg-white text-black font-semibold text-sm hover:bg-white/90 transition-all disabled:opacity-50">
+              {isPending ? "Creating account..." : "Create account"}
+            </button>
+          </form>
+        )}
 
+        <p className="mt-6 text-center text-xs text-white/25">
           {mode === "login" ? (
-            <form onSubmit={handleLogin} className="space-y-4">
-              <div>
-                <label htmlFor="l-email" className="block text-xs text-muted-foreground uppercase tracking-wide mb-1.5">Email</label>
-                <input
-                  id="l-email"
-                  type="email"
-                  autoComplete="email"
-                  placeholder="you@example.com"
-                  value={email}
-                  onChange={e => setEmail(e.target.value)}
-                  className="w-full px-3 py-2 rounded-md border border-input bg-input/50 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary text-sm"
-                />
-              </div>
-              <div>
-                <label htmlFor="l-password" className="block text-xs text-muted-foreground uppercase tracking-wide mb-1.5">Password</label>
-                <div className="relative">
-                  <input
-                    id="l-password"
-                    type={showPassword ? "text" : "password"}
-                    autoComplete="current-password"
-                    placeholder="••••••••"
-                    value={password}
-                    onChange={e => setPassword(e.target.value)}
-                    className="w-full px-3 py-2 pr-10 rounded-md border border-input bg-input/50 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary text-sm"
-                  />
-                  <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
-                    {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                  </button>
-                </div>
-              </div>
-              <button
-                type="submit"
-                disabled={isPending}
-                className="w-full py-2.5 rounded-md bg-primary text-white font-semibold hover:bg-primary/90 transition-colors disabled:opacity-60 mt-2"
-              >
-                {isPending ? "Signing in..." : "Sign in"}
-              </button>
-            </form>
+            <>No account?{" "}
+              <button type="button" onClick={() => switchMode("register")} className="text-white/50 hover:text-white transition-colors font-medium">Sign up</button>
+            </>
           ) : (
-            <form onSubmit={handleRegister} className="space-y-4">
-              <div>
-                <label htmlFor="r-name" className="block text-xs text-muted-foreground uppercase tracking-wide mb-1.5">Full name</label>
-                <input
-                  id="r-name"
-                  type="text"
-                  autoComplete="name"
-                  placeholder="Alex Chen"
-                  value={name}
-                  onChange={e => setName(e.target.value)}
-                  className="w-full px-3 py-2 rounded-md border border-input bg-input/50 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary text-sm"
-                />
-              </div>
-              <div>
-                <label htmlFor="r-email" className="block text-xs text-muted-foreground uppercase tracking-wide mb-1.5">Email</label>
-                <input
-                  id="r-email"
-                  type="email"
-                  autoComplete="email"
-                  placeholder="you@example.com"
-                  value={email}
-                  onChange={e => setEmail(e.target.value)}
-                  className="w-full px-3 py-2 rounded-md border border-input bg-input/50 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary text-sm"
-                />
-              </div>
-              <div>
-                <label htmlFor="r-password" className="block text-xs text-muted-foreground uppercase tracking-wide mb-1.5">Password</label>
-                <div className="relative">
-                  <input
-                    id="r-password"
-                    type={showPassword ? "text" : "password"}
-                    autoComplete="new-password"
-                    placeholder="Min 8 characters"
-                    value={password}
-                    onChange={e => setPassword(e.target.value)}
-                    className="w-full px-3 py-2 pr-10 rounded-md border border-input bg-input/50 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary text-sm"
-                  />
-                  <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
-                    {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                  </button>
-                </div>
-              </div>
-              <button
-                type="submit"
-                disabled={isPending}
-                className="w-full py-2.5 rounded-md bg-primary text-white font-semibold hover:bg-primary/90 transition-colors disabled:opacity-60 mt-2"
-              >
-                {isPending ? "Creating account..." : "Create account"}
-              </button>
-            </form>
+            <>Already have an account?{" "}
+              <button type="button" onClick={() => switchMode("login")} className="text-white/50 hover:text-white transition-colors font-medium">Sign in</button>
+            </>
           )}
-
-          <p className="mt-6 text-center text-sm text-muted-foreground">
-            {mode === "login" ? (
-              <>Don&apos;t have an account?{" "}
-                <button type="button" onClick={() => switchMode("register")} className="text-primary hover:underline font-medium">Sign up</button>
-              </>
-            ) : (
-              <>Already have an account?{" "}
-                <button type="button" onClick={() => switchMode("login")} className="text-primary hover:underline font-medium">Sign in</button>
-              </>
-            )}
-          </p>
-        </div>
+        </p>
       </div>
     </div>
   );
