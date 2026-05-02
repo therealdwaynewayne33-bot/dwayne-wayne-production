@@ -17,15 +17,30 @@ const execAsync   = promisify(exec);
 const router = Router();
 
 const VIDEO_EXTS = new Set([".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v", ".3gp"]);
+const IMAGE_EXTS = new Set([".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".heif"]);
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 200 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const ext = "." + (file.originalname.split(".").pop() ?? "").toLowerCase();
-    if (file.mimetype.startsWith("video/") || VIDEO_EXTS.has(ext)) cb(null, true);
-    else cb(new Error("Only video files are accepted (MP4, MOV, WebM…)"));
+    const isVideo = file.mimetype.startsWith("video/") || VIDEO_EXTS.has(ext);
+    const isImage = file.mimetype.startsWith("image/") || IMAGE_EXTS.has(ext);
+    // Target field must be video. Reference can be either video OR image.
+    if (file.fieldname === "target") {
+      if (isVideo) cb(null, true);
+      else cb(new Error("Target must be a video file"));
+    } else {
+      if (isVideo || isImage) cb(null, true);
+      else cb(new Error("Reference must be a video or image file"));
+    }
   },
 });
+
+function isImageFile(file: Express.Multer.File): boolean {
+  const ext = "." + (file.originalname.split(".").pop() ?? "").toLowerCase();
+  return file.mimetype.startsWith("image/") || IMAGE_EXTS.has(ext);
+}
 
 /**
  * POST /api/videos/v2v   (Video → Video transfer)
@@ -74,10 +89,15 @@ router.post(
     await mkdir(VIDEOS_DIR,  { recursive: true });
     await mkdir(THUMBS_DIR,  { recursive: true });
 
-    // 1. Save both videos
-    const targetPath    = path.join(UPLOADS_DIR, `${jobId}-target.mp4`);
-    const referencePath = path.join(UPLOADS_DIR, `${jobId}-reference.mp4`);
-    await writeFile(targetPath,    targetFile.buffer);
+    // 1. Save target (always video) and reference (video OR image)
+    const targetPath = path.join(UPLOADS_DIR, `${jobId}-target.mp4`);
+    await writeFile(targetPath, targetFile.buffer);
+
+    const refIsImage = isImageFile(referenceFile);
+    const refExt = refIsImage
+      ? "." + (referenceFile.originalname.split(".").pop() ?? "png").toLowerCase()
+      : ".mp4";
+    const referencePath = path.join(UPLOADS_DIR, `${jobId}-reference${refExt}`);
     await writeFile(referencePath, referenceFile.buffer);
 
     // 2. Probe target dimensions/duration
@@ -105,14 +125,21 @@ router.post(
       outH = Math.round(vidHeight / 2) * 2;
     }
 
-    // 3. Extract a mid-point frame from each video
+    // 3. Extract reference frames.
+    //    - target: always a mid-point frame from the video
+    //    - reference: if it's an image, normalise to PNG; if video, extract mid-point
     const targetFramePath = path.join(UPLOADS_DIR, `${jobId}-target-frame.png`);
     const refFramePath    = path.join(UPLOADS_DIR, `${jobId}-ref-frame.png`);
     const midSec = (vidDuration / 2).toFixed(2);
     try {
+      const refExtractCmd = refIsImage
+        // Image reference — just convert/normalise to PNG (handles HEIC, WebP, etc.)
+        ? `ffmpeg -y -i "${referencePath}" -frames:v 1 -q:v 2 "${refFramePath}"`
+        // Video reference — grab a frame ~1s in
+        : `ffmpeg -y -ss 1.0 -i "${referencePath}" -vframes 1 -q:v 2 "${refFramePath}"`;
       await Promise.all([
-        execAsync(`ffmpeg -y -ss ${midSec} -i "${targetPath}"    -vframes 1 -q:v 2 "${targetFramePath}"`),
-        execAsync(`ffmpeg -y -ss 1.0       -i "${referencePath}" -vframes 1 -q:v 2 "${refFramePath}"`),
+        execAsync(`ffmpeg -y -ss ${midSec} -i "${targetPath}" -vframes 1 -q:v 2 "${targetFramePath}"`),
+        execAsync(refExtractCmd),
       ]);
     } catch (err: any) {
       return res.status(500).json({ error: `Frame extraction failed: ${err.message}` });

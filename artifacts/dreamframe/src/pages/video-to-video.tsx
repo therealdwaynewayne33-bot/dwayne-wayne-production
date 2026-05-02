@@ -76,15 +76,22 @@ function VideoPlayer({ src, thumbnail }: { src: string; thumbnail?: string }) {
 }
 
 const VIDEO_EXTS = [".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v", ".3gp"];
+const IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".heif"];
+
 const isVideoFile = (f: File) => {
   const ext = "." + f.name.split(".").pop()?.toLowerCase();
   return f.type.startsWith("video/")
     || (f.type === "application/octet-stream" && VIDEO_EXTS.includes(ext))
     || VIDEO_EXTS.includes(ext);
 };
+const isImageFile = (f: File) => {
+  const ext = "." + f.name.split(".").pop()?.toLowerCase();
+  return f.type.startsWith("image/") || IMAGE_EXTS.includes(ext);
+};
 
-function VideoDropZone({
+function MediaDropZone({
   label, file, previewUrl, onFile, onClear, dataTestId,
+  acceptImages = false, hint,
 }: {
   label: string;
   file: File | null;
@@ -92,18 +99,31 @@ function VideoDropZone({
   onFile: (f: File) => void;
   onClear: () => void;
   dataTestId: string;
+  acceptImages?: boolean;
+  hint?: string;
 }) {
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
+  const isImg = file ? isImageFile(file) : false;
 
   const handle = (f: File) => {
-    if (!isVideoFile(f)) {
-      toast({ title: "Please upload a video file (MP4, MOV, WebM…)", variant: "destructive" });
+    const ok = isVideoFile(f) || (acceptImages && isImageFile(f));
+    if (!ok) {
+      toast({
+        title: acceptImages
+          ? "Please upload a video or image"
+          : "Please upload a video file",
+        variant: "destructive",
+      });
       return;
     }
     onFile(f);
   };
+
+  const acceptAttr = acceptImages
+    ? "video/*,image/*,.mp4,.mov,.webm,.avi,.mkv,.m4v,.3gp,.jpg,.jpeg,.png,.webp,.gif,.bmp,.heic,.heif"
+    : "video/*,.mp4,.mov,.webm,.avi,.mkv,.m4v,.3gp";
 
   return (
     <div>
@@ -123,13 +143,16 @@ function VideoDropZone({
         )}>
         {file && previewUrl ? (
           <>
-            <video src={previewUrl} className="w-full h-full object-contain bg-black" muted />
+            {isImg
+              ? <img src={previewUrl} alt="reference" className="w-full h-full object-contain bg-black" />
+              : <video src={previewUrl} className="w-full h-full object-contain bg-black" muted />
+            }
             <button onClick={(e) => { e.stopPropagation(); onClear(); }}
               className="absolute top-3 right-3 w-7 h-7 rounded-full bg-black/80 hover:bg-black flex items-center justify-center text-white transition-colors">
               <X className="w-3.5 h-3.5" />
             </button>
             <div className="absolute bottom-3 left-3 px-2.5 py-1 rounded-full bg-black/70 text-white text-[10px] font-medium truncate max-w-[90%]">
-              {file.name} · {(file.size / 1024 / 1024).toFixed(1)} MB
+              {isImg ? "IMG" : "VID"} · {file.name} · {(file.size / 1024 / 1024).toFixed(1)} MB
             </div>
           </>
         ) : (
@@ -138,12 +161,12 @@ function VideoDropZone({
               <Upload className={cn("w-4 h-4", dragging ? "text-white/70" : "text-white/25")} />
             </div>
             <div>
-              <p className="text-xs font-medium text-white/50">Drop video</p>
-              <p className="text-[10px] text-white/20 mt-0.5">MP4, MOV, WebM</p>
+              <p className="text-xs font-medium text-white/50">{acceptImages ? "Drop video or image" : "Drop video"}</p>
+              <p className="text-[10px] text-white/20 mt-0.5">{hint ?? (acceptImages ? "Video or photo · for inspiration" : "MP4, MOV, WebM")}</p>
             </div>
           </div>
         )}
-        <input ref={inputRef} type="file" accept="video/*,.mp4,.mov,.webm,.avi,.mkv,.m4v,.3gp" className="hidden"
+        <input ref={inputRef} type="file" accept={acceptAttr} className="hidden"
           onChange={(e) => e.target.files?.[0] && handle(e.target.files[0])} />
       </div>
     </div>
@@ -179,7 +202,7 @@ export default function VideoToVideoPage() {
 
   const handleSubmit = async () => {
     if (!target)    { toast({ title: "Upload a target video first",    variant: "destructive" }); return; }
-    if (!reference) { toast({ title: "Upload a reference video first", variant: "destructive" }); return; }
+    if (!reference) { toast({ title: "Upload a reference video or image first", variant: "destructive" }); return; }
     if (!prompt.trim()) { toast({ title: "Describe what to transfer", variant: "destructive" }); return; }
 
     setStage("processing");
@@ -222,26 +245,29 @@ export default function VideoToVideoPage() {
           <p className="text-xs text-white/30 uppercase tracking-widest mb-2">AI transfer</p>
           <h1 className="text-4xl font-semibold text-white tracking-tight">Video to Video</h1>
           <p className="text-sm text-white/30 mt-2">
-            Drop two videos — describe what to copy from the reference (color grade, lighting, an object) and we apply it to your target
+            Drop your video and a reference (video or photo) — describe what to copy (color grade, lighting, an object) and we apply it to your video
           </p>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-10">
           {/* Left: inputs */}
           <div className="space-y-7">
-            {/* Two video drop zones side-by-side */}
+            {/* Target video + reference (video OR image) drop zones */}
             <div className="grid grid-cols-2 gap-4 items-start">
-              <VideoDropZone
+              <MediaDropZone
                 label="Your video (target)"
                 file={target} previewUrl={targetUrl}
                 onFile={setT} onClear={clearT}
                 dataTestId="drop-zone-target"
+                hint="MP4, MOV, WebM"
               />
-              <VideoDropZone
-                label="Reference video"
+              <MediaDropZone
+                label="Reference (video or image)"
                 file={reference} previewUrl={referenceUrl}
                 onFile={setR} onClear={clearR}
                 dataTestId="drop-zone-reference"
+                acceptImages
+                hint="A photo or video to copy from"
               />
             </div>
 
@@ -354,7 +380,7 @@ export default function VideoToVideoPage() {
                 </div>
                 <div>
                   <p className="text-sm font-medium text-white/25 mb-1">Result appears here</p>
-                  <p className="text-xs text-white/15">Drop two videos and describe what to transfer</p>
+                  <p className="text-xs text-white/15">Drop a video + reference and describe what to transfer</p>
                 </div>
                 <div className="text-[11px] text-white/15 space-y-1.5 text-left w-full max-w-xs">
                   <p className="text-white/25 font-medium mb-2">Examples</p>
