@@ -127,20 +127,13 @@ export default function BgReplacePage() {
     setError(null);
     setStage("idle");
 
-    // Probe duration so we can warn the user about the 9 s trim.
+    // Probe duration just so we can show a small "auto-trimmed" badge in the
+    // preview. The backend trims to the first 9 s automatically.
     const probe = document.createElement("video");
     probe.preload = "metadata";
     probe.onloadedmetadata = () => {
       const d = probe.duration;
-      if (Number.isFinite(d) && d > 0) {
-        setClipDuration(d);
-        if (d > 9.5) {
-          toast({
-            title: "Heads up: only the first 9 seconds will be processed",
-            description: `Your clip is ${d.toFixed(1)}s. Luma's video-to-video caps inputs at ~9s — we'll trim from the start.`,
-          });
-        }
-      }
+      if (Number.isFinite(d) && d > 0) setClipDuration(d);
     };
     probe.src = url;
   };
