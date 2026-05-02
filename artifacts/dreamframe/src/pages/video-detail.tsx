@@ -1,11 +1,10 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { Link } from "wouter";
 import { useGetVideo, useApplyStyle, useDeleteVideo, getGetVideoQueryKey } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { StatusBadge } from "@/components/StatusBadge";
-import { Button } from "@/components/ui/button";
-import { ArrowLeft, Play, Trash2, Sparkles, ExternalLink } from "lucide-react";
+import { ArrowLeft, Play, Trash2, Sparkles, X, ZoomIn } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
 import { useLocation } from "wouter";
@@ -13,9 +12,37 @@ import { useLocation } from "wouter";
 type Style = "realistic" | "cartoon" | "animated-3d" | "cinematic";
 const STYLES: Style[] = ["realistic", "cartoon", "animated-3d", "cinematic"];
 
+function PreviewModal({ src, prompt, onClose }: { src: string; prompt: string; onClose: () => void }) {
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-black/90 flex flex-col items-center justify-center p-4"
+      onClick={onClose}
+    >
+      <button
+        className="absolute top-4 right-4 w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-white transition-colors"
+        onClick={onClose}
+      >
+        <X className="w-5 h-5" />
+      </button>
+      <div
+        className="relative max-w-4xl w-full rounded-2xl overflow-hidden shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <img src={src} alt={prompt} className="w-full object-contain" />
+        <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent p-5">
+          <p className="text-xs text-white/60 uppercase tracking-widest mb-1">AI-Generated Preview Frame</p>
+          <p className="text-sm text-white leading-snug">{prompt}</p>
+        </div>
+      </div>
+      <p className="mt-4 text-xs text-white/40">Click anywhere outside to close</p>
+    </div>
+  );
+}
+
 export default function VideoDetailPage({ id }: { id: number }) {
   const [trimStart, setTrimStart] = useState(0);
   const [trimEnd, setTrimEnd] = useState(100);
+  const [showPreview, setShowPreview] = useState(false);
   const [, setLocation] = useLocation();
   const queryClient = useQueryClient();
   const { toast } = useToast();
@@ -73,6 +100,14 @@ export default function VideoDetailPage({ id }: { id: number }) {
 
   return (
     <AppLayout>
+      {showPreview && video.thumbnailUrl && (
+        <PreviewModal
+          src={video.thumbnailUrl}
+          prompt={video.prompt}
+          onClose={() => setShowPreview(false)}
+        />
+      )}
+
       <div className="p-8 max-w-5xl mx-auto">
         <Link href={`/projects/${video.projectId}`}>
           <button className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground mb-6 transition-colors">
@@ -107,26 +142,24 @@ export default function VideoDetailPage({ id }: { id: number }) {
                     alt={video.title}
                     className="w-full h-full object-cover"
                   />
-                  <div className="absolute inset-0 bg-black/30 flex items-center justify-center">
-                    <a
+                  <div className="absolute inset-0 bg-black/20 flex items-center justify-center">
+                    <button
                       data-testid="button-play-pause"
-                      href={video.videoUrl ?? "#"}
-                      target="_blank"
-                      rel="noreferrer"
+                      onClick={() => setShowPreview(true)}
                       className="w-16 h-16 rounded-full bg-white/90 hover:bg-white flex items-center justify-center shadow-2xl transition-all hover:scale-105"
                     >
                       <Play className="w-7 h-7 text-black ml-1" />
-                    </a>
+                    </button>
                   </div>
-                  <a
-                    data-testid="button-download"
-                    href={video.videoUrl ?? "#"}
-                    target="_blank"
-                    rel="noreferrer"
+                  <button
+                    onClick={() => setShowPreview(true)}
                     className="absolute bottom-4 right-4 flex items-center gap-1.5 px-3 py-2 rounded-lg bg-black/60 hover:bg-black/80 text-white text-xs font-medium transition-all"
                   >
-                    <ExternalLink className="w-3.5 h-3.5" /> Open video
-                  </a>
+                    <ZoomIn className="w-3.5 h-3.5" /> View full preview
+                  </button>
+                  <div className="absolute top-3 left-3 px-2 py-1 rounded-md bg-black/60 text-white text-[10px] uppercase tracking-widest font-semibold">
+                    AI Preview Frame
+                  </div>
                 </>
               ) : (
                 <div className="absolute inset-0 flex flex-col items-center justify-center">
