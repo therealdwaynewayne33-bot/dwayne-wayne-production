@@ -130,7 +130,10 @@ function demoFilterForPrompt(prompt: string, variant: "base" | "facelock" = "bas
   if (variant === "facelock") {
     grade += ",eq=contrast=1.05:saturation=1.05:gamma=0.98,colorbalance=rs=0.08:gs=0.02:bs=-0.05";
   }
-  return `${grade},vignette=PI/5`;
+  // `colorbalance` outputs gbrp (4:4:4) which is incompatible with
+  // `-profile:v high` (needs 4:2:0). Force the pixel format back so libx264
+  // can encode in High profile for broad device compatibility.
+  return `${grade},vignette=PI/5,format=yuv420p`;
 }
 
 async function applyDemoEffect(srcPath: string, outPath: string, prompt: string, variant: "base" | "facelock" = "base") {
@@ -138,19 +141,28 @@ async function applyDemoEffect(srcPath: string, outPath: string, prompt: string,
   // Use execFile (no shell) to avoid command-injection through srcPath/outPath.
   // Even though we control these, srcPath in /fix-face is derived from a
   // user-supplied URL, so we treat them as untrusted.
-  await execFileAsync("ffmpeg", [
-    "-y",
-    "-i", srcPath,
-    "-vf", filter,
-    "-c:v", "libx264",
-    "-profile:v", "high",
-    "-level", "4.0",
-    "-preset", "fast",
-    "-crf", "20",
-    "-c:a", "copy",
-    "-movflags", "+faststart",
-    outPath,
-  ]);
+  try {
+    await execFileAsync("ffmpeg", [
+      "-y",
+      "-i", srcPath,
+      "-vf", filter,
+      "-c:v", "libx264",
+      "-profile:v", "high",
+      "-level", "4.0",
+      "-preset", "fast",
+      "-crf", "20",
+      "-c:a", "copy",
+      "-movflags", "+faststart",
+      outPath,
+    ]);
+  } catch (err: any) {
+    // execFile errors swallow the actual ffmpeg stderr in `err.message`.
+    // Surface the last bit of stderr so we can debug filter/codec failures
+    // instead of staring at "Command failed: ffmpeg ...".
+    const stderr: string = err?.stderr ?? "";
+    const tail = stderr.split("\n").filter(Boolean).slice(-6).join(" | ");
+    throw new Error(tail || err?.message || "ffmpeg failed");
+  }
 }
 
 /**
