@@ -1,2 +1,3 @@
 artifacts/api-server/public/uploads/bgr-1777704362649-7h563-src.mp4 filter=lfs diff=lfs merge=lfs -text
 artifacts/api-server/public/uploads/bgr-1777704462762-elizh-src.mp4 filter=lfs diff=lfs merge=lfs -text
+artifacts/api-server/public/uploads/bgr-1777704703967-9m67j-raw.mp4 filter=lfs diff=lfs merge=lfs -text

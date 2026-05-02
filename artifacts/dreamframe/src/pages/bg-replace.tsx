@@ -106,6 +106,7 @@ export default function BgReplacePage() {
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
   const [fixing, setFixing] = useState(false);
+  const [clipDuration, setClipDuration] = useState<number | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
 
@@ -118,11 +119,30 @@ export default function BgReplacePage() {
   const handleFile = (f: File) => {
     if (!isVideoFile(f)) { toast({ title: "Please upload a video file (MP4, MOV, WebM…)", variant: "destructive" }); return; }
     if (f.size > 100 * 1024 * 1024) { toast({ title: "Video must be under 100 MB (Luma limit)", variant: "destructive" }); return; }
+    const url = URL.createObjectURL(f);
     setFile(f);
-    setPreviewUrl(URL.createObjectURL(f));
+    setPreviewUrl(url);
+    setClipDuration(null);
     setResult(null);
     setError(null);
     setStage("idle");
+
+    // Probe duration so we can warn the user about the 9 s trim.
+    const probe = document.createElement("video");
+    probe.preload = "metadata";
+    probe.onloadedmetadata = () => {
+      const d = probe.duration;
+      if (Number.isFinite(d) && d > 0) {
+        setClipDuration(d);
+        if (d > 9.5) {
+          toast({
+            title: "Heads up: only the first 9 seconds will be processed",
+            description: `Your clip is ${d.toFixed(1)}s. Luma's video-to-video caps inputs at ~9s — we'll trim from the start.`,
+          });
+        }
+      }
+    };
+    probe.src = url;
   };
 
   const onDrop = useCallback((e: React.DragEvent) => {
@@ -201,7 +221,7 @@ export default function BgReplacePage() {
 
   const reset = () => {
     setFile(null); setPreviewUrl(null); setResult(null); setError(null);
-    setStage("idle"); setBgPrompt("");
+    setStage("idle"); setBgPrompt(""); setClipDuration(null);
   };
 
   return (
@@ -241,7 +261,13 @@ export default function BgReplacePage() {
                     </button>
                     <div className="absolute bottom-3 left-3 px-2.5 py-1 rounded-full bg-black/70 text-white text-[10px] font-medium">
                       {file.name} · {(file.size / 1024 / 1024).toFixed(1)} MB
+                      {clipDuration ? ` · ${clipDuration.toFixed(1)}s` : ""}
                     </div>
+                    {clipDuration && clipDuration > 9.5 ? (
+                      <div className="absolute top-3 left-3 px-2.5 py-1 rounded-full bg-amber-500/90 text-black text-[10px] font-semibold">
+                        Will trim to first 9s
+                      </div>
+                    ) : null}
                   </>
                 ) : (
                   <div className="flex flex-col items-center gap-4 text-center px-6">
@@ -250,7 +276,7 @@ export default function BgReplacePage() {
                     </div>
                     <div>
                       <p className="text-sm font-medium text-white/50">Drop your video here</p>
-                      <p className="text-xs text-white/20 mt-1">MP4, MOV, WebM · up to 100 MB · max 30 seconds</p>
+                      <p className="text-xs text-white/20 mt-1">MP4, MOV, WebM · up to 100 MB · trimmed to first 9 seconds</p>
                     </div>
                     <button onClick={() => fileRef.current?.click()}
                       className="text-xs text-white/40 hover:text-white transition-colors font-medium">Browse file</button>

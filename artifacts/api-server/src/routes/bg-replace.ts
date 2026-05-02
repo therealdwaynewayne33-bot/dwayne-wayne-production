@@ -18,7 +18,8 @@ const router = Router();
 
 const VIDEO_EXTS = new Set([".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v", ".3gp"]);
 
-// luma/modify-video accepts up to 100 MB / 30 s source clips
+// Cap raw uploads at 100 MB. We hard-trim to 9 s during normalization
+// (Luma flex_1's real input limit — see normalizeForLuma below).
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 100 * 1024 * 1024 },
@@ -44,25 +45,29 @@ async function makeThumbnail(videoPath: string, outPath: string) {
 }
 
 /**
- * Normalize an uploaded video to a format Luma's modify-video pipeline
- * reliably accepts:
- *   - H.264 (high profile, yuv420p) in MP4 container
- *   - AAC audio
- *   - max 1280px on the long edge, even pixel dims
- *   - 30fps, capped at 30s (Luma hard limit)
- *   - faststart for streaming
+ * Normalize an uploaded video to the EXACT profile that Luma's
+ * `modify-video` (mode `flex_1`) reliably accepts. Anything outside this
+ * profile triggers Luma's silent `(E006)` "input was invalid" error.
  *
- * Phones (especially iPhones) often produce HEVC / H.265 .mov files which
- * Luma rejects with E006 ("input was invalid"). Re-encoding here turns any
- * upload into something the model is happy with.
+ * Empirically verified spec (the docs lie about some of these):
+ *   - Max ~9 second input duration  (longer → E006, even though docs say 30s)
+ *   - Exactly 1280x720, 30fps, H.264 high profile, yuv420p
+ *   - AAC 48kHz stereo audio          (44.1kHz → E006)
+ *   - faststart MP4 container
+ *
+ * Portrait/odd-aspect inputs are letterboxed (scale + pad) to keep the
+ * canvas at exactly 1280x720 without distortion. iPhones often shoot HEVC
+ * .mov which is also fixed by re-encoding here.
  */
 async function normalizeForLuma(srcPath: string, outPath: string) {
   await execAsync(
     `ffmpeg -y -i "${srcPath}" ` +
-    `-t 30 ` +
-    `-vf "scale='min(1280,iw)':-2:flags=lanczos,fps=30,format=yuv420p" ` +
-    `-c:v libx264 -profile:v high -level 4.0 -preset fast -crf 22 ` +
-    `-c:a aac -b:a 128k -ac 2 -ar 44100 ` +
+    `-t 9 ` +
+    `-vf "scale=1280:720:force_original_aspect_ratio=decrease:flags=lanczos,` +
+        `pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,` +
+        `fps=30,format=yuv420p,setsar=1" ` +
+    `-c:v libx264 -profile:v high -level 4.0 -preset fast -b:v 4500k -maxrate 5000k -bufsize 9000k ` +
+    `-c:a aac -b:a 140k -ac 2 -ar 48000 ` +
     `-movflags +faststart ` +
     `"${outPath}"`
   );
@@ -248,10 +253,22 @@ router.post("/videos/bg-replace/fix-face", requireAuth, async (req, res) => {
 
   const jobId = `bgr-fix-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
-  // Allow either absolute or app-relative URLs from the client
-  const toAbs = (u: string) => (u.startsWith("http") ? u : `https://${domain}${u}`);
-  const targetAbs  = toAbs(targetVideoUrl);
-  const faceSrcAbs = toAbs(faceSourceUrl);
+  // SSRF guard: only accept app-relative URLs that point at our own
+  // upload/video paths. We refuse arbitrary external URLs so authenticated
+  // users can't use this endpoint to make the server fetch internal/3rd
+  // party hosts or feed unknown URLs to Replicate workers.
+  const ALLOWED_PREFIXES = ["/api/uploads/", "/api/videos-files/"];
+  const isAllowedPath = (u: string) =>
+    typeof u === "string" &&
+    ALLOWED_PREFIXES.some((p) => u.startsWith(p)) &&
+    !u.includes("..");
+  if (!isAllowedPath(targetVideoUrl) || !isAllowedPath(faceSourceUrl)) {
+    return res.status(400).json({
+      error: "targetVideoUrl and faceSourceUrl must be app-relative paths under /api/uploads/ or /api/videos-files/",
+    });
+  }
+  const targetAbs  = `https://${domain}${targetVideoUrl}`;
+  const faceSrcAbs = `https://${domain}${faceSourceUrl}`;
 
   // Download the face source (could be a video or an image) so we can extract
   // a single clean face frame from it locally.

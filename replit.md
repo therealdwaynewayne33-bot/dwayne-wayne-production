@@ -44,7 +44,16 @@ Full-stack AI video generation platform (SaaS MVP). Dark cinematic UI with chara
 - **Video Generation Types**: text-to-video, image-to-video
 - **Style Options**: realistic, cartoon, 3D-animated, cinematic
 - **Face Lock**: Character consistency system — upload character images, lock to videos
-- **Background Replace**: AI green-screen style background replacement
+- **Background Replace**: Luma Ray-2 video-to-video (`luma/modify-video`, mode `flex_1`) with optional `arabyai-replicate/roop_face_swap` for face-lock. Per-result "Fix face" button re-runs only the swap against the original Luma render.
+
+### Luma `modify-video` constraints (learned the hard way)
+
+The model rejects inputs with a silent `(E006)` "input was invalid" error if any of these aren't met. `normalizeForLuma()` in `bg-replace.ts` re-encodes every upload to match this profile:
+
+- **Max ~9 second input duration** (longer is silently rejected even though docs claim 30s)
+- 1280×720 @ 30fps, H.264 high profile, yuv420p
+- AAC 48kHz stereo audio (44.1kHz also triggered E006 in testing)
+- Public URL must be reachable from Replicate workers (our `$REPLIT_DEV_DOMAIN` works)
 - **Video Editor**: Preview player, trim controls, apply-style panel, download
 - **Character Library**: Upload/manage character images for face-lock
 - **Projects**: Organize videos into projects with status tracking
