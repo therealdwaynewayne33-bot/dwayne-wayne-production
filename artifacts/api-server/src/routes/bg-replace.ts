@@ -113,26 +113,29 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
   // 6. FFmpeg composite using alphamerge (no chromakey — preserves real colors)
   //
   //   Pipeline:
-  //     [bg image]   → scale + crop to match video dimensions         → [bg]
-  //     [original]   → convert to yuva420p (adds alpha channel slot)  → [src_rgba]
+  //     [bg image]   → looped + scaled to video size                  → [bg]
+  //     [original]   → format yuva420p (adds alpha channel slot)      → [src_rgba]
   //     [src_rgba] + [alpha-mask] → alphamerge (mask drives alpha)    → [fg]
-  //     [bg] + [fg]  → overlay                                        → [out]
+  //     [bg] + [fg]  → overlay (shortest=src video)                   → [out]
+  //
+  //   Key fix: -loop 1 on the PNG so it repeats for the full video duration
+  //   instead of stopping after frame 1 (which produced a 0:00 output).
   //
   const outputPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
   const ffmpegCmd = [
     `ffmpeg -y`,
     `-i "${srcPath}"`,
     `-i "${maskPath}"`,
-    `-i "${bgPath}"`,
+    `-loop 1 -i "${bgPath}"`,
     `-filter_complex`,
     `"[2:v]scale=${vidWidth}:${vidHeight}:force_original_aspect_ratio=increase,crop=${vidWidth}:${vidHeight}[bg];` +
-    `[0:v]scale=${vidWidth}:${vidHeight}[src_scaled];` +
-    `[src_scaled]format=yuva420p[src_rgba];` +
-    `[1:v]scale=${vidWidth}:${vidHeight},format=gray[mask];` +
+    `[0:v]format=yuva420p[src_rgba];` +
+    `[1:v]format=gray[mask];` +
     `[src_rgba][mask]alphamerge[fg];` +
     `[bg][fg]overlay=shortest=1[out]"`,
-    `-map "[out]"`,
+    `-map "[out]" -map "0:a?"`,
     `-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p`,
+    `-c:a copy`,
     `-movflags +faststart`,
     `"${outputPath}"`,
   ].join(" ");
