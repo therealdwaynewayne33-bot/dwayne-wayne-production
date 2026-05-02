@@ -2,13 +2,10 @@ import { Router } from "express";
 import { db, charactersTable, videosTable, activityTable } from "@workspace/db";
 import { eq, and, count } from "drizzle-orm";
 import { CreateCharacterBody, GetCharacterParams, DeleteCharacterParams } from "@workspace/api-zod";
+import { requireAuth } from "../middlewares/requireAuth";
 
 const router = Router();
 
-function requireAuth(req: any, res: any, next: any) {
-  if (!req.session.userId) return res.status(401).json({ error: "Not authenticated" });
-  next();
-}
 
 router.get("/characters", requireAuth, async (req, res) => {
   const chars = await db.select().from(charactersTable).where(eq(charactersTable.userId, req.session.userId!));

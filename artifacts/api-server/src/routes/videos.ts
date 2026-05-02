@@ -10,6 +10,7 @@ import {
   UploadCharacterImageBody,
   ListVideosQueryParams,
 } from "@workspace/api-zod";
+import { requireAuth } from "../middlewares/requireAuth";
 
 const router = Router();
 
@@ -19,10 +20,6 @@ const PLAN_LIMITS: Record<string, number> = {
   enterprise: Infinity,
 };
 
-function requireAuth(req: any, res: any, next: any) {
-  if (!req.session.userId) return res.status(401).json({ error: "Not authenticated" });
-  next();
-}
 
 function simulateProcessing(videoId: number) {
   setTimeout(async () => {

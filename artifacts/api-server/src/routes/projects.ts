@@ -2,13 +2,9 @@ import { Router } from "express";
 import { db, projectsTable, videosTable, activityTable } from "@workspace/db";
 import { eq, and, count } from "drizzle-orm";
 import { CreateProjectBody, GetProjectParams, UpdateProjectBody, UpdateProjectParams, DeleteProjectParams } from "@workspace/api-zod";
+import { requireAuth } from "../middlewares/requireAuth";
 
 const router = Router();
-
-function requireAuth(req: any, res: any, next: any) {
-  if (!req.session.userId) return res.status(401).json({ error: "Not authenticated" });
-  next();
-}
 
 async function projectWithCount(p: any, userId: number) {
   const [{ count: vc }] = await db.select({ count: count() }).from(videosTable).where(and(eq(videosTable.projectId, p.id), eq(videosTable.userId, userId)));

@@ -1,13 +1,10 @@
 import { Router } from "express";
 import { db, usersTable, videosTable } from "@workspace/db";
 import { eq, gte, and, count } from "drizzle-orm";
+import { requireAuth } from "../middlewares/requireAuth";
 
 const router = Router();
 
-function requireAuth(req: any, res: any, next: any) {
-  if (!req.session.userId) return res.status(401).json({ error: "Not authenticated" });
-  next();
-}
 
 const PLANS = [
   {

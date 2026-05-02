@@ -17,6 +17,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [, setLocation] = useLocation();
 
   const logout = () => {
+    localStorage.removeItem("dreamframe_token");
     logoutMutation.mutate(undefined, {
       onSuccess: () => setLocation("/"),
     });

@@ -49,6 +49,7 @@ export default function AuthPage() {
     setError("");
     loginMutation.mutate({ data }, {
       onSuccess: (response) => {
+        localStorage.setItem("dreamframe_token", response.token);
         queryClient.setQueryData(getGetMeQueryKey(), response.user);
         setLocation("/dashboard");
       },
@@ -60,6 +61,7 @@ export default function AuthPage() {
     setError("");
     registerMutation.mutate({ data }, {
       onSuccess: (response) => {
+        localStorage.setItem("dreamframe_token", response.token);
         queryClient.setQueryData(getGetMeQueryKey(), response.user);
         setLocation("/dashboard");
       },

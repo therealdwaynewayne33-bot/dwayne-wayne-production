@@ -1,15 +1,12 @@
 import { Router } from "express";
 import { db, projectsTable, videosTable, charactersTable, activityTable, usersTable } from "@workspace/db";
 import { eq, count, and } from "drizzle-orm";
+import { requireAuth } from "../middlewares/requireAuth";
 
 const router = Router();
 
 const PLAN_LIMITS: Record<string, number> = { free: 10, pro: 100, enterprise: 1000 };
 
-function requireAuth(req: any, res: any, next: any) {
-  if (!req.session.userId) return res.status(401).json({ error: "Not authenticated" });
-  next();
-}
 
 router.get("/dashboard/summary", requireAuth, async (req, res) => {
   const uid = req.session.userId!;
