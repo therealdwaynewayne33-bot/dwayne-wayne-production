@@ -20,6 +20,7 @@ import Replicate from "replicate";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const THUMBS_DIR = path.join(__dirname, "../public/thumbs");
 const VIDEOS_DIR = path.join(__dirname, "../public/videos");
+const CHARS_DIR  = path.join(__dirname, "../public/chars");
 
 const router = Router();
 
@@ -44,19 +45,20 @@ async function generateThumbnail(videoId: number, prompt: string): Promise<strin
 }
 
 // Generate real video using Replicate minimax/video-01
-async function generateVideo(videoId: number, prompt: string): Promise<{ videoUrl: string; duration: number }> {
+async function generateVideo(videoId: number, prompt: string, characterImageUrl?: string): Promise<{ videoUrl: string; duration: number }> {
   const token = process.env.REPLICATE_API_TOKEN;
   if (!token) throw new Error("REPLICATE_API_TOKEN not set");
 
   const replicate = new Replicate({ auth: token });
 
+  // Build input — if character face lock is enabled, pass image as first frame
+  const input: Record<string, unknown> = { prompt, prompt_optimizer: true };
+  if (characterImageUrl) {
+    input.first_frame_image = characterImageUrl;
+  }
+
   // Use minimax/video-01 — 6s video, good motion quality
-  const output = await replicate.run("minimax/video-01", {
-    input: {
-      prompt: prompt,
-      prompt_optimizer: true,
-    },
-  }) as unknown;
+  const output = await replicate.run("minimax/video-01", { input }) as unknown;
 
   // output is a ReadableStream or URL string depending on SDK version
   let videoUrl: string;
@@ -86,10 +88,24 @@ async function runGeneration(videoId: number, prompt: string) {
   try {
     await db.update(videosTable).set({ status: "processing" }).where(eq(videosTable.id, videoId));
 
+    // Fetch the video record to get characterId (for face lock)
+    const [videoRecord] = await db.select().from(videosTable).where(eq(videosTable.id, videoId)).limit(1);
+    let characterImageUrl: string | undefined;
+    if (videoRecord?.characterId) {
+      const [char] = await db.select().from(charactersTable).where(eq(charactersTable.id, videoRecord.characterId)).limit(1);
+      if (char?.imageUrl && char.imageUrl.startsWith("/api/char-files/")) {
+        // Build a public URL Replicate can fetch
+        const domain = process.env.REPLIT_DEV_DOMAIN ?? process.env.REPLIT_DOMAINS?.split(",")[0];
+        if (domain) {
+          characterImageUrl = `https://${domain}/api/char-files/${char.id}.png`;
+        }
+      }
+    }
+
     // Run thumbnail and video generation in parallel
     const [thumbnailUrl, videoResult] = await Promise.allSettled([
       generateThumbnail(videoId, prompt),
-      generateVideo(videoId, prompt),
+      generateVideo(videoId, prompt, characterImageUrl),
     ]);
 
     const thumb = thumbnailUrl.status === "fulfilled" ? thumbnailUrl.value : `https://picsum.photos/seed/${videoId}/640/360`;
@@ -196,13 +212,27 @@ router.post("/videos/:id/apply-style", requireAuth, async (req, res) => {
 router.post("/videos/upload-character", requireAuth, async (req, res) => {
   const parsed = UploadCharacterImageBody.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid request body" });
+
+  // Insert with placeholder to get ID
   const [char] = await db.insert(charactersTable).values({
     userId: req.session.userId!,
     name: parsed.data.name,
-    imageUrl: parsed.data.imageDataUrl.substring(0, 500),
+    imageUrl: "",
   }).returning();
+
+  // Save the full image as a file
+  let imageUrl = parsed.data.imageDataUrl;
+  if (imageUrl.startsWith("data:image")) {
+    await mkdir(CHARS_DIR, { recursive: true });
+    const base64 = imageUrl.replace(/^data:image\/\w+;base64,/, "");
+    const buf = Buffer.from(base64, "base64");
+    await writeFile(path.join(CHARS_DIR, `${char.id}.png`), buf);
+    imageUrl = `/api/char-files/${char.id}.png`;
+  }
+
+  await db.update(charactersTable).set({ imageUrl }).where(eq(charactersTable.id, char.id));
   await db.insert(activityTable).values({ userId: req.session.userId!, type: "character_added", description: `Uploaded character "${char.name}"`, resourceId: char.id, resourceType: "character" });
-  return res.json({ imageUrl: char.imageUrl, characterId: char.id });
+  return res.json({ imageUrl, characterId: char.id });
 });
 
 export default router;

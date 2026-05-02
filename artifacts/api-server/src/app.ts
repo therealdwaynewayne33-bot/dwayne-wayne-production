@@ -58,6 +58,8 @@ app.use(
 app.use("/api/thumbs", express.static(path.join(__dirname, "../public/thumbs")));
 // Serve generated video files
 app.use("/api/videos-files", express.static(path.join(__dirname, "../public/videos")));
+// Serve character reference images
+app.use("/api/char-files", express.static(path.join(__dirname, "../public/chars")));
 
 app.use("/api", router);
 

@@ -58,7 +58,7 @@ export default function CharactersPage() {
       return;
     }
     createCharacter.mutate({
-      data: { name: data.name, description: data.description, imageUrl: imageDataUrl.substring(0, 500) }
+      data: { name: data.name, description: data.description, imageUrl: imageDataUrl }
     }, {
       onSuccess: () => {
         queryClient.invalidateQueries({ queryKey: getListCharactersQueryKey() });
