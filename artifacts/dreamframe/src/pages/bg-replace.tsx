@@ -126,8 +126,14 @@ export default function BgReplacePage() {
     form.append("video", file);
     form.append("backgroundPrompt", bgPrompt.trim());
 
+    const token = localStorage.getItem("dreamframe_token");
     try {
-      const resp = await fetch("/api/videos/bg-replace", { method: "POST", body: form, credentials: "include" });
+      const resp = await fetch("/api/videos/bg-replace", {
+        method: "POST",
+        body: form,
+        credentials: "include",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.error ?? "Unknown error");
       setResult(data);

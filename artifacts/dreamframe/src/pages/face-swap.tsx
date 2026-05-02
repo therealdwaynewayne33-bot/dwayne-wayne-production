@@ -119,7 +119,13 @@ export default function FaceSwapPage() {
     form.append("targetImage", targetFile);
 
     try {
-      const resp = await fetch("/api/face-swap", { method: "POST", body: form, credentials: "include" });
+      const token = localStorage.getItem("dreamframe_token");
+      const resp = await fetch("/api/face-swap", {
+        method: "POST",
+        body: form,
+        credentials: "include",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.error ?? "Unknown error");
       setResult(data.imageUrl);
