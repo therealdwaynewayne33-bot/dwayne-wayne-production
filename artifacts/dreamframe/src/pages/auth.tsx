@@ -48,8 +48,8 @@ export default function AuthPage() {
   const onLogin = (data: LoginData) => {
     setError("");
     loginMutation.mutate({ data }, {
-      onSuccess: () => {
-        queryClient.invalidateQueries({ queryKey: getGetMeQueryKey() });
+      onSuccess: (response) => {
+        queryClient.setQueryData(getGetMeQueryKey(), response.user);
         setLocation("/dashboard");
       },
       onError: () => setError("Invalid email or password"),
@@ -59,11 +59,17 @@ export default function AuthPage() {
   const onRegister = (data: RegisterData) => {
     setError("");
     registerMutation.mutate({ data }, {
-      onSuccess: () => {
-        queryClient.invalidateQueries({ queryKey: getGetMeQueryKey() });
+      onSuccess: (response) => {
+        queryClient.setQueryData(getGetMeQueryKey(), response.user);
         setLocation("/dashboard");
       },
-      onError: () => setError("Registration failed. Email may already be in use."),
+      onError: (err: any) => {
+        if (err?.data?.error?.includes("already")) {
+          setError("That email is already registered. Try signing in instead.");
+        } else {
+          setError("Registration failed. Please try again.");
+        }
+      },
     });
   };
 
@@ -106,11 +112,28 @@ export default function AuthPage() {
             <span className="text-lg font-bold">DreamFrame AI Studio</span>
           </div>
 
+          <div className="flex rounded-lg border border-border bg-secondary/40 p-1 mb-6">
+            <button
+              type="button"
+              onClick={() => { setMode("login"); setError(""); }}
+              className={`flex-1 py-2 rounded-md text-sm font-semibold transition-all ${mode === "login" ? "bg-card text-foreground shadow" : "text-muted-foreground hover:text-foreground"}`}
+            >
+              Sign in
+            </button>
+            <button
+              type="button"
+              onClick={() => { setMode("register"); setError(""); }}
+              className={`flex-1 py-2 rounded-md text-sm font-semibold transition-all ${mode === "register" ? "bg-card text-foreground shadow" : "text-muted-foreground hover:text-foreground"}`}
+            >
+              Create account
+            </button>
+          </div>
+
           <h2 className="text-2xl font-bold text-foreground mb-1">
-            {mode === "login" ? "Welcome back" : "Create account"}
+            {mode === "login" ? "Welcome back" : "Get started free"}
           </h2>
           <p className="text-muted-foreground text-sm mb-6">
-            {mode === "login" ? "Sign in to your studio" : "Start creating AI videos today"}
+            {mode === "login" ? "Sign in to your studio" : "Create your account — no credit card needed"}
           </p>
 
           {error && (
