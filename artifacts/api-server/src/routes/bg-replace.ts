@@ -2,7 +2,7 @@ import { Router } from "express";
 import multer from "multer";
 import path from "path";
 import { fileURLToPath } from "url";
-import { mkdir, writeFile } from "fs/promises";
+import { mkdir, writeFile, readFile } from "fs/promises";
 import { exec } from "child_process";
 import { promisify } from "util";
 import Replicate from "replicate";
@@ -14,6 +14,34 @@ const UPLOADS_DIR = path.join(__dirname, "../public/uploads");
 const VIDEOS_DIR  = path.join(__dirname, "../public/videos");
 const THUMBS_DIR  = path.join(__dirname, "../public/thumbs");
 const execAsync   = promisify(exec);
+
+/**
+ * Read a downsampled PPM and return all pixels with luminance.
+ * Used for cheap colour / brightness sampling of an image.
+ */
+async function samplePixels(imagePath: string, size = 16) {
+  const ppmPath = `${imagePath}.${size}.ppm`;
+  await execAsync(`ffmpeg -y -i "${imagePath}" -vf scale=${size}:${size} -frames:v 1 "${ppmPath}"`);
+  const buf = await readFile(ppmPath);
+  let nl = 0, idx = 0;
+  while (nl < 3 && idx < buf.length) {
+    if (buf[idx] === 0x0a) nl++;
+    idx++;
+  }
+  const pixels: Array<{ r: number; g: number; b: number; lum: number }> = [];
+  for (let i = idx; i < buf.length; i += 3) {
+    const r = buf[i], g = buf[i + 1], b = buf[i + 2];
+    pixels.push({ r, g, b, lum: 0.299 * r + 0.587 * g + 0.114 * b });
+  }
+  return pixels;
+}
+
+async function avgLuminance(imagePath: string): Promise<number> {
+  const px = await samplePixels(imagePath, 16);
+  let s = 0;
+  for (const p of px) s += p.lum;
+  return s / px.length;
+}
 
 const router = Router();
 
@@ -134,29 +162,58 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     return res.status(500).json({ error: `Background editing failed: ${err.message}` });
   }
 
-  // 7. FFmpeg composite — environmental colour-bake pipeline.
+  // 7. EXPOSURE + COLOUR MATCHING — sample brightness of bg vs source so we
+  //    can lift the subject toward the new environment's exposure level.
+  //    Without this, a dark-lit subject pasted on a bright wall looks like a
+  //    silhouette — the #1 cause of "green screen" / "pasted on" feel.
+  let subjectBrightness = 1.0;     // gamma multiplier for subject (>1 brightens)
+  let ambientOpacity   = 0.30;     // softlight strength of bg colour onto subject
+  try {
+    // Sample mid-frame of source video for subject exposure estimate.
+    const srcMidFrame = path.join(UPLOADS_DIR, `${jobId}-srcmid.png`);
+    await execAsync(
+      `ffmpeg -y -ss ${(vidDuration / 2).toFixed(2)} -i "${srcPath}" -vframes 1 -q:v 2 "${srcMidFrame}"`
+    );
+    const srcLum = await avgLuminance(srcMidFrame);
+    const bgLum  = await avgLuminance(bgPath);
+    // Lift subject toward bg luminance, but cap to avoid crushing detail.
+    // ratio < 1 → bg is darker than subject → keep subject at 1.0 (don't darken).
+    // ratio > 1 → bg is brighter → lift subject; cap at 1.55 so faces don't blow out.
+    const ratio = bgLum / Math.max(1, srcLum);
+    subjectBrightness = Math.max(1.0, Math.min(1.55, Math.pow(ratio, 0.85)));
+    // If the exposure gap is huge, lean MORE on ambient colour blend too.
+    ambientOpacity = ratio > 1.4 ? 0.40 : 0.30;
+    req.log.info(
+      {
+        srcLum: srcLum.toFixed(1),
+        bgLum:  bgLum.toFixed(1),
+        ratio:  ratio.toFixed(3),
+        subjectBrightness: subjectBrightness.toFixed(3),
+        ambientOpacity,
+      },
+      "bg-replace: exposure match"
+    );
+  } catch (err: any) {
+    req.log.warn({ err: err.message }, "bg-replace: exposure sampling failed, using defaults");
+  }
+
+  // 8. FFmpeg composite — environmental colour-bake pipeline.
   //
   //  PROBLEM SOLVED: "green screen look" — character looks pasted on because
   //  their lighting / colour temperature doesn't match the new background.
   //
-  //  REAL-WORLD PHYSICS: when a person stands in a room, ambient light bounces
-  //  from the walls/floor/ceiling onto their skin and clothes. Stand in a blue
-  //  room → blue cast on skin. Stand at sunset → warm orange cast. Without
-  //  baking this in, the composite ALWAYS looks fake.
-  //
   //  PIPELINE:
-  //   1. bg_main      — slight DOF blur (sigma=2) so subject pops vs bg.
-  //   2. bg_ambient   — heavy blur (sigma=80) of bg → averages to bg's colour cast.
-  //   3. mask_soft    — sigma=2.5 mask blur (softer edges = no hard cutout halo).
-  //   4. SUBJECT TINT — softlight the bg_ambient OVER the full source frame
-  //      at 55% BEFORE alphamerge. This bakes the bg's colour cast directly
-  //      into skin/clothes/hair. THIS is what makes the character belong in
-  //      the new environment instead of looking pasted on.
-  //   5. alphamerge with the soft mask → tinted foreground with feathered edges.
-  //   6. Composite tinted_fg over bg_main.
-  //   7. Final 12% softlight of bg_ambient over the WHOLE comp → unifies
-  //      micro-contrast and noise so subject and bg read as one shot.
-  //   8. Tiny saturation / contrast bump + grain → final integration.
+  //   1. bg_main         — light DOF blur (sigma=2) so subject pops vs bg.
+  //   2. bg_ambient      — heavy blur (sigma=80) of bg → averages to bg colour.
+  //   3. mask_soft       — sigma=2.5 mask blur (softer edges = no halo).
+  //   4. src_lit         — eq=gamma lift on the source so subject brightness
+  //                        matches the new environment's exposure level.
+  //   5. src_tinted      — softlight bg_ambient over src_lit at ~30–40% so
+  //                        skin/clothes pick up the new room's colour cast.
+  //   6. alphamerge      — cut tinted+lit subject out with feathered mask.
+  //   7. overlay         — composite onto bg_main.
+  //   8. NO final whole-frame tint — that was greening the walls. Just a
+  //      tiny contrast/grain pass to unify the layers.
   //
   const outputPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
   const ffmpegCmd = [
@@ -168,16 +225,16 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     `"[2:v]scale=${vidWidth}:${vidHeight}:force_original_aspect_ratio=increase,crop=${vidWidth}:${vidHeight}[bg_clean];` +
     `[bg_clean]split=2[bg_for_dof][bg_for_amb];` +
     `[bg_for_dof]gblur=sigma=2,format=yuv420p[bg_main];` +
-    `[bg_for_amb]gblur=sigma=80,format=yuv420p,split=2[bg_ambient_a][bg_ambient_b];` +
+    `[bg_for_amb]gblur=sigma=80,format=yuv420p[bg_ambient];` +
     `[1:v]format=gray,gblur=sigma=2.5[mask_soft];` +
+    // Lift subject brightness FIRST so dark subjects don't look like silhouettes
+    // when placed on bright walls.
+    `[0:v]eq=gamma=${subjectBrightness.toFixed(3)}:contrast=1.02[src_lit];` +
     // Bake bg's colour cast INTO the subject before cutting it out.
-    // This is the key step that prevents the "green screen" look.
-    `[0:v][bg_ambient_a]blend=all_mode=softlight:all_opacity=0.55:shortest=1,format=yuva420p[src_tinted];` +
+    `[src_lit][bg_ambient]blend=all_mode=softlight:all_opacity=${ambientOpacity.toFixed(2)}:shortest=1,format=yuva420p[src_tinted];` +
     `[src_tinted][mask_soft]alphamerge[fg];` +
-    `[bg_main][fg]overlay=shortest=1[comp];` +
-    // Lighter final pass over the whole frame for grain/contrast unification.
-    `[comp][bg_ambient_b]blend=all_mode=softlight:all_opacity=0.12:shortest=1,` +
-    `eq=contrast=1.03:saturation=1.04,` +
+    `[bg_main][fg]overlay=shortest=1,` +
+    `eq=contrast=1.02:saturation=1.02,` +
     `noise=alls=3:allf=t+u[out]"`,
     `-map "[out]" -map "0:a?"`,
     `-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p`,
