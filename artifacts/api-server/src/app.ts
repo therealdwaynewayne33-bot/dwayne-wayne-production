@@ -54,8 +54,10 @@ app.use(
   })
 );
 
-// Serve AI-generated thumbnails at /api/thumbs/:file
+// Serve AI-generated thumbnails
 app.use("/api/thumbs", express.static(path.join(__dirname, "../public/thumbs")));
+// Serve generated video files
+app.use("/api/videos-files", express.static(path.join(__dirname, "../public/videos")));
 
 app.use("/api", router);
 

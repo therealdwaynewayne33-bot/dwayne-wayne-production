@@ -15,9 +15,11 @@ import { generateImageBuffer } from "@workspace/integrations-openai-ai-server/im
 import { writeFile, mkdir } from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
+import Replicate from "replicate";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const THUMBS_DIR = path.join(__dirname, "../public/thumbs");
+const VIDEOS_DIR = path.join(__dirname, "../public/videos");
 
 const router = Router();
 
@@ -27,51 +29,91 @@ const PLAN_LIMITS: Record<string, number> = {
   enterprise: Infinity,
 };
 
-const MOTION_PHASES = [
-  "starting position, just beginning to move",
-  "mid-motion, peak dynamic action, full stride",
-  "follow-through, opposite limbs extended",
-  "recovery step, returning to start position",
-];
-
+// Generate a real thumbnail using OpenAI
 async function generateThumbnail(videoId: number, prompt: string): Promise<string> {
   try {
     await mkdir(THUMBS_DIR, { recursive: true });
-    const base = `Cinematic action shot, full body visible: ${prompt}. High quality, dramatic lighting, 24mm lens, sharp focus.`;
-
-    const results = await Promise.allSettled(
-      MOTION_PHASES.map(async (phase, i) => {
-        const buf = await generateImageBuffer(`${base} ${phase}`, "1536x1024");
-        const fp = path.join(THUMBS_DIR, `${videoId}_${i}.png`);
-        await writeFile(fp, buf);
-        return `/api/thumbs/${videoId}_${i}.png`;
-      })
-    );
-
-    const frameUrls = results.map((r, i) =>
-      r.status === "fulfilled" ? r.value : `https://picsum.photos/seed/${videoId}${i}/640/360`
-    );
-
-    return `multi:${frameUrls.join(",")}`;
+    const imagePrompt = `Cinematic still frame: ${prompt}. High quality, dramatic lighting, professional photography.`;
+    const buffer = await generateImageBuffer(imagePrompt, "1536x1024");
+    const filePath = path.join(THUMBS_DIR, `${videoId}.png`);
+    await writeFile(filePath, buffer);
+    return `/api/thumbs/${videoId}.png`;
   } catch {
     return `https://picsum.photos/seed/${videoId}/640/360`;
   }
 }
 
-function simulateProcessing(videoId: number, prompt: string) {
-  setTimeout(async () => {
+// Generate real video using Replicate minimax/video-01
+async function generateVideo(videoId: number, prompt: string): Promise<{ videoUrl: string; duration: number }> {
+  const token = process.env.REPLICATE_API_TOKEN;
+  if (!token) throw new Error("REPLICATE_API_TOKEN not set");
+
+  const replicate = new Replicate({ auth: token });
+
+  // Use minimax/video-01 — 6s video, good motion quality
+  const output = await replicate.run("minimax/video-01", {
+    input: {
+      prompt: prompt,
+      prompt_optimizer: true,
+    },
+  }) as unknown;
+
+  // output is a ReadableStream or URL string depending on SDK version
+  let videoUrl: string;
+  if (typeof output === "string") {
+    videoUrl = output;
+  } else if (output && typeof (output as any).url === "function") {
+    videoUrl = (output as any).url().href;
+  } else if (Array.isArray(output) && output.length > 0) {
+    const item = output[0];
+    videoUrl = typeof item === "string" ? item : item.url().href;
+  } else {
+    throw new Error("Unexpected Replicate output format");
+  }
+
+  // Download and serve locally so the URL works reliably
+  await mkdir(VIDEOS_DIR, { recursive: true });
+  const videoResp = await fetch(videoUrl);
+  if (!videoResp.ok) throw new Error(`Failed to fetch video: ${videoResp.status}`);
+  const buf = Buffer.from(await videoResp.arrayBuffer());
+  const localPath = path.join(VIDEOS_DIR, `${videoId}.mp4`);
+  await writeFile(localPath, buf);
+
+  return { videoUrl: `/api/videos-files/${videoId}.mp4`, duration: 6 };
+}
+
+async function runGeneration(videoId: number, prompt: string) {
+  try {
     await db.update(videosTable).set({ status: "processing" }).where(eq(videosTable.id, videoId));
-    const thumbnailUrl = await generateThumbnail(videoId, prompt);
+
+    // Run thumbnail and video generation in parallel
+    const [thumbnailUrl, videoResult] = await Promise.allSettled([
+      generateThumbnail(videoId, prompt),
+      generateVideo(videoId, prompt),
+    ]);
+
+    const thumb = thumbnailUrl.status === "fulfilled" ? thumbnailUrl.value : `https://picsum.photos/seed/${videoId}/640/360`;
+    const vidUrl = videoResult.status === "fulfilled" ? videoResult.value.videoUrl : null;
+    const duration = videoResult.status === "fulfilled" ? videoResult.value.duration : 6;
+
+    if (videoResult.status === "rejected") {
+      // Log error but still complete with thumbnail only
+      console.error("Video generation failed:", videoResult.reason);
+    }
+
     await db.update(videosTable).set({
       status: "completed",
-      videoUrl: `https://www.w3schools.com/html/mov_bbb.mp4`,
-      thumbnailUrl,
-      duration: Math.round((15 + Math.random() * 45) * 10) / 10,
+      videoUrl: vidUrl,
+      thumbnailUrl: thumb,
+      duration,
     }).where(eq(videosTable.id, videoId));
     await db.update(projectsTable).set({ status: "completed", updatedAt: new Date() }).where(
       eq(projectsTable.id, (await db.select().from(videosTable).where(eq(videosTable.id, videoId)).limit(1))[0]?.projectId ?? -1)
     );
-  }, 2000);
+  } catch (err) {
+    console.error("runGeneration failed:", err);
+    await db.update(videosTable).set({ status: "failed" }).where(eq(videosTable.id, videoId));
+  }
 }
 
 router.get("/videos", requireAuth, async (req, res) => {
@@ -119,7 +161,7 @@ router.post("/videos", requireAuth, async (req, res) => {
   }).returning();
   await db.insert(activityTable).values({ userId: req.session.userId!, type: "video_generated", description: `Started generating "${video.title}"`, resourceId: video.id, resourceType: "video" });
   await db.update(projectsTable).set({ status: "processing", updatedAt: new Date() }).where(eq(projectsTable.id, video.projectId));
-  simulateProcessing(video.id, parsed.data.prompt);
+  void runGeneration(video.id, parsed.data.prompt);
   return res.status(201).json(video);
 });
 
@@ -147,7 +189,7 @@ router.post("/videos/:id/apply-style", requireAuth, async (req, res) => {
   const [video] = await db.update(videosTable).set({ style: body.data.style, status: "queued" }).where(and(eq(videosTable.id, params.data.id), eq(videosTable.userId, req.session.userId!))).returning();
   if (!video) return res.status(404).json({ error: "Video not found" });
   await db.insert(activityTable).values({ userId: req.session.userId!, type: "style_applied", description: `Applied ${body.data.style} style to "${video.title}"`, resourceId: video.id, resourceType: "video" });
-  simulateProcessing(video.id, video.prompt);
+  void runGeneration(video.id, video.prompt);
   return res.json(video);
 });
 
