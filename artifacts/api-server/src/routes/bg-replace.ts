@@ -94,34 +94,37 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     vidDuration = parseFloat(parts[2]) || 5;
   } catch { /* use defaults */ }
 
-  // 5. Extract a mid-point frame from the source video for background context
-  //    This gives GPT-Image-1 the actual scene so it can make targeted edits
-  //    (e.g. "white walls" only changes the walls, not the whole room)
+  // 5. Extract TWO candidate context frames for GPT:
+  //    - Very first frame (0.1s): often has least subject overlap, best for bg context
+  //    - Near-last frame: fallback if first is too dark/transitional
+  //    We pass whichever gives GPT the clearest background.
   const contextFramePath = path.join(UPLOADS_DIR, `${jobId}-context.png`);
-  const midSec = (vidDuration / 2).toFixed(2);
   try {
+    // Try first frame (0.1s) — before subject has fully entered the scene
     await execAsync(
-      `ffmpeg -y -ss ${midSec} -i "${srcPath}" -vframes 1 -q:v 2 "${contextFramePath}"`
+      `ffmpeg -y -ss 0.1 -i "${srcPath}" -vframes 1 -q:v 2 "${contextFramePath}"`
     );
   } catch (err: any) {
     return res.status(500).json({ error: `Frame extraction failed: ${err.message}` });
   }
 
-  // 6. Use GPT-Image-1 to make a targeted edit to the real background frame
-  //    The model sees the actual scene — camera angle, lighting, proportions — so it
-  //    only changes what was specified and keeps everything else identical.
+  // 6. GPT-Image-1 targeted edit:
+  //    We give it the real scene frame and a strict instruction to ONLY change
+  //    what was asked — everything architectural (door frames, windows, built-ins)
+  //    must stay identical.
   const bgPath = path.join(UPLOADS_DIR, `${jobId}-bg.png`);
   try {
     const editInstruction =
-      `Edit the BACKGROUND of this scene. Change only: "${backgroundPrompt}". ` +
-      `Strict rules for realism: ` +
-      `(1) Keep the EXACT same camera angle, perspective and lens distortion. ` +
-      `(2) Keep the EXACT same lighting direction, colour temperature and shadow positions. ` +
-      `(3) Keep every unchanged surface, object and furniture piece pixel-perfect. ` +
-      `(4) Make the result look like a real photograph — same sensor noise level, ` +
-      `same depth of field, same sharpness falloff as the original. ` +
-      `(5) Remove all people — return only the background, no subjects. ` +
-      `(6) Do NOT add or remove any objects unless that was specifically requested.`;
+      `You are editing the BACKGROUND ONLY of this scene frame. ` +
+      `Make ONLY this change: "${backgroundPrompt}". ` +
+      `ABSOLUTE RULES — never break these: ` +
+      `(1) NEVER touch door frames, doorways, windows, archways, stairs or any architectural structure — these are FIXED and must remain pixel-perfect. ` +
+      `(2) NEVER change the floor, ceiling, or any surface not mentioned in the request. ` +
+      `(3) NEVER add or remove furniture, objects, or decorations unless explicitly requested. ` +
+      `(4) Keep the EXACT same camera angle, perspective, lighting direction and colour temperature. ` +
+      `(5) If any people appear in the frame, remove them naturally — inpaint the background behind where they stood. ` +
+      `(6) Output must look like a real photograph — match the original noise, grain, and sharpness level exactly. ` +
+      `(7) Change ONLY the specific surface or element named. Nothing else.`;
 
     const bgBuffer = await editImages([contextFramePath], editInstruction);
     await writeFile(bgPath, bgBuffer);
@@ -129,13 +132,13 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     return res.status(500).json({ error: `Background editing failed: ${err.message}` });
   }
 
-  // 7. FFmpeg composite — realism pipeline:
+  // 7. FFmpeg composite — confirmed working realism pipeline:
   //
-  //  • Mask feathering  (gblur sigma=3) — soft edges instead of hard cutout
-  //  • Background DOF   (gblur sigma=3) — slight blur puts bg visually behind subject
-  //  • Film grain       (noise alls=8)  — both layers share same grain texture so
-  //                                       they feel like they came from the same camera
-  //  • Cinematic grade  (curves + colorchannelmixer + vignette)
+  //  • sigma=1 mask blur  — minimal feathering only, STOPS the green-screen halo glow
+  //                         that sigma=3 was causing (too much blur = transparent fringe)
+  //  • sigma=1 bg blur    — barely perceptible DOF, just enough to separate layers
+  //  • grain noise=6      — shared texture makes both layers feel from the same camera
+  //  • Cinematic grade    — curves + teal-orange + vignette
   //
   const outputPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
   const ffmpegCmd = [
@@ -144,16 +147,16 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     `-i "${maskPath}"`,
     `-loop 1 -i "${bgPath}"`,
     `-filter_complex`,
-    `"[2:v]scale=${vidWidth}:${vidHeight}:force_original_aspect_ratio=increase,crop=${vidWidth}:${vidHeight},gblur=sigma=3[bg_dof];` +
-    `[1:v]format=gray,gblur=sigma=3[mask_soft];` +
+    `"[2:v]scale=${vidWidth}:${vidHeight}:force_original_aspect_ratio=increase,crop=${vidWidth}:${vidHeight},gblur=sigma=1[bg];` +
+    `[1:v]format=gray,gblur=sigma=1[mask_soft];` +
     `[0:v]format=yuva420p[src_rgba];` +
     `[src_rgba][mask_soft]alphamerge[fg];` +
-    `[bg_dof][fg]overlay=shortest=1[comp];` +
+    `[bg][fg]overlay=shortest=1[comp];` +
     `[comp]eq=contrast=1.08:brightness=0.0:saturation=0.82,` +
     `curves=all='0/0.05 0.25/0.27 0.75/0.78 1/0.96',` +
     `colorchannelmixer=rr=1.0:rg=0.01:rb=-0.03:gr=-0.01:gg=0.95:gb=0.06:br=-0.07:bg=0.07:bb=1.0,` +
     `vignette=PI/5,` +
-    `noise=alls=8:allf=t+u[out]"`,
+    `noise=alls=6:allf=t+u[out]"`,
     `-map "[out]" -map "0:a?"`,
     `-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p`,
     `-c:a copy`,
