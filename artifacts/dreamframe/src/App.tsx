@@ -14,6 +14,7 @@ import VideoDetailPage from "@/pages/video-detail";
 import PricingPage from "@/pages/pricing";
 import BgReplacePage from "@/pages/bg-replace";
 import FaceSwapPage from "@/pages/face-swap";
+import VideoToVideoPage from "@/pages/video-to-video";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -73,6 +74,7 @@ function CharactersRoute() { return <ProtectedRoute component={CharactersPage} /
 function PricingRoute() { return <ProtectedRoute component={PricingPage} />; }
 function BgReplaceRoute() { return <ProtectedRoute component={BgReplacePage} />; }
 function FaceSwapRoute()  { return <ProtectedRoute component={FaceSwapPage} />; }
+function V2VRoute()       { return <ProtectedRoute component={VideoToVideoPage} />; }
 
 function Router() {
   return (
@@ -82,6 +84,7 @@ function Router() {
       <Route path="/create" component={CreateRoute} />
       <Route path="/bg-replace" component={BgReplaceRoute} />
       <Route path="/face-swap" component={FaceSwapRoute} />
+      <Route path="/video-to-video" component={V2VRoute} />
       <Route path="/projects" component={ProjectsRoute} />
       <Route path="/projects/:id" component={ProjectDetailRoute} />
       <Route path="/characters" component={CharactersRoute} />

@@ -7,8 +7,9 @@ import { useState, useRef, useEffect } from "react";
 const navItems = [
   { label: "Dashboard",   href: "/dashboard" },
   { label: "Create",      href: "/create" },
-  { label: "Face Swap",   href: "/face-swap",  badge: "AI" },
-  { label: "BG Replace",  href: "/bg-replace", badge: "AI" },
+  { label: "Face Swap",   href: "/face-swap",      badge: "AI" },
+  { label: "BG Replace",  href: "/bg-replace",     badge: "AI" },
+  { label: "V2V",         href: "/video-to-video", badge: "AI" },
   { label: "Projects",    href: "/projects" },
   { label: "Characters",  href: "/characters" },
 ];
