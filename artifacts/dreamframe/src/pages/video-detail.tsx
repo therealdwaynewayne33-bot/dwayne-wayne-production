@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { Link } from "wouter";
 import { useGetVideo, useApplyStyle, useDeleteVideo, getGetVideoQueryKey } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
@@ -18,58 +18,128 @@ function fmt(secs: number) {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-const FRAME_INTERVAL_MS = 160; // ~6 fps animation
-
+// ─── Canvas Video Player ───────────────────────────────────────────────────
+// Simulates motion by animating the AI image with running physics on each frame:
+//  • horizontal parallax  – background scrolls left (scene movement)
+//  • vertical bounce      – subject bobs up/down (footstep rhythm)
+//  • lateral sway         – slight left/right torso swing
+//  • motion streak        – semi-transparent trailing frames at stride peaks
 function VideoPlayer({ src, duration, prompt }: { src: string; duration: number; prompt: string }) {
-  // Parse multi-frame format: "multi:url1,url2,url3,url4"
-  const frames = src.startsWith("multi:") ? src.slice(6).split(",") : [src];
-  const isMultiFrame = frames.length > 1;
+  const firstFrame = src.startsWith("multi:") ? src.slice(6).split(",")[0] : src;
 
-  const [playing, setPlaying] = useState(false);
-  const [elapsed, setElapsed] = useState(0);
-  const [ended, setEnded] = useState(false);
-  const [frameIdx, setFrameIdx] = useState(0);
-  const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const frameRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const imgRef    = useRef<HTMLImageElement | null>(null);
+  const rafRef    = useRef<number>(0);
+  const tRef      = useRef<number>(0);   // elapsed seconds
+  const lastRef   = useRef<number>(-1);  // last rAF timestamp
 
-  // Progress ticker
-  useEffect(() => {
-    if (playing && !ended) {
-      tickRef.current = setInterval(() => {
-        setElapsed((prev) => {
-          const next = prev + 0.1;
-          if (next >= duration) {
-            setPlaying(false);
-            setEnded(true);
-            return duration;
-          }
-          return next;
-        });
-      }, 100);
-    } else {
-      if (tickRef.current) clearInterval(tickRef.current);
+  const [playing,   setPlaying]   = useState(false);
+  const [elapsed,   setElapsed]   = useState(0);
+  const [ended,     setEnded]     = useState(false);
+  const [imgReady,  setImgReady]  = useState(false);
+
+  // ── draw one frame ────────────────────────────────────────────────────────
+  const draw = useCallback((t: number, isPlaying: boolean) => {
+    const canvas = canvasRef.current;
+    const img    = imgRef.current;
+    if (!canvas || !img) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const W = canvas.width;
+    const H = canvas.height;
+
+    // Motion parameters
+    const STEPS_PER_SEC  = 2.6;          // footstep cadence
+    const BOUNCE_AMP     = 0.022;         // vertical bounce (fraction of height)
+    const SWAY_AMP       = 0.008;         // lateral sway (fraction of width)
+    const PARALLAX_RATE  = 0.08;          // how fast background scrolls (fraction/sec)
+    const ZOOM           = 1.18;          // zoom-in so we have room to pan
+
+    const step   = t * STEPS_PER_SEC * Math.PI * 2;
+    const bounce = isPlaying ? Math.abs(Math.sin(step)) * BOUNCE_AMP : 0;   // always up
+    const sway   = isPlaying ? Math.sin(step * 0.5)     * SWAY_AMP   : 0;
+    const panX   = (t * PARALLAX_RATE) % 1;  // wraps 0→1
+
+    const iW = img.naturalWidth;
+    const iH = img.naturalHeight;
+    const sw = iW / ZOOM;
+    const sh = iH / ZOOM;
+
+    // Source origin – clamp so we never go out of bounds
+    const maxSX = iW - sw;
+    const maxSY = iH - sh;
+    const sx = Math.min(Math.max(panX * maxSX + sway * iW, 0), maxSX);
+    const sy = Math.min(Math.max(bounce * iH, 0), maxSY);
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, W, H);
+
+    // Ghosting / motion streak at stride peaks
+    if (isPlaying) {
+      const stridePhase = Math.abs(Math.cos(step));
+      if (stridePhase > 0.65) {
+        const ghost = (stridePhase - 0.65) / 0.35; // 0→1 at peak
+        const streakSX = Math.min(Math.max(sx + 14, 0), maxSX);
+        ctx.globalAlpha = ghost * 0.18;
+        ctx.drawImage(img, streakSX, sy, sw, sh, 0, 0, W, H);
+        const streakSX2 = Math.min(Math.max(sx + 28, 0), maxSX);
+        ctx.globalAlpha = ghost * 0.09;
+        ctx.drawImage(img, streakSX2, sy, sw, sh, 0, 0, W, H);
+        ctx.globalAlpha = 1;
+      }
     }
-    return () => { if (tickRef.current) clearInterval(tickRef.current); };
-  }, [playing, ended, duration]);
 
-  // Frame cycling — animates the character
+    // Vignette overlay
+    const vignette = ctx.createRadialGradient(W/2, H/2, H*0.3, W/2, H/2, H*0.85);
+    vignette.addColorStop(0, "rgba(0,0,0,0)");
+    vignette.addColorStop(1, "rgba(0,0,0,0.35)");
+    ctx.fillStyle = vignette;
+    ctx.fillRect(0, 0, W, H);
+  }, []);
+
+  // ── load image ────────────────────────────────────────────────────────────
   useEffect(() => {
-    if (playing && isMultiFrame) {
-      frameRef.current = setInterval(() => {
-        setFrameIdx((i) => (i + 1) % frames.length);
-      }, FRAME_INTERVAL_MS);
-    } else {
-      if (frameRef.current) clearInterval(frameRef.current);
-    }
-    return () => { if (frameRef.current) clearInterval(frameRef.current); };
-  }, [playing, isMultiFrame, frames.length]);
+    const img = new Image();
+    img.onload = () => {
+      imgRef.current = img;
+      setImgReady(true);
+      draw(0, false);
+    };
+    img.src = firstFrame;
+  }, [firstFrame, draw]);
 
-  const progress = duration > 0 ? (elapsed / duration) * 100 : 0;
+  // ── animation loop ────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!playing || !imgReady) return;
+
+    function loop(ts: number) {
+      if (lastRef.current < 0) lastRef.current = ts;
+      const dt = Math.min((ts - lastRef.current) / 1000, 0.05); // cap at 50ms
+      lastRef.current = ts;
+      tRef.current = Math.min(tRef.current + dt, duration);
+
+      draw(tRef.current, true);
+      setElapsed(tRef.current);
+
+      if (tRef.current >= duration) {
+        setPlaying(false);
+        setEnded(true);
+        lastRef.current = -1;
+        return;
+      }
+      rafRef.current = requestAnimationFrame(loop);
+    }
+
+    lastRef.current = -1;
+    rafRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [playing, imgReady, duration, draw]);
 
   const handlePlayPause = () => {
     if (ended) {
+      tRef.current = 0;
       setElapsed(0);
-      setFrameIdx(0);
       setEnded(false);
       setPlaying(true);
     } else {
@@ -78,30 +148,31 @@ function VideoPlayer({ src, duration, prompt }: { src: string; duration: number;
   };
 
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const val = (Number(e.target.value) / 100) * duration;
-    setElapsed(val);
+    const t = (Number(e.target.value) / 100) * duration;
+    tRef.current = t;
+    setElapsed(t);
     setEnded(false);
+    draw(t, false);
   };
 
-  const currentFrame = frames[frameIdx];
+  const progress = duration > 0 ? (elapsed / duration) * 100 : 0;
 
   return (
     <div className="rounded-xl overflow-hidden border border-card-border bg-black">
-      {/* Frame display */}
-      <div className="relative aspect-video overflow-hidden bg-black">
-        <img
-          src={currentFrame}
-          alt={prompt}
-          className="w-full h-full object-cover"
-          style={{ imageRendering: "auto" }}
-          draggable={false}
+      {/* Canvas viewport */}
+      <div className="relative aspect-video bg-black">
+        <canvas
+          ref={canvasRef}
+          width={960}
+          height={540}
+          className="w-full h-full"
         />
 
-        {/* Cinematic letterbox bars */}
-        <div className="absolute inset-x-0 top-0 h-6 bg-black pointer-events-none" />
-        <div className="absolute inset-x-0 bottom-0 h-6 bg-black pointer-events-none" />
+        {/* Black letterbox bars */}
+        <div className="absolute inset-x-0 top-0 h-5 bg-black pointer-events-none" />
+        <div className="absolute inset-x-0 bottom-0 h-5 bg-black pointer-events-none" />
 
-        {/* Big play button — only before first press */}
+        {/* Centre play button – only before first press */}
         {!playing && elapsed === 0 && !ended && (
           <div className="absolute inset-0 flex items-center justify-center">
             <button
@@ -114,12 +185,12 @@ function VideoPlayer({ src, duration, prompt }: { src: string; duration: number;
           </div>
         )}
 
-        {/* Replay overlay */}
+        {/* Replay */}
         {ended && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/60">
             <button
               onClick={handlePlayPause}
-              className="w-14 h-14 rounded-full bg-white/90 hover:bg-white flex items-center justify-center shadow-2xl transition-all hover:scale-105 mb-2"
+              className="w-14 h-14 rounded-full bg-white/90 hover:bg-white flex items-center justify-center shadow-2xl hover:scale-105 transition-all mb-2"
             >
               <RotateCcw className="w-6 h-6 text-black" />
             </button>
@@ -127,21 +198,15 @@ function VideoPlayer({ src, duration, prompt }: { src: string; duration: number;
           </div>
         )}
 
-        {/* Frame counter badge */}
-        {isMultiFrame && (
-          <div className="absolute top-8 left-3 px-2 py-0.5 rounded bg-black/70 text-white text-[10px] uppercase tracking-widest font-semibold pointer-events-none">
-            AI Generated · {frames.length} frames
-          </div>
-        )}
+        <div className="absolute top-6 left-3 px-2 py-0.5 rounded bg-black/70 text-white text-[10px] uppercase tracking-widest font-semibold pointer-events-none">
+          AI Generated
+        </div>
       </div>
 
       {/* Controls */}
       <div className="bg-zinc-950 px-4 pt-2.5 pb-3 space-y-2">
-        <div className="relative h-1.5 bg-white/10 rounded-full overflow-hidden cursor-pointer">
-          <div
-            className="absolute left-0 top-0 h-full bg-primary rounded-full"
-            style={{ width: `${progress}%` }}
-          />
+        <div className="relative h-1.5 bg-white/10 rounded-full overflow-hidden">
+          <div className="absolute left-0 top-0 h-full bg-primary rounded-full" style={{ width: `${progress}%` }} />
           <input
             type="range" min={0} max={100} step={0.1} value={progress}
             onChange={handleSeek}
@@ -166,9 +231,10 @@ function VideoPlayer({ src, duration, prompt }: { src: string; duration: number;
   );
 }
 
+// ─── Page ──────────────────────────────────────────────────────────────────
 export default function VideoDetailPage({ id }: { id: number }) {
   const [trimStart, setTrimStart] = useState(0);
-  const [trimEnd, setTrimEnd] = useState(100);
+  const [trimEnd,   setTrimEnd]   = useState(100);
   const [, setLocation] = useLocation();
   const queryClient = useQueryClient();
   const { toast } = useToast();
@@ -184,7 +250,7 @@ export default function VideoDetailPage({ id }: { id: number }) {
     },
   });
 
-  const applyStyle = useApplyStyle();
+  const applyStyle  = useApplyStyle();
   const deleteVideo = useDeleteVideo();
 
   const onApplyStyle = (style: Style) => {
@@ -255,11 +321,7 @@ export default function VideoDetailPage({ id }: { id: number }) {
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-2 space-y-4">
             {video.status === "completed" && video.thumbnailUrl ? (
-              <VideoPlayer
-                src={video.thumbnailUrl}
-                duration={duration}
-                prompt={video.prompt}
-              />
+              <VideoPlayer src={video.thumbnailUrl} duration={duration} prompt={video.prompt} />
             ) : (
               <div className="relative rounded-xl overflow-hidden bg-black aspect-video border border-card-border">
                 <div className="absolute inset-0 flex flex-col items-center justify-center">
@@ -312,10 +374,10 @@ export default function VideoDetailPage({ id }: { id: number }) {
               <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-3">Details</h3>
               <div className="space-y-2.5 text-sm">
                 {[
-                  { label: "Type", value: video.generationType.replace("-", " ") },
-                  { label: "Style", value: video.style.replace("-", " ") },
+                  { label: "Type",     value: video.generationType.replace("-", " ") },
+                  { label: "Style",    value: video.style.replace("-", " ") },
                   { label: "Duration", value: `${duration}s` },
-                  { label: "Face Lock", value: video.characterId ? "Enabled" : "Off" },
+                  { label: "Face Lock",  value: video.characterId ? "Enabled" : "Off" },
                   { label: "BG Replace", value: video.backgroundReplaced ? "On" : "Off" },
                 ].map(({ label, value }) => (
                   <div key={label} className="flex justify-between">
