@@ -1,29 +1,9 @@
 import { useState } from "react";
-import { useForm } from "react-hook-form";
-import { zodResolver } from "@hookform/resolvers/zod";
-import { z } from "zod";
 import { useLocation } from "wouter";
 import { useRegisterUser, useLoginUser } from "@workspace/api-client-react";
-import { Input } from "@/components/ui/input";
-import { Button } from "@/components/ui/button";
-import { Label } from "@/components/ui/label";
 import { Sparkles, Eye, EyeOff } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { getGetMeQueryKey } from "@workspace/api-client-react";
-
-const loginSchema = z.object({
-  email: z.string().email("Valid email required"),
-  password: z.string().min(1, "Password required"),
-});
-
-const registerSchema = z.object({
-  name: z.string().min(2, "Name must be at least 2 characters"),
-  email: z.string().email("Valid email required"),
-  password: z.string().min(8, "Password must be at least 8 characters"),
-});
-
-type LoginData = z.infer<typeof loginSchema>;
-type RegisterData = z.infer<typeof registerSchema>;
 
 export default function AuthPage() {
   const [mode, setMode] = useState<"login" | "register">("login");
@@ -32,22 +12,26 @@ export default function AuthPage() {
   const [, setLocation] = useLocation();
   const queryClient = useQueryClient();
 
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+
   const loginMutation = useLoginUser();
   const registerMutation = useRegisterUser();
 
-  const loginForm = useForm<LoginData>({
-    resolver: zodResolver(loginSchema),
-    defaultValues: { email: "", password: "" },
-  });
-
-  const registerForm = useForm<RegisterData>({
-    resolver: zodResolver(registerSchema),
-    defaultValues: { name: "", email: "", password: "" },
-  });
-
-  const onLogin = (data: LoginData) => {
+  function switchMode(next: "login" | "register") {
+    setMode(next);
     setError("");
-    loginMutation.mutate({ data }, {
+    setName("");
+    setEmail("");
+    setPassword("");
+  }
+
+  function handleLogin(e: React.FormEvent) {
+    e.preventDefault();
+    if (!email || !password) { setError("Please fill in all fields."); return; }
+    setError("");
+    loginMutation.mutate({ data: { email, password } }, {
       onSuccess: (response) => {
         localStorage.setItem("dreamframe_token", response.token);
         queryClient.setQueryData(getGetMeQueryKey(), response.user);
@@ -55,11 +39,16 @@ export default function AuthPage() {
       },
       onError: () => setError("Invalid email or password. Please try again."),
     });
-  };
+  }
 
-  const onRegister = (data: RegisterData) => {
+  function handleRegister(e: React.FormEvent) {
+    e.preventDefault();
+    if (!name || !email || !password) { setError("Please fill in all fields."); return; }
+    if (name.length < 2) { setError("Name must be at least 2 characters."); return; }
+    if (password.length < 8) { setError("Password must be at least 8 characters."); return; }
+    if (!email.includes("@")) { setError("Please enter a valid email."); return; }
     setError("");
-    registerMutation.mutate({ data }, {
+    registerMutation.mutate({ data: { name, email, password } }, {
       onSuccess: (response) => {
         localStorage.setItem("dreamframe_token", response.token);
         queryClient.setQueryData(getGetMeQueryKey(), response.user);
@@ -73,7 +62,9 @@ export default function AuthPage() {
         }
       },
     });
-  };
+  }
+
+  const isPending = loginMutation.isPending || registerMutation.isPending;
 
   return (
     <div className="min-h-screen bg-background flex items-center justify-center p-4">
@@ -90,14 +81,14 @@ export default function AuthPage() {
           <div className="flex rounded-lg border border-border bg-secondary/40 p-1 mb-6">
             <button
               type="button"
-              onClick={() => { setMode("login"); setError(""); loginForm.clearErrors(); }}
+              onClick={() => switchMode("login")}
               className={`flex-1 py-2 rounded-md text-sm font-semibold transition-all ${mode === "login" ? "bg-card text-foreground shadow" : "text-muted-foreground hover:text-foreground"}`}
             >
               Sign in
             </button>
             <button
               type="button"
-              onClick={() => { setMode("register"); setError(""); registerForm.clearErrors(); }}
+              onClick={() => switchMode("register")}
               className={`flex-1 py-2 rounded-md text-sm font-semibold transition-all ${mode === "register" ? "bg-card text-foreground shadow" : "text-muted-foreground hover:text-foreground"}`}
             >
               Create account
@@ -111,112 +102,105 @@ export default function AuthPage() {
           )}
 
           {mode === "login" ? (
-            <form onSubmit={loginForm.handleSubmit(onLogin)} className="space-y-4">
+            <form onSubmit={handleLogin} className="space-y-4">
               <div>
-                <Label htmlFor="login-email" className="text-xs text-muted-foreground uppercase tracking-wide mb-1.5 block">Email</Label>
-                <Input
-                  id="login-email"
-                  data-testid="input-email"
+                <label htmlFor="l-email" className="block text-xs text-muted-foreground uppercase tracking-wide mb-1.5">Email</label>
+                <input
+                  id="l-email"
                   type="email"
-                  placeholder="you@example.com"
                   autoComplete="email"
-                  className="bg-input/50"
-                  {...loginForm.register("email")}
+                  placeholder="you@example.com"
+                  value={email}
+                  onChange={e => setEmail(e.target.value)}
+                  className="w-full px-3 py-2 rounded-md border border-input bg-input/50 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary text-sm"
                 />
-                {loginForm.formState.errors.email && (
-                  <p className="text-destructive text-xs mt-1">{loginForm.formState.errors.email.message}</p>
-                )}
               </div>
               <div>
-                <Label htmlFor="login-password" className="text-xs text-muted-foreground uppercase tracking-wide mb-1.5 block">Password</Label>
+                <label htmlFor="l-password" className="block text-xs text-muted-foreground uppercase tracking-wide mb-1.5">Password</label>
                 <div className="relative">
-                  <Input
-                    id="login-password"
-                    data-testid="input-password"
+                  <input
+                    id="l-password"
                     type={showPassword ? "text" : "password"}
-                    placeholder="••••••••"
                     autoComplete="current-password"
-                    className="bg-input/50 pr-10"
-                    {...loginForm.register("password")}
+                    placeholder="••••••••"
+                    value={password}
+                    onChange={e => setPassword(e.target.value)}
+                    className="w-full px-3 py-2 pr-10 rounded-md border border-input bg-input/50 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary text-sm"
                   />
                   <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
                     {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                   </button>
                 </div>
-                {loginForm.formState.errors.password && (
-                  <p className="text-destructive text-xs mt-1">{loginForm.formState.errors.password.message}</p>
-                )}
               </div>
-              <Button data-testid="button-submit" type="submit" className="w-full bg-primary hover:bg-primary/90 mt-2" disabled={loginMutation.isPending}>
-                {loginMutation.isPending ? "Signing in..." : "Sign in"}
-              </Button>
+              <button
+                type="submit"
+                disabled={isPending}
+                className="w-full py-2.5 rounded-md bg-primary text-white font-semibold hover:bg-primary/90 transition-colors disabled:opacity-60 mt-2"
+              >
+                {isPending ? "Signing in..." : "Sign in"}
+              </button>
             </form>
           ) : (
-            <form onSubmit={registerForm.handleSubmit(onRegister)} className="space-y-4">
+            <form onSubmit={handleRegister} className="space-y-4">
               <div>
-                <Label htmlFor="reg-name" className="text-xs text-muted-foreground uppercase tracking-wide mb-1.5 block">Full name</Label>
-                <Input
-                  id="reg-name"
-                  data-testid="input-name"
+                <label htmlFor="r-name" className="block text-xs text-muted-foreground uppercase tracking-wide mb-1.5">Full name</label>
+                <input
+                  id="r-name"
                   type="text"
-                  placeholder="Alex Chen"
                   autoComplete="name"
-                  className="bg-input/50"
-                  {...registerForm.register("name")}
+                  placeholder="Alex Chen"
+                  value={name}
+                  onChange={e => setName(e.target.value)}
+                  className="w-full px-3 py-2 rounded-md border border-input bg-input/50 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary text-sm"
                 />
-                {registerForm.formState.errors.name && (
-                  <p className="text-destructive text-xs mt-1">{registerForm.formState.errors.name.message}</p>
-                )}
               </div>
               <div>
-                <Label htmlFor="reg-email" className="text-xs text-muted-foreground uppercase tracking-wide mb-1.5 block">Email</Label>
-                <Input
-                  id="reg-email"
-                  data-testid="input-email"
+                <label htmlFor="r-email" className="block text-xs text-muted-foreground uppercase tracking-wide mb-1.5">Email</label>
+                <input
+                  id="r-email"
                   type="email"
-                  placeholder="you@example.com"
                   autoComplete="email"
-                  className="bg-input/50"
-                  {...registerForm.register("email")}
+                  placeholder="you@example.com"
+                  value={email}
+                  onChange={e => setEmail(e.target.value)}
+                  className="w-full px-3 py-2 rounded-md border border-input bg-input/50 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary text-sm"
                 />
-                {registerForm.formState.errors.email && (
-                  <p className="text-destructive text-xs mt-1">{registerForm.formState.errors.email.message}</p>
-                )}
               </div>
               <div>
-                <Label htmlFor="reg-password" className="text-xs text-muted-foreground uppercase tracking-wide mb-1.5 block">Password</Label>
+                <label htmlFor="r-password" className="block text-xs text-muted-foreground uppercase tracking-wide mb-1.5">Password</label>
                 <div className="relative">
-                  <Input
-                    id="reg-password"
-                    data-testid="input-password"
+                  <input
+                    id="r-password"
                     type={showPassword ? "text" : "password"}
-                    placeholder="Min 8 characters"
                     autoComplete="new-password"
-                    className="bg-input/50 pr-10"
-                    {...registerForm.register("password")}
+                    placeholder="Min 8 characters"
+                    value={password}
+                    onChange={e => setPassword(e.target.value)}
+                    className="w-full px-3 py-2 pr-10 rounded-md border border-input bg-input/50 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary text-sm"
                   />
                   <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
                     {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                   </button>
                 </div>
-                {registerForm.formState.errors.password && (
-                  <p className="text-destructive text-xs mt-1">{registerForm.formState.errors.password.message}</p>
-                )}
               </div>
-              <Button data-testid="button-submit" type="submit" className="w-full bg-primary hover:bg-primary/90 mt-2" disabled={registerMutation.isPending}>
-                {registerMutation.isPending ? "Creating account..." : "Create account"}
-              </Button>
+              <button
+                type="submit"
+                disabled={isPending}
+                className="w-full py-2.5 rounded-md bg-primary text-white font-semibold hover:bg-primary/90 transition-colors disabled:opacity-60 mt-2"
+              >
+                {isPending ? "Creating account..." : "Create account"}
+              </button>
             </form>
           )}
 
           <p className="mt-6 text-center text-sm text-muted-foreground">
             {mode === "login" ? (
               <>Don&apos;t have an account?{" "}
-                <button data-testid="button-switch-mode" type="button" onClick={() => { setMode("register"); setError(""); }} className="text-primary hover:underline font-medium">Sign up</button>
+                <button type="button" onClick={() => switchMode("register")} className="text-primary hover:underline font-medium">Sign up</button>
               </>
             ) : (
               <>Already have an account?{" "}
-                <button data-testid="button-switch-mode" type="button" onClick={() => { setMode("login"); setError(""); }} className="text-primary hover:underline font-medium">Sign in</button>
+                <button type="button" onClick={() => switchMode("login")} className="text-primary hover:underline font-medium">Sign in</button>
               </>
             )}
           </p>

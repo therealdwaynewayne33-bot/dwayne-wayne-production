@@ -39,8 +39,9 @@ function AuthRoute() {
   useEffect(() => {
     if (!isLoading && user) setLocation("/dashboard");
   }, [user, isLoading]);
-  if (isLoading) return <Spinner />;
-  if (user) return null;
+  // Never show spinner here — it unmounts AuthPage and wipes form state.
+  // If user is confirmed logged in, hide the form while redirect fires.
+  if (!isLoading && user) return null;
   return <AuthPage />;
 }
 

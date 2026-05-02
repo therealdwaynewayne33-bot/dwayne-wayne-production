@@ -12,7 +12,7 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType>({ user: null, isLoading: true, logout: () => {} });
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const { data: user, isLoading } = useGetMe({ query: { retry: false, queryKey: getGetMeQueryKey() } });
+  const { data: user, isLoading } = useGetMe({ query: { retry: false, refetchOnWindowFocus: false, queryKey: getGetMeQueryKey() } });
   const logoutMutation = useLogoutUser();
   const [, setLocation] = useLocation();
 
