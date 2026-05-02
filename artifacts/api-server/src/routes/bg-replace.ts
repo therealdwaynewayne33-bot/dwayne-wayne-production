@@ -134,14 +134,22 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     return res.status(500).json({ error: `Background editing failed: ${err.message}` });
   }
 
-  // 7. FFmpeg composite — natural look pipeline (NO color grading):
+  // 7. FFmpeg composite — color-match pipeline (THIS IS THE KEY TO REALISM):
   //
-  //  • sigma=1 mask blur  — minimal feathering, no halo
-  //  • sigma=1 bg blur    — tiny DOF separation only
-  //  • Light grain noise=3 — barely perceptible, just enough to unify the two layers'
-  //                          texture so the AI background doesn't look "too clean"
-  //  • NO color grade — character keeps natural colors. NO teal-orange, NO vignette,
-  //                      NO curves. Just a clean cutout placed onto the new background.
+  //  Why this works: real cameras pick up ambient light from the environment.
+  //  When you stand in a blue room, your skin & clothes pick up a blue cast.
+  //  When you stand at sunset, you turn warm/orange. Without this, the cutout
+  //  always looks "pasted on" — that's the green-screen look.
+  //
+  //  Pipeline:
+  //   1. bg_main      — slight DOF blur (sigma=1) of the background
+  //   2. bg_ambient   — heavy blur (sigma=60) of bg → gives the average colour cast
+  //   3. mask_soft    — sigma=1 mask blur (tight edges, no halo)
+  //   4. comp         — clean composite of fg over bg
+  //   5. softlight blend the bg_ambient over the WHOLE comp at 35% — this
+  //      shifts the character's tones to match the new environment's lighting,
+  //      making them belong in the scene
+  //   6. tiny saturation/contrast bump + light grain unifies the layers
   //
   const outputPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
   const ffmpegCmd = [
@@ -150,11 +158,16 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     `-i "${maskPath}"`,
     `-loop 1 -i "${bgPath}"`,
     `-filter_complex`,
-    `"[2:v]scale=${vidWidth}:${vidHeight}:force_original_aspect_ratio=increase,crop=${vidWidth}:${vidHeight},gblur=sigma=1,noise=alls=3:allf=t+u[bg];` +
+    `"[2:v]scale=${vidWidth}:${vidHeight}:force_original_aspect_ratio=increase,crop=${vidWidth}:${vidHeight},gblur=sigma=1[bg_dof];` +
+    `[bg_dof]split[bg_main][bg_amb_in];` +
+    `[bg_amb_in]gblur=sigma=60,format=yuv420p[bg_ambient];` +
     `[1:v]format=gray,gblur=sigma=1[mask_soft];` +
     `[0:v]format=yuva420p[src_rgba];` +
     `[src_rgba][mask_soft]alphamerge[fg];` +
-    `[bg][fg]overlay=shortest=1[out]"`,
+    `[bg_main][fg]overlay=shortest=1[comp];` +
+    `[comp][bg_ambient]blend=all_mode=softlight:all_opacity=0.35:shortest=1,` +
+    `eq=contrast=1.04:saturation=1.05,` +
+    `noise=alls=4:allf=t+u[out]"`,
     `-map "[out]" -map "0:a?"`,
     `-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p`,
     `-c:a copy`,
