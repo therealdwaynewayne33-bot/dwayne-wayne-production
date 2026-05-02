@@ -43,6 +43,21 @@ async function avgLuminance(imagePath: string): Promise<number> {
   return s / px.length;
 }
 
+/**
+ * Sample the average colour of the brightest 8% of pixels — these are
+ * the "whites" of the image (walls, ceilings, paper, sky). Used to
+ * white-balance the AI-generated background to true neutral white.
+ */
+async function whitePoint(imagePath: string): Promise<[number, number, number]> {
+  const px = await samplePixels(imagePath, 32);
+  px.sort((a, b) => b.lum - a.lum);
+  const topN = Math.max(16, Math.floor(px.length * 0.08));
+  const top = px.slice(0, topN);
+  let sr = 0, sg = 0, sb = 0;
+  for (const p of top) { sr += p.r; sg += p.g; sb += p.b; }
+  return [sr / topN, sg / topN, sb / topN];
+}
+
 const router = Router();
 
 const VIDEO_EXTS = new Set([".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v", ".3gp"]);
@@ -162,12 +177,16 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     return res.status(500).json({ error: `Background editing failed: ${err.message}` });
   }
 
-  // 7. EXPOSURE + COLOUR MATCHING — sample brightness of bg vs source so we
-  //    can lift the subject toward the new environment's exposure level.
-  //    Without this, a dark-lit subject pasted on a bright wall looks like a
-  //    silhouette — the #1 cause of "green screen" / "pasted on" feel.
+  // 7. EXPOSURE + WHITE-BALANCE MATCHING.
+  //    (a) Sample brightness of bg vs source so we can lift the subject
+  //        toward the new environment's exposure level. Without this, a
+  //        dark-lit subject pasted on a bright wall looks like a silhouette.
+  //    (b) Sample the bg's white point and compute neutralisation scales so
+  //        the walls/ceiling come out as TRUE WHITE PAINT, not cream/yellow/
+  //        green. The AI image gen often produces slightly tinted whites.
   let subjectBrightness = 1.0;     // gamma multiplier for subject (>1 brightens)
   let ambientOpacity   = 0.30;     // softlight strength of bg colour onto subject
+  let bgWbR = 1.0, bgWbG = 1.0, bgWbB = 1.0;  // bg white-balance scales
   try {
     // Sample mid-frame of source video for subject exposure estimate.
     const srcMidFrame = path.join(UPLOADS_DIR, `${jobId}-srcmid.png`);
@@ -176,13 +195,20 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     );
     const srcLum = await avgLuminance(srcMidFrame);
     const bgLum  = await avgLuminance(bgPath);
-    // Lift subject toward bg luminance, but cap to avoid crushing detail.
-    // ratio < 1 → bg is darker than subject → keep subject at 1.0 (don't darken).
-    // ratio > 1 → bg is brighter → lift subject; cap at 1.55 so faces don't blow out.
-    const ratio = bgLum / Math.max(1, srcLum);
+    const ratio  = bgLum / Math.max(1, srcLum);
     subjectBrightness = Math.max(1.0, Math.min(1.55, Math.pow(ratio, 0.85)));
-    // If the exposure gap is huge, lean MORE on ambient colour blend too.
-    ambientOpacity = ratio > 1.4 ? 0.40 : 0.30;
+    ambientOpacity    = ratio > 1.4 ? 0.40 : 0.30;
+
+    // Auto white-balance the AI background — force its brightest pixels
+    // (the walls) to be true neutral grey/white. This gives "real paint"
+    // walls regardless of any tint in the AI output.
+    const [bR, bG, bB] = await whitePoint(bgPath);
+    const grayTarget = (bR + bG + bB) / 3;
+    const clamp = (v: number) => Math.max(0.7, Math.min(1.5, v));
+    bgWbR = clamp(grayTarget / Math.max(1, bR));
+    bgWbG = clamp(grayTarget / Math.max(1, bG));
+    bgWbB = clamp(grayTarget / Math.max(1, bB));
+
     req.log.info(
       {
         srcLum: srcLum.toFixed(1),
@@ -190,11 +216,13 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
         ratio:  ratio.toFixed(3),
         subjectBrightness: subjectBrightness.toFixed(3),
         ambientOpacity,
+        bg_wp:    [Math.round(bR), Math.round(bG), Math.round(bB)],
+        bg_scale: { r: bgWbR.toFixed(3), g: bgWbG.toFixed(3), b: bgWbB.toFixed(3) },
       },
-      "bg-replace: exposure match"
+      "bg-replace: exposure + white-balance"
     );
   } catch (err: any) {
-    req.log.warn({ err: err.message }, "bg-replace: exposure sampling failed, using defaults");
+    req.log.warn({ err: err.message }, "bg-replace: exposure/wb sampling failed, using defaults");
   }
 
   // 8. FFmpeg composite — environmental colour-bake pipeline.
@@ -222,7 +250,9 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     `-i "${maskPath}"`,
     `-loop 1 -i "${bgPath}"`,
     `-filter_complex`,
-    `"[2:v]scale=${vidWidth}:${vidHeight}:force_original_aspect_ratio=increase,crop=${vidWidth}:${vidHeight}[bg_clean];` +
+    `"[2:v]scale=${vidWidth}:${vidHeight}:force_original_aspect_ratio=increase,crop=${vidWidth}:${vidHeight},` +
+    // Force walls to TRUE WHITE PAINT — neutralise any colour tint in the AI bg.
+    `colorchannelmixer=rr=${bgWbR.toFixed(3)}:gg=${bgWbG.toFixed(3)}:bb=${bgWbB.toFixed(3)}[bg_clean];` +
     `[bg_clean]split=2[bg_for_dof][bg_for_amb];` +
     `[bg_for_dof]gblur=sigma=2,format=yuv420p[bg_main];` +
     `[bg_for_amb]gblur=sigma=80,format=yuv420p[bg_ambient];` +
