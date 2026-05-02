@@ -54,10 +54,12 @@ function isImageFile(file: Express.Multer.File): boolean {
  *     ceilings, sky), so averaging them gives a clean estimate of "what white
  *     looks like in this lighting".
  */
-async function whitePoint(imagePath: string): Promise<[number, number, number]> {
-  // 16×16 = 256 samples — enough to be stable, small enough to be fast
-  const ppmPath = `${imagePath}.16.ppm`;
-  await execAsync(`ffmpeg -y -i "${imagePath}" -vf scale=16:16 -frames:v 1 "${ppmPath}"`);
+/**
+ * Read a downsampled PPM and return all pixels with luminance.
+ */
+async function samplePixels(imagePath: string, size = 32) {
+  const ppmPath = `${imagePath}.${size}.ppm`;
+  await execAsync(`ffmpeg -y -i "${imagePath}" -vf scale=${size}:${size} -frames:v 1 "${ppmPath}"`);
   const buf = await readFile(ppmPath);
   let nl = 0, idx = 0;
   while (nl < 3 && idx < buf.length) {
@@ -70,12 +72,32 @@ async function whitePoint(imagePath: string): Promise<[number, number, number]> 
     const r = buf[i], g = buf[i + 1], b = buf[i + 2];
     pixels.push({ r, g, b, lum: 0.299 * r + 0.587 * g + 0.114 * b });
   }
-  pixels.sort((a, b) => b.lum - a.lum);
-  const topN = Math.max(8, Math.floor(pixels.length * 0.25));
-  const top = pixels.slice(0, topN);
+  return pixels;
+}
+
+/**
+ * White point = average colour of the brightest 8% of pixels. We use a tight
+ * window so dimmer mid-tones don't dilute the estimate — the brightest pixels
+ * (sky, walls, sunlight) are the real "whites" that white-balance needs to match.
+ */
+async function whitePoint(imagePath: string): Promise<[number, number, number]> {
+  const px = await samplePixels(imagePath, 32);  // 1024 samples
+  px.sort((a, b) => b.lum - a.lum);
+  const topN = Math.max(16, Math.floor(px.length * 0.08));
+  const top = px.slice(0, topN);
   let sr = 0, sg = 0, sb = 0;
   for (const p of top) { sr += p.r; sg += p.g; sb += p.b; }
   return [sr / topN, sg / topN, sb / topN];
+}
+
+/**
+ * Average luminance of an image (gives a brightness estimate).
+ */
+async function avgLuminance(imagePath: string): Promise<number> {
+  const px = await samplePixels(imagePath, 16);
+  let sum = 0;
+  for (const p of px) sum += p.lum;
+  return sum / px.length;
 }
 
 /**
@@ -223,29 +245,46 @@ router.post(
     //     white balance, not crude colour shifting.
     //
     let sR = 1, sG = 1, sB = 1;
+    let brightnessGain = 1;
     try {
       const [tR, tG, tB] = await whitePoint(targetFramePath);
       const [rR, rG, rB] = await whitePoint(refFramePath);
-      // Scale factors: multiply target whites by (ref / target) to match
-      const clamp = (v: number) => Math.max(0.75, Math.min(1.30, v));
+      // Wider clamp (0.55–1.55) lets us neutralise strong colour casts
+      // like warm sunlight bloom, which a 30% cap couldn't reach.
+      const clamp = (v: number) => Math.max(0.55, Math.min(1.55, v));
       sR = clamp(rR / Math.max(1, tR));
       sG = clamp(rG / Math.max(1, tG));
       sB = clamp(rB / Math.max(1, tB));
+
+      // Brightness matching: if reference is brighter than target, lift exposure.
+      // We use ref/target luminance ratio, capped to avoid blown highlights.
+      const tLum = await avgLuminance(targetFramePath);
+      const rLum = await avgLuminance(refFramePath);
+      brightnessGain = Math.max(0.85, Math.min(1.35, rLum / Math.max(1, tLum)));
+
       req.log.info(
         {
           target_wp: [Math.round(tR), Math.round(tG), Math.round(tB)],
           ref_wp:    [Math.round(rR), Math.round(rG), Math.round(rB)],
           scale: { r: sR.toFixed(3), g: sG.toFixed(3), b: sB.toFixed(3) },
+          target_lum: tLum.toFixed(1),
+          ref_lum:    rLum.toFixed(1),
+          brightnessGain: brightnessGain.toFixed(3),
         },
-        "v2v: white-balance scale"
+        "v2v: white-balance + exposure"
       );
     } catch (err: any) {
-      req.log.warn({ err: err.message }, "v2v: whitePoint failed, falling back to identity scale");
+      req.log.warn({ err: err.message }, "v2v: whitePoint/luminance failed, falling back to identity");
     }
 
     // colorchannelmixer: per-channel multiplicative scaling = pure white balance.
     // No additive shifts (which crush blacks) and no opacity (which limits effect).
     const wb_filter = `colorchannelmixer=rr=${sR}:gg=${sG}:bb=${sB}`;
+    // eq=gamma applies multiplicative brightness similar to camera exposure compensation.
+    // gamma=1.0 = no change; <1 = darker, >1 = brighter (but inverse-mapped, see below).
+    // Actually we use eq=brightness in an additive sense; safer is to apply gain via
+    // colorchannelmixer's diagonal already plus an additional eq=gamma step.
+    const exposure_filter = `eq=gamma=${brightnessGain.toFixed(3)}:contrast=1.04:saturation=1.08`;
 
     const outputPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
     const ffmpegCmd = [
@@ -254,7 +293,7 @@ router.post(
       `-filter_complex`,
       `"[0:v]scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,format=yuv420p,` +
       `${wb_filter},` +
-      `eq=contrast=1.04:saturation=1.06,` +
+      `${exposure_filter},` +
       `noise=alls=2:allf=t+u[out]"`,
       `-map "[out]" -map "0:a?"`,
       `-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p`,
