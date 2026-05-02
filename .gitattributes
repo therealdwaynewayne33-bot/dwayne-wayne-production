@@ -4,3 +4,4 @@ artifacts/api-server/public/uploads/bgr-1777704703967-9m67j-raw.mp4 filter=lfs d
 artifacts/api-server/public/uploads/bgr-1777706518376-8vr03-raw.mp4 filter=lfs diff=lfs merge=lfs -text
 artifacts/api-server/public/uploads/bgr-1777707220024-wss5l-raw.mp4 filter=lfs diff=lfs merge=lfs -text
 artifacts/api-server/public/uploads/bgr-1777707313074-rl5yy-raw.mp4 filter=lfs diff=lfs merge=lfs -text
+artifacts/api-server/public/uploads/bgr-1777708063004-ocrmi-raw.mp4 filter=lfs diff=lfs merge=lfs -text
