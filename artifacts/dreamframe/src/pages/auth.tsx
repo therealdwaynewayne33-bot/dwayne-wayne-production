@@ -75,7 +75,7 @@ export default function AuthPage() {
         <div className="w-12 h-12 rounded-2xl bg-white flex items-center justify-center mx-auto mb-5">
           <Sparkles className="w-6 h-6 text-black" />
         </div>
-        <h1 className="text-2xl font-semibold text-white tracking-tight">DreamFrame AI Studio</h1>
+        <h1 className="text-2xl font-bold text-white tracking-tight uppercase">DwayneWayne Production<span className="block text-base font-semibold text-white/60 tracking-[0.2em] mt-1">AI System</span></h1>
         <p className="text-white/30 text-sm mt-1.5">Professional AI video generation</p>
       </div>
 

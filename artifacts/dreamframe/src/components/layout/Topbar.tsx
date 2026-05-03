@@ -52,7 +52,7 @@ export function Topbar() {
           <div className="w-7 h-7 rounded-lg bg-white flex items-center justify-center">
             <Sparkles className="w-3.5 h-3.5 text-black" />
           </div>
-          <span className="text-sm font-semibold text-white tracking-tight">DreamFrame</span>
+          <span className="text-[11px] font-bold text-white tracking-[0.14em] uppercase whitespace-nowrap">DwayneWayne Production<span className="text-white/40"> · AI System</span></span>
         </div>
       </Link>
 

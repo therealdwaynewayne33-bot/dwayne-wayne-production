@@ -23,7 +23,7 @@ export function Sidebar() {
           <Sparkles className="w-4 h-4 text-white" />
         </div>
         <div>
-          <span className="text-sm font-bold text-foreground tracking-wide">DreamFrame</span>
+          <span className="text-[11px] font-bold text-foreground tracking-[0.14em] uppercase leading-tight">DwayneWayne<br/>Production AI</span>
           <span className="block text-[10px] text-muted-foreground uppercase tracking-widest">AI Studio</span>
         </div>
       </div>
