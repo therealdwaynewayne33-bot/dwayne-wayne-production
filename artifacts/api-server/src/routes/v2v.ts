@@ -268,19 +268,22 @@ router.post(
       const [eR, eG, eB] = await whitePoint(editedFramePath);
 
       // Per-channel scale to push target whites toward edited whites.
-      // Clamp wide enough to allow a real grade (warmer/cooler) but not
-      // produce wildly tinted output if AI drifted hard.
-      const clamp = (v: number) => Math.max(0.55, Math.min(1.85, v));
+      // Wide clamp: allow strong warmer/cooler shifts so a "Warm sunset" or
+      // "Cool teal" preset actually looks visibly warm or cool.
+      const clamp = (v: number) => Math.max(0.45, Math.min(2.10, v));
       sR = clamp(eR / Math.max(1, tR));
       sG = clamp(eG / Math.max(1, tG));
       sB = clamp(eB / Math.max(1, tB));
 
-      // Luminance match (allow both brighten and darken, gently bounded).
+      // Luminance match (allow both brighten and darken, generously bounded).
       const tLum = await avgLuminance(targetFramePath);
       const eLum = await avgLuminance(editedFramePath);
-      brightnessGain = Math.max(0.75, Math.min(1.40, eLum / Math.max(1, tLum)));
+      brightnessGain = Math.max(0.65, Math.min(1.55, eLum / Math.max(1, tLum)));
 
       // Saturation match: chroma = avg distance of pixels from neutral grey.
+      // CRITICAL: never desaturate. A colour grade should ADD punch; if the
+      // AI's frame is less saturated than the source, fall back to a small
+      // default boost (1.10) so the user always sees a visibly graded result.
       const targetPx = await samplePixels(targetFramePath, 32);
       const editedPx = await samplePixels(editedFramePath, 32);
       const chroma = (px: { r: number; g: number; b: number }[]) => {
@@ -293,7 +296,8 @@ router.post(
       };
       const tSat = chroma(targetPx);
       const eSat = chroma(editedPx);
-      satBoost = Math.max(0.80, Math.min(1.50, eSat / Math.max(1, tSat)));
+      const ratio = eSat / Math.max(1, tSat);
+      satBoost = Math.max(1.10, Math.min(1.70, ratio));
 
       req.log.info(
         {
@@ -313,49 +317,33 @@ router.post(
 
     // colorchannelmixer: per-channel multiplicative scaling = white balance shift.
     const wb_filter = `colorchannelmixer=rr=${sR}:gg=${sG}:bb=${sB}`;
-    // eq: midtone gamma + contrast/saturation match.
-    const exposure_filter = `eq=gamma=${brightnessGain.toFixed(3)}:contrast=1.08:saturation=${satBoost.toFixed(3)}`;
+    // eq: midtone gamma + contrast/saturation match. Punchier contrast (1.12)
+    // makes the grade feel like a real cinematic look, not a flat tint.
+    const exposure_filter = `eq=gamma=${brightnessGain.toFixed(3)}:contrast=1.12:saturation=${satBoost.toFixed(3)}`;
 
-    // COLOR-FIELD BLEND of the AI-edited frame on top of the video.
-    //
-    //   PROBLEM with naive soft-light blend of the AI frame:
-    //     The AI frame contains real picture content (people, furniture,
-    //     edges). Blending it on top of moving video locks that structure
-    //     onto every frame as a static ghost — the silhouettes of the AI's
-    //     people appear baked into the user's moving video. Looks awful.
-    //
-    //   FIX:
-    //     Strip the STRUCTURE out of the AI frame, keep only the COLOUR. We
-    //     do this by downscaling it to 16×9 (≈ output aspect ratio at tiny
-    //     resolution) then upscaling back with bilinear interp. The result
-    //     is a smooth gradient colour field that carries the AI's local
-    //     hue/tone decisions across the frame WITHOUT any image structure.
-    //
-    //     A small downscale (16×9) preserves rough left-right/top-bottom
-    //     colour zones — e.g. if the AI graded the sky blue and the ground
-    //     warm, that vertical gradient is preserved. Going to 1×1 would
-    //     give a pure global colour wash; 16×9 is a sweet spot.
-    //
-    //   With no structure to ghost, we can push opacity higher (0.65) for a
-    //   stronger visible grade.
-    const BLEND_OPACITY = 0.65;
+    // NOTE: Earlier versions of this route soft-light-blended the AI-edited
+    // frame on top of every video frame to "transfer the look". Two failure
+    // modes killed that approach:
+    //   1. Full-resolution blend ghosted the AI's people/objects onto the user's
+    //      moving video as a static silhouette layer.
+    //   2. Downscaled-then-upscaled blend produced a near-neutral colour field
+    //      (~RGB 128) which under soft-light is mathematically a no-op AND
+    //      actively pulled the WB-shifted pixels back toward neutral, undoing
+    //      the grade.
+    // Conclusion: the right tool for transferring an AI-frame's GRADE onto a
+    // video is per-pixel colour-math (WB + exposure + saturation), not pixel
+    // blending. The math above already encodes the AI's colour decision into
+    // the video deterministically and visibly.
 
     const outputPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
     const ffmpegCmd = [
       `ffmpeg -y`,
       `-i "${targetPath}"`,
-      `-loop 1 -i "${editedFramePath}"`,
-      `-filter_complex`,
-      `"[0:v]scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,format=yuv420p,` +
+      `-vf`,
+      `"scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,format=yuv420p,` +
       `${wb_filter},` +
-      `${exposure_filter}[base];` +
-      // 1) downscale AI frame to 16×9 (kills all structure, keeps local colour zones)
-      // 2) upscale back to video size with bilinear smoothing → pure colour field
-      `[1:v]scale=16:9,scale=${outW}:${outH}:flags=bilinear,format=yuv420p,setsar=1[grade];` +
-      `[base][grade]blend=all_mode='softlight':all_opacity=${BLEND_OPACITY},` +
-      `noise=alls=2:allf=t+u[out]"`,
-      `-map "[out]" -map "0:a?"`,
-      `-shortest`,
+      `${exposure_filter},` +
+      `noise=alls=2:allf=t+u"`,
       `-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p`,
       `-c:a copy`,
       `-movflags +faststart`,
