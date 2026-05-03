@@ -298,18 +298,37 @@ router.post(
     // colorchannelmixer: per-channel multiplicative scaling = white balance shift.
     const wb_filter = `colorchannelmixer=rr=${sR}:gg=${sG}:bb=${sB}`;
     // eq: midtone gamma + contrast/saturation match.
-    const exposure_filter = `eq=gamma=${brightnessGain.toFixed(3)}:contrast=1.05:saturation=${satBoost.toFixed(3)}`;
+    const exposure_filter = `eq=gamma=${brightnessGain.toFixed(3)}:contrast=1.08:saturation=${satBoost.toFixed(3)}`;
+
+    // SOFT-LIGHT BLEND of the AI-edited frame on top of the video.
+    //
+    //   Soft-light is the standard photographic grading blend: it pushes the
+    //   underlying pixel toward the overlay's HUE and TONE while preserving
+    //   the underlying luminance/detail. This is exactly how Lightroom /
+    //   Photoshop "color match" presets work — overlay a graded reference at
+    //   some opacity and the colour of that reference is applied to the image
+    //   without flattening detail.
+    //
+    //   Combined with the WB/exposure/saturation match above, this gives a
+    //   strong, visible grade that follows the AI's colour decision frame-by-frame.
+    //
+    //   Opacity 0.55 = strong but not opaque (you still see your video clearly).
+    const BLEND_OPACITY = 0.55;
 
     const outputPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
     const ffmpegCmd = [
       `ffmpeg -y`,
       `-i "${targetPath}"`,
+      `-loop 1 -i "${editedFramePath}"`,
       `-filter_complex`,
       `"[0:v]scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,format=yuv420p,` +
       `${wb_filter},` +
-      `${exposure_filter},` +
+      `${exposure_filter}[base];` +
+      `[1:v]scale=${outW}:${outH}:force_original_aspect_ratio=increase,crop=${outW}:${outH},format=yuv420p,setsar=1[grade];` +
+      `[base][grade]blend=all_mode='softlight':all_opacity=${BLEND_OPACITY},` +
       `noise=alls=2:allf=t+u[out]"`,
       `-map "[out]" -map "0:a?"`,
+      `-shortest`,
       `-c:v libx264 -preset fast -crf 22 -pix_fmt yuv420p`,
       `-c:a copy`,
       `-movflags +faststart`,
