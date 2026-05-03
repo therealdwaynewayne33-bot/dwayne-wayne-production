@@ -5,17 +5,20 @@ import dwLogoBg from "@assets/IMG_4084_(1)_1777826749985.jpg";
 export function AppLayout({ children }: { children: ReactNode }) {
   return (
     <div className="relative min-h-screen bg-black text-white">
-      {/* Global DW logo backdrop — bold, full-color, like the Split Hero panel */}
+      {/* Global DW logo backdrop — bold logo, but darkened heavily over the
+          content zone so text and UI are highly legible. Logo reads strongest
+          along the edges; the center is near-black for readability. */}
       <div aria-hidden className="fixed inset-0 z-0 pointer-events-none overflow-hidden">
         <img
           src={dwLogoBg}
           alt=""
           className="absolute inset-0 h-full w-full object-cover"
         />
-        {/* Cinematic gradients — same recipe as the SplitHero left panel,
-            scaled to read across a full-width app while keeping content legible */}
-        <div className="absolute inset-0 bg-gradient-to-tr from-black/75 via-black/40 to-black/20" />
-        <div className="absolute inset-0 bg-gradient-to-b from-black/30 via-transparent to-black/60" />
+        {/* Heavy dark wash so words pop everywhere */}
+        <div className="absolute inset-0 bg-black/75" />
+        {/* Inverted vignette: even darker in the middle (where content sits),
+            slightly lighter at the edges so the logo still shows through */}
+        <div className="absolute inset-0 [background:radial-gradient(ellipse_at_center,rgba(0,0,0,0.65)_0%,rgba(0,0,0,0.2)_70%,transparent_100%)]" />
       </div>
 
       {/* Foreground app */}
