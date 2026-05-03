@@ -191,8 +191,12 @@ export default function VideoToVideoPage() {
   const [referenceUrl,setReferenceUrl] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
   const [stage, setStage] = useState<Stage>("idle");
+  const [uploadPct, setUploadPct] = useState(0);
+  const [uploaded,  setUploaded]  = useState(0);
+  const [totalBytes,setTotalBytes]= useState(0);
   const [result, setResult] = useState<{ videoUrl: string; thumbnailUrl?: string; previewUrl?: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const xhrRef = useRef<XMLHttpRequest | null>(null);
   const { toast } = useToast();
 
   const setT = useCallback((f: File) => { setTarget(f);    setTargetUrl(URL.createObjectURL(f));    setResult(null); setError(null); setStage("idle"); }, []);
@@ -207,6 +211,9 @@ export default function VideoToVideoPage() {
 
     setStage("processing");
     setError(null);
+    setUploadPct(0);
+    setUploaded(0);
+    setTotalBytes(target.size + reference.size);
 
     const form = new FormData();
     form.append("target",    target);
@@ -214,28 +221,55 @@ export default function VideoToVideoPage() {
     form.append("transferPrompt", prompt.trim());
 
     const token = localStorage.getItem("dreamframe_token");
-    try {
-      const resp = await fetch("/api/videos/v2v", {
-        method: "POST",
-        body: form,
-        credentials: "include",
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-      });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.error ?? "Unknown error");
-      setResult(data);
-      setStage("done");
-    } catch (err: any) {
-      setError(err.message ?? "Something went wrong");
-      setStage("error");
-    }
+
+    // Use XHR (not fetch) because we need upload-progress events.
+    const xhr = new XMLHttpRequest();
+    xhrRef.current = xhr;
+    xhr.open("POST", "/api/videos/v2v", true);
+    xhr.withCredentials = true;
+    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+
+    xhr.upload.onprogress = (e) => {
+      if (!e.lengthComputable) return;
+      setUploaded(e.loaded);
+      setUploadPct(Math.round((e.loaded / e.total) * 100));
+    };
+    xhr.upload.onload = () => setUploadPct(100);
+
+    xhr.onload = () => {
+      try {
+        const data = JSON.parse(xhr.responseText || "{}");
+        if (xhr.status >= 200 && xhr.status < 300) {
+          setResult(data);
+          setStage("done");
+        } else {
+          setError(data.error ?? `Upload failed (HTTP ${xhr.status})`);
+          setStage("error");
+        }
+      } catch {
+        setError(`Server returned an invalid response (HTTP ${xhr.status})`);
+        setStage("error");
+      }
+      xhrRef.current = null;
+    };
+    xhr.onerror   = () => { setError("Network error — check your connection and try again."); setStage("error"); xhrRef.current = null; };
+    xhr.onabort   = () => { setError("Upload was cancelled.");                                 setStage("error"); xhrRef.current = null; };
+    xhr.ontimeout = () => { setError("Upload timed out — try a smaller file or better connection."); setStage("error"); xhrRef.current = null; };
+
+    xhr.send(form);
   };
 
+  const cancelUpload = () => { xhrRef.current?.abort(); };
+
   const reset = () => {
+    xhrRef.current?.abort();
     setTarget(null); setReference(null);
     setTargetUrl(null); setReferenceUrl(null);
     setPrompt(""); setResult(null); setError(null); setStage("idle");
+    setUploadPct(0); setUploaded(0); setTotalBytes(0);
   };
+
+  const fmtMB = (n: number) => (n / 1024 / 1024).toFixed(1);
 
   return (
     <AppLayout>
@@ -324,20 +358,58 @@ export default function VideoToVideoPage() {
 
             {stage === "processing" && (
               <div className="border border-white/8 rounded-2xl p-5 space-y-4">
-                <p className="text-xs font-semibold text-white/50 uppercase tracking-widest">Pipeline</p>
-                {[
-                  "Uploading both videos",
-                  "Extracting reference frames",
-                  "AI generating transfer",
-                  "Applying to target video",
-                  "Encoding final video",
-                ].map((step, i) => (
-                  <div key={step} className="flex items-center gap-3">
-                    <div className={cn("w-1.5 h-1.5 rounded-full shrink-0", i < 3 ? "bg-white animate-pulse" : "bg-white/15")} />
-                    <span className="text-xs text-white/40">{step}</span>
+                {/* Upload progress bar */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs font-semibold text-white/60 uppercase tracking-widest">
+                      {uploadPct < 100 ? "Uploading" : "Processing on server"}
+                    </p>
+                    <span className="text-xs font-mono tabular-nums text-white/50">
+                      {uploadPct < 100
+                        ? `${fmtMB(uploaded)} / ${fmtMB(totalBytes)} MB · ${uploadPct}%`
+                        : "100%"}
+                    </span>
                   </div>
-                ))}
-                <p className="text-[11px] text-white/20 pt-1">Takes 1–3 minutes</p>
+                  <div className="h-1.5 bg-white/8 rounded-full overflow-hidden">
+                    <div
+                      className={cn(
+                        "h-full transition-all duration-200",
+                        uploadPct < 100 ? "bg-white" : "bg-emerald-400 animate-pulse"
+                      )}
+                      style={{ width: `${Math.max(uploadPct, 4)}%` }}
+                    />
+                  </div>
+                  {uploadPct < 100 && (
+                    <button
+                      onClick={cancelUpload}
+                      className="text-[11px] text-white/30 hover:text-white/60 transition-colors"
+                    >
+                      Cancel upload
+                    </button>
+                  )}
+                </div>
+
+                <div className="border-t border-white/8 pt-4 space-y-3">
+                  <p className="text-xs font-semibold text-white/50 uppercase tracking-widest">Pipeline</p>
+                  {[
+                    { label: "Upload videos",          done: uploadPct >= 100, active: uploadPct < 100 },
+                    { label: "Extract reference frames", done: false,           active: uploadPct >= 100 },
+                    { label: "AI generating transfer",   done: false,           active: uploadPct >= 100 },
+                    { label: "Apply to target video",    done: false,           active: false },
+                    { label: "Encode final video",       done: false,           active: false },
+                  ].map((step) => (
+                    <div key={step.label} className="flex items-center gap-3">
+                      <div className={cn(
+                        "w-1.5 h-1.5 rounded-full shrink-0",
+                        step.done ? "bg-emerald-400" : step.active ? "bg-white animate-pulse" : "bg-white/15"
+                      )} />
+                      <span className={cn("text-xs", step.active ? "text-white/70" : "text-white/40")}>{step.label}</span>
+                    </div>
+                  ))}
+                  <p className="text-[11px] text-white/20 pt-1">
+                    Server processing takes 1–3 minutes. Don't refresh the page.
+                  </p>
+                </div>
               </div>
             )}
 
