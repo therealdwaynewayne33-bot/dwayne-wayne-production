@@ -232,71 +232,73 @@ router.post(
       return res.status(500).json({ error: `AI transfer failed: ${err.message}` });
     }
 
-    // 5. White-balance the target video to match the REFERENCE.
+    // 5. Transfer the AI-edited frame's GRADE onto the target video.
     //
-    //  Approach: compute the white point (avg of brightest 25% of pixels) of
-    //  both the original target frame AND the reference frame. Compute the
-    //  per-channel SCALE factor needed to make the target's whites look like
-    //  the reference's whites. Apply that scale to every frame of the video.
+    // The AI edit step (GPT-Image-1) just produced `editedFramePath` — a single
+    // frame showing the target with the requested transfer applied. That frame
+    // IS the user's desired look. To carry it onto every frame of the video:
     //
-    //  Why this is better than averaging the AI-edited frame:
-    //   - GPT-Image-1 sometimes drifts (over-warms, over-cools, darkens).
-    //     Using its output as the colour target propagates that drift.
-    //   - The user's REFERENCE photo is the ground truth for what they want.
-    //     Balancing against it directly is precise and predictable.
-    //   - White-point matching is what real cinematographers do — it's true
-    //     white balance, not crude colour shifting.
+    //   per-channel scale = editedWhitePoint[c] / targetWhitePoint[c]
+    //   luminance gain    = editedAvgLuminance  / targetAvgLuminance
     //
-    //
-    //  STRATEGY:
-    //    1. AUTO WHITE BALANCE — force the target's brightest pixels (whites)
-    //       to be a true NEUTRAL grey (R=G=B). This is what real cameras do
-    //       and it ALWAYS produces clean white walls regardless of any
-    //       coloured cast in the reference photo.
-    //    2. EXPOSURE — lift brightness toward the reference if needed, but
-    //       never darken (we never want to dim user footage to match a dim ref).
-    //    3. The reference photo is used by GPT for the AI edit step but does
-    //       NOT propagate its colour cast into the colour correction. Most
-    //       reference photos have their own cast (fluorescent green, tungsten
-    //       yellow), so matching them blindly produces ugly tinted output.
-    //
+    // This transfers the AI's colour decision (warmer / cooler / moodier /
+    // graded) onto the entire video using a real white-balance/exposure
+    // matching pass — not a stylised filter.
     let sR = 1, sG = 1, sB = 1;
     let brightnessGain = 1;
+    let satBoost = 1.0;
     try {
       const [tR, tG, tB] = await whitePoint(targetFramePath);
-      // Neutralise: make brightest pixels true neutral grey. Compute the
-      // average luminance-target and scale each channel to match it.
-      const grayTarget = (tR + tG + tB) / 3;
-      const clamp = (v: number) => Math.max(0.55, Math.min(1.65, v));
-      sR = clamp(grayTarget / Math.max(1, tR));
-      sG = clamp(grayTarget / Math.max(1, tG));
-      sB = clamp(grayTarget / Math.max(1, tB));
+      const [eR, eG, eB] = await whitePoint(editedFramePath);
 
-      // Brightness: lift toward reference if reference is brighter.
-      // Never go below 1.0 (gamma > 1 in ffmpeg's eq filter brightens).
+      // Per-channel scale to push target whites toward edited whites.
+      // Clamp wide enough to allow a real grade (warmer/cooler) but not
+      // produce wildly tinted output if AI drifted hard.
+      const clamp = (v: number) => Math.max(0.55, Math.min(1.85, v));
+      sR = clamp(eR / Math.max(1, tR));
+      sG = clamp(eG / Math.max(1, tG));
+      sB = clamp(eB / Math.max(1, tB));
+
+      // Luminance match (allow both brighten and darken, gently bounded).
       const tLum = await avgLuminance(targetFramePath);
-      const rLum = await avgLuminance(refFramePath);
-      brightnessGain = Math.max(1.0, Math.min(1.40, rLum / Math.max(1, tLum)));
+      const eLum = await avgLuminance(editedFramePath);
+      brightnessGain = Math.max(0.75, Math.min(1.40, eLum / Math.max(1, tLum)));
+
+      // Saturation match: chroma = avg distance of pixels from neutral grey.
+      const targetPx = await samplePixels(targetFramePath, 32);
+      const editedPx = await samplePixels(editedFramePath, 32);
+      const chroma = (px: { r: number; g: number; b: number }[]) => {
+        let s = 0;
+        for (const p of px) {
+          const m = (p.r + p.g + p.b) / 3;
+          s += Math.abs(p.r - m) + Math.abs(p.g - m) + Math.abs(p.b - m);
+        }
+        return s / px.length;
+      };
+      const tSat = chroma(targetPx);
+      const eSat = chroma(editedPx);
+      satBoost = Math.max(0.80, Math.min(1.50, eSat / Math.max(1, tSat)));
 
       req.log.info(
         {
           target_wp: [Math.round(tR), Math.round(tG), Math.round(tB)],
-          gray_target: Math.round(grayTarget),
+          edited_wp: [Math.round(eR), Math.round(eG), Math.round(eB)],
           scale: { r: sR.toFixed(3), g: sG.toFixed(3), b: sB.toFixed(3) },
           target_lum: tLum.toFixed(1),
-          ref_lum:    rLum.toFixed(1),
+          edited_lum: eLum.toFixed(1),
           brightnessGain: brightnessGain.toFixed(3),
+          satBoost: satBoost.toFixed(3),
         },
-        "v2v: auto white-balance + brighten"
+        "v2v: grade transfer from AI-edited frame"
       );
     } catch (err: any) {
-      req.log.warn({ err: err.message }, "v2v: whitePoint/luminance failed, falling back to identity");
+      req.log.warn({ err: err.message }, "v2v: grade extraction failed, falling back to identity");
     }
 
-    // colorchannelmixer: per-channel multiplicative scaling = pure white balance.
+    // colorchannelmixer: per-channel multiplicative scaling = white balance shift.
     const wb_filter = `colorchannelmixer=rr=${sR}:gg=${sG}:bb=${sB}`;
-    // eq=gamma > 1 brightens midtones without blowing highlights.
-    const exposure_filter = `eq=gamma=${brightnessGain.toFixed(3)}:contrast=1.03:saturation=1.05`;
+    // eq: midtone gamma + contrast/saturation match.
+    const exposure_filter = `eq=gamma=${brightnessGain.toFixed(3)}:contrast=1.05:saturation=${satBoost.toFixed(3)}`;
 
     const outputPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
     const ffmpegCmd = [
