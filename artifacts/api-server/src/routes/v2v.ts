@@ -186,22 +186,38 @@ router.post(
       outH = Math.round(vidHeight / 2) * 2;
     }
 
-    // 3. Extract reference frames.
-    //    - target: always a mid-point frame from the video
-    //    - reference: if it's an image, normalise to PNG; if video, extract mid-point
+    // 3. Extract REPRESENTATIVE frames.
+    //    - target: use ffmpeg's `thumbnail` filter, which analyses batches of
+    //      frames and picks the most representative one (skipping blank/black/
+    //      blown-out frames — exactly the bug we just hit where the first
+    //      frame of a Luma export was pure white).
+    //    - reference: if image, just normalise to PNG; if video, same thumbnail
+    //      filter as target.
+    //
+    //    We also seek a small offset (0.5s) past the start to skip any intro
+    //    flash, and analyse the next ~3-4 seconds of frames.
     const targetFramePath = path.join(UPLOADS_DIR, `${jobId}-target-frame.png`);
     const refFramePath    = path.join(UPLOADS_DIR, `${jobId}-ref-frame.png`);
-    const midSec = (vidDuration / 2).toFixed(2);
     try {
       const refExtractCmd = refIsImage
         // Image reference — just convert/normalise to PNG (handles HEIC, WebP, etc.)
         ? `ffmpeg -y -i "${referencePath}" -frames:v 1 -q:v 2 "${refFramePath}"`
-        // Video reference — grab a frame ~1s in
-        : `ffmpeg -y -ss 1.0 -i "${referencePath}" -vframes 1 -q:v 2 "${refFramePath}"`;
+        // Video reference — pick most representative frame
+        : `ffmpeg -y -ss 0.5 -i "${referencePath}" -vf "thumbnail=100" -frames:v 1 -q:v 2 "${refFramePath}"`;
       await Promise.all([
-        execAsync(`ffmpeg -y -ss ${midSec} -i "${targetPath}" -vframes 1 -q:v 2 "${targetFramePath}"`),
+        execAsync(`ffmpeg -y -ss 0.5 -i "${targetPath}" -vf "thumbnail=100" -frames:v 1 -q:v 2 "${targetFramePath}"`),
         execAsync(refExtractCmd),
       ]);
+
+      // Sanity-check the extracted target frame: if it's still blown-out
+      // (avg lum > 245) or near-black (< 10), fall back to a hard-seek to
+      // 25% of the video duration where there's almost certainly real content.
+      const lum = await avgLuminance(targetFramePath);
+      if (lum > 245 || lum < 10) {
+        req.log.warn({ lum: lum.toFixed(1) }, "v2v: thumbnail frame was blank — re-extracting at 25% duration");
+        const fallbackSec = Math.max(0.5, vidDuration * 0.25).toFixed(2);
+        await execAsync(`ffmpeg -y -ss ${fallbackSec} -i "${targetPath}" -vframes 1 -q:v 2 "${targetFramePath}"`);
+      }
     } catch (err: any) {
       return res.status(500).json({ error: `Frame extraction failed: ${err.message}` });
     }
