@@ -316,20 +316,29 @@ router.post(
     // eq: midtone gamma + contrast/saturation match.
     const exposure_filter = `eq=gamma=${brightnessGain.toFixed(3)}:contrast=1.08:saturation=${satBoost.toFixed(3)}`;
 
-    // SOFT-LIGHT BLEND of the AI-edited frame on top of the video.
+    // COLOR-FIELD BLEND of the AI-edited frame on top of the video.
     //
-    //   Soft-light is the standard photographic grading blend: it pushes the
-    //   underlying pixel toward the overlay's HUE and TONE while preserving
-    //   the underlying luminance/detail. This is exactly how Lightroom /
-    //   Photoshop "color match" presets work — overlay a graded reference at
-    //   some opacity and the colour of that reference is applied to the image
-    //   without flattening detail.
+    //   PROBLEM with naive soft-light blend of the AI frame:
+    //     The AI frame contains real picture content (people, furniture,
+    //     edges). Blending it on top of moving video locks that structure
+    //     onto every frame as a static ghost — the silhouettes of the AI's
+    //     people appear baked into the user's moving video. Looks awful.
     //
-    //   Combined with the WB/exposure/saturation match above, this gives a
-    //   strong, visible grade that follows the AI's colour decision frame-by-frame.
+    //   FIX:
+    //     Strip the STRUCTURE out of the AI frame, keep only the COLOUR. We
+    //     do this by downscaling it to 16×9 (≈ output aspect ratio at tiny
+    //     resolution) then upscaling back with bilinear interp. The result
+    //     is a smooth gradient colour field that carries the AI's local
+    //     hue/tone decisions across the frame WITHOUT any image structure.
     //
-    //   Opacity 0.55 = strong but not opaque (you still see your video clearly).
-    const BLEND_OPACITY = 0.55;
+    //     A small downscale (16×9) preserves rough left-right/top-bottom
+    //     colour zones — e.g. if the AI graded the sky blue and the ground
+    //     warm, that vertical gradient is preserved. Going to 1×1 would
+    //     give a pure global colour wash; 16×9 is a sweet spot.
+    //
+    //   With no structure to ghost, we can push opacity higher (0.65) for a
+    //   stronger visible grade.
+    const BLEND_OPACITY = 0.65;
 
     const outputPath = path.join(VIDEOS_DIR, `${jobId}-out.mp4`);
     const ffmpegCmd = [
@@ -340,7 +349,9 @@ router.post(
       `"[0:v]scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,format=yuv420p,` +
       `${wb_filter},` +
       `${exposure_filter}[base];` +
-      `[1:v]scale=${outW}:${outH}:force_original_aspect_ratio=increase,crop=${outW}:${outH},format=yuv420p,setsar=1[grade];` +
+      // 1) downscale AI frame to 16×9 (kills all structure, keeps local colour zones)
+      // 2) upscale back to video size with bilinear smoothing → pure colour field
+      `[1:v]scale=16:9,scale=${outW}:${outH}:flags=bilinear,format=yuv420p,setsar=1[grade];` +
       `[base][grade]blend=all_mode='softlight':all_opacity=${BLEND_OPACITY},` +
       `noise=alls=2:allf=t+u[out]"`,
       `-map "[out]" -map "0:a?"`,
