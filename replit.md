@@ -45,10 +45,16 @@ Full-stack AI video generation platform (SaaS MVP). Dark cinematic UI with chara
 - **Style Options**: realistic, cartoon, 3D-animated, cinematic
 - **Face Lock**: Character consistency system — upload character images, lock to videos
 - **Background Replace**: Luma Ray-2 video-to-video (`luma/modify-video`, mode `flex_1`) with optional `arabyai-replicate/roop_face_swap` for face-lock. Per-result "Fix face" button re-runs only the swap against the original Luma render.
+- **Generate Scene** (`/generate-scene`, route `POST /api/scene/generate`): multi-engine image-to-video / text-to-video generator. Engine tab strip in the UI lets the user pick between four Replicate models, each registered in the `ENGINES` catalog at the top of `artifacts/api-server/src/routes/generate-scene.ts`:
+  - `kwaivgi/kling-v2.1` — needs `start_image`, premium cinematic, 5s/10s
+  - `minimax/hailuo-02` — `first_frame_image` optional (so this engine supports pure text-to-video), 6s/10s
+  - `pixverse/pixverse-v4.5` — `image` optional, 5s/8s, supports special effects
+  - `wan-video/wan-2.2-i2v-a14b` — `image` required, ~3s output
+  Backend persists the upload to `/api/uploads/<jobId>-img.<ext>`, calls the chosen model, downloads the result to `/api/videos-files/<jobId>-out.mp4`, generates a thumbnail. Engine list is exposed at `GET /api/scene/engines`. **Important**: this is NOT video-to-video modify (Luma `modify-video` is the only model on Replicate that accepts a video input — see prior investigation). Generate Scene is for B-roll, establishing shots, and animating stills the user can't film.
 
 ### Background Replace — DEMO MODE
 
-The Replicate account currently has $0 credit, so `BG_REPLACE_DEMO_MODE` is **on by default**. When on:
+`BG_REPLACE_DEMO_MODE` is currently **off** (the user topped up Replicate credits). When `BG_REPLACE_DEMO_MODE=true`:
 
 - `POST /api/videos/bg-replace` and `/fix-face` skip Luma + Roop entirely
 - Instead, ffmpeg applies a prompt-aware color grade (warm beach, cool night, green forest, etc.) + vignette
