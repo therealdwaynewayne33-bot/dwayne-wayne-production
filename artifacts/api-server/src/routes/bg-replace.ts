@@ -7,6 +7,13 @@ import { exec, execFile } from "child_process";
 import { promisify } from "util";
 import Replicate from "replicate";
 import { requireAuth } from "../middlewares/requireAuth";
+import {
+  chargeCredits,
+  refundCredits,
+  COST_BG_REPLACE,
+  COST_BG_REPLACE_FIX_FACE,
+  insufficientCreditsResponse,
+} from "../lib/credits";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOADS_DIR = path.join(__dirname, "../public/uploads");
@@ -277,10 +284,16 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
 
   const srcPublicUrl = `https://${domain}/api/uploads/${jobId}-src.mp4`;
 
+  // Charge BEFORE the paid Replicate calls. Demo mode is free and skipped above.
+  const charge = await chargeCredits(req.session.userId!, COST_BG_REPLACE, "bg-replace", req.log);
+  if (!charge.ok) {
+    return res.status(402).json(insufficientCreditsResponse(charge.have, charge.needed));
+  }
+
   const replicate = new Replicate({ auth: token });
 
   // 2. Luma video-to-video re-render
-  req.log.info({ jobId, prompt, lockFace }, "bg-replace: calling luma/modify-video");
+  req.log.info({ jobId, prompt, lockFace, cost: COST_BG_REPLACE }, "bg-replace: calling luma/modify-video");
   let lumaUrl: string;
   try {
     const output = await replicate.run("luma/modify-video", {
@@ -296,6 +309,7 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     lumaUrl = resolveUrl(output);
   } catch (err: any) {
     req.log.error({ err: err.message }, "bg-replace: luma/modify-video failed");
+    await refundCredits(req.session.userId!, COST_BG_REPLACE, "bg-replace luma failed", req.log);
     const f = friendlyReplicateError(err);
     return res.status(f.status).json({ error: f.message });
   }
@@ -305,6 +319,7 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
   try {
     await downloadToFile(lumaUrl, lumaPath);
   } catch (err: any) {
+    await refundCredits(req.session.userId!, COST_BG_REPLACE, "bg-replace download failed", req.log);
     return res.status(500).json({ error: `Failed to download Luma output: ${err.message}` });
   }
 
@@ -358,6 +373,8 @@ router.post("/videos/bg-replace", requireAuth, upload.single("video"), async (re
     faceLocked,
     demoMode:     false,
     jobId,
+    creditsCharged: COST_BG_REPLACE,
+    creditsRemaining: charge.newBalance,
   });
 });
 
@@ -457,6 +474,12 @@ router.post("/videos/bg-replace/fix-face", requireAuth, async (req, res) => {
   const targetAbs  = `https://${domain}${targetVideoUrl}`;
   const faceSrcAbs = `https://${domain}${faceSourceUrl}`;
 
+  // Charge BEFORE Roop. Refund on any downstream failure.
+  const charge = await chargeCredits(req.session.userId!, COST_BG_REPLACE_FIX_FACE, "bg-replace/fix-face", req.log);
+  if (!charge.ok) {
+    return res.status(402).json(insufficientCreditsResponse(charge.have, charge.needed));
+  }
+
   // Download the face source (could be a video or an image) so we can extract
   // a single clean face frame from it locally.
   let faceSrcExt = ".mp4";
@@ -468,6 +491,7 @@ router.post("/videos/bg-replace/fix-face", requireAuth, async (req, res) => {
   try {
     await downloadToFile(faceSrcAbs, faceSrcPath);
   } catch (err: any) {
+    await refundCredits(req.session.userId!, COST_BG_REPLACE_FIX_FACE, "fix-face: facesrc download failed", req.log);
     return res.status(500).json({ error: `Failed to download face source: ${err.message}` });
   }
 
@@ -475,13 +499,14 @@ router.post("/videos/bg-replace/fix-face", requireAuth, async (req, res) => {
   try {
     await extractFaceFrame(faceSrcPath, facePath);
   } catch (err: any) {
+    await refundCredits(req.session.userId!, COST_BG_REPLACE_FIX_FACE, "fix-face: extract failed", req.log);
     return res.status(500).json({ error: `Failed to extract face frame: ${err.message}` });
   }
   const facePublicUrl = `https://${domain}/api/uploads/${jobId}-face.jpg`;
 
   const replicate = new Replicate({ auth: token });
 
-  req.log.info({ jobId, targetAbs }, "bg-replace fix-face: running roop_face_swap");
+  req.log.info({ jobId, targetAbs, cost: COST_BG_REPLACE_FIX_FACE }, "bg-replace fix-face: running roop_face_swap");
   let resultUrl: string;
   try {
     const output = await replicate.run("arabyai-replicate/roop_face_swap", {
@@ -493,6 +518,7 @@ router.post("/videos/bg-replace/fix-face", requireAuth, async (req, res) => {
     resultUrl = resolveUrl(output);
   } catch (err: any) {
     req.log.error({ err: err.message }, "bg-replace fix-face: roop_face_swap failed");
+    await refundCredits(req.session.userId!, COST_BG_REPLACE_FIX_FACE, "fix-face: roop failed", req.log);
     const f = friendlyReplicateError(err);
     return res.status(f.status).json({ error: `Face lock failed — ${f.message}` });
   }
@@ -501,6 +527,7 @@ router.post("/videos/bg-replace/fix-face", requireAuth, async (req, res) => {
   try {
     await downloadToFile(resultUrl, outPath);
   } catch (err: any) {
+    await refundCredits(req.session.userId!, COST_BG_REPLACE_FIX_FACE, "fix-face: download failed", req.log);
     return res.status(500).json({ error: `Failed to download face-swap result: ${err.message}` });
   }
 
@@ -515,6 +542,8 @@ router.post("/videos/bg-replace/fix-face", requireAuth, async (req, res) => {
     thumbnailUrl: `/api/thumbs/${jobId}.jpg`,
     demoMode:     false,
     jobId,
+    creditsCharged: COST_BG_REPLACE_FIX_FACE,
+    creditsRemaining: charge.newBalance,
   });
 });
 

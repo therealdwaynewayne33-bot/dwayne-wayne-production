@@ -7,6 +7,12 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import Replicate from "replicate";
 import { requireAuth } from "../middlewares/requireAuth";
+import {
+  chargeCredits,
+  refundCredits,
+  costForSceneEngine,
+  insufficientCreditsResponse,
+} from "../lib/credits";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOADS_DIR = path.join(__dirname, "../public/uploads");
@@ -222,9 +228,17 @@ router.post("/scene/generate", requireAuth, upload.single("image"), async (req, 
   const aspectRatio    = req.body?.aspectRatio    as string | undefined;
   const negativePrompt = req.body?.negativePrompt as string | undefined;
 
+  // Charge credits BEFORE the Replicate call so two parallel requests can't
+  // both overspend a near-empty balance. Refund on any failure path below.
+  const cost = costForSceneEngine(engineId, duration);
+  const charge = await chargeCredits(req.session.userId!, cost, `scene/${engineId}`, req.log);
+  if (!charge.ok) {
+    return res.status(402).json(insufficientCreditsResponse(charge.have, charge.needed));
+  }
+
   const input = spec.build({ prompt, imageUrl, duration, aspectRatio, negativePrompt });
 
-  req.log.info({ jobId, engine: engineId, prompt }, "scene/generate: calling model");
+  req.log.info({ jobId, engine: engineId, prompt, cost }, "scene/generate: calling model");
 
   const replicate = new Replicate({ auth: token });
   let resultUrl: string;
@@ -233,6 +247,7 @@ router.post("/scene/generate", requireAuth, upload.single("image"), async (req, 
     resultUrl = resolveUrl(output);
   } catch (err: any) {
     req.log.error({ err: err.message, engine: engineId }, "scene/generate: model failed");
+    await refundCredits(req.session.userId!, cost, `scene/${engineId} failed`, req.log);
     const f = friendlyReplicateError(err);
     return res.status(f.status).json({ error: `${spec.label} — ${f.message}` });
   }
@@ -243,6 +258,7 @@ router.post("/scene/generate", requireAuth, upload.single("image"), async (req, 
   try {
     await downloadToFile(resultUrl, outPath);
   } catch (err: any) {
+    await refundCredits(req.session.userId!, cost, `scene/${engineId} download failed`, req.log);
     return res.status(500).json({ error: `Failed to save generated video: ${err.message}` });
   }
 
@@ -258,6 +274,8 @@ router.post("/scene/generate", requireAuth, upload.single("image"), async (req, 
     engine:       engineId,
     engineLabel:  spec.label,
     jobId,
+    creditsCharged: cost,
+    creditsRemaining: charge.newBalance,
   });
 });
 

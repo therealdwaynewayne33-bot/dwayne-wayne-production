@@ -10,6 +10,7 @@ import bgReplaceRouter from "./bg-replace";
 import faceSwapRouter from "./face-swap";
 import v2vRouter from "./v2v";
 import generateSceneRouter from "./generate-scene";
+import creditsRouter from "./credits";
 
 const router: IRouter = Router();
 
@@ -24,5 +25,6 @@ router.use(bgReplaceRouter);
 router.use(faceSwapRouter);
 router.use(v2vRouter);
 router.use(generateSceneRouter);
+router.use(creditsRouter);
 
 export default router;

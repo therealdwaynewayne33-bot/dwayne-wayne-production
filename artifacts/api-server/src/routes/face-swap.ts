@@ -23,6 +23,10 @@ const upload = multer({
 
 // POST /api/face-swap
 // multipart: swapImage (the face), targetImage (the photo to put it in)
+//
+// TODO(credits): this route is NOT yet gated by the credit system in
+// `lib/credits.ts`. Wire `chargeCredits()` / `refundCredits()` here before
+// exposing it to public users, otherwise it bypasses the per-user quota.
 router.post("/face-swap", requireAuth, upload.fields([
   { name: "swapImage", maxCount: 1 },
   { name: "targetImage", maxCount: 1 },

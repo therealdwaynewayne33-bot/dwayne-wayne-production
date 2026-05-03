@@ -1,8 +1,10 @@
 import { Link, useLocation } from "wouter";
 import { useAuth } from "@/lib/auth";
 import { cn } from "@/lib/utils";
-import { Sparkles, LogOut, Crown, ChevronDown } from "lucide-react";
+import { Sparkles, LogOut, Crown, ChevronDown, Coins, Plus } from "lucide-react";
 import { useState, useRef, useEffect } from "react";
+import { useCredits, useGrantTestCredits } from "@/lib/credits";
+import { useToast } from "@/hooks/use-toast";
 
 const navItems = [
   { label: "Dashboard",   href: "/dashboard" },
@@ -19,6 +21,20 @@ export function Topbar() {
   const { user, logout } = useAuth();
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const { data: creditsData } = useCredits();
+  const grant = useGrantTestCredits();
+  const { toast } = useToast();
+  const balance = creditsData?.credits ?? null;
+  const lowCredits = balance !== null && balance < 100;
+
+  const onGrant = () => {
+    grant.mutate(undefined, {
+      onSuccess: (d) =>
+        toast({ title: `+${d.granted} test credits`, description: `New balance: ${d.credits.toLocaleString()}` }),
+      onError: (e: any) =>
+        toast({ title: "Couldn't grant credits", description: e.message }),
+    });
+  };
 
   useEffect(() => {
     function handle(e: MouseEvent) {
@@ -69,7 +85,29 @@ export function Topbar() {
         })}
       </nav>
 
-      {/* User menu */}
+      {/* Credits pill + user menu */}
+      <div className="flex items-center gap-2">
+        {user && balance !== null && (
+          <Link href="/pricing">
+            <div
+              data-testid="credit-balance-pill"
+              className={cn(
+                "hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-semibold transition-colors cursor-pointer",
+                lowCredits
+                  ? "border-amber-400/30 bg-amber-400/10 text-amber-300 hover:bg-amber-400/15"
+                  : "border-white/10 bg-white/[0.03] text-white/80 hover:border-white/20",
+              )}
+              title="Click to view plans"
+            >
+              <Coins className={cn("w-3.5 h-3.5", lowCredits ? "text-amber-300" : "text-primary")} />
+              <span data-testid="credit-balance" className="tabular-nums">
+                {balance.toLocaleString()}
+              </span>
+              <span className="text-white/35 font-normal">credits</span>
+            </div>
+          </Link>
+        )}
+
       <div className="relative" ref={menuRef}>
         <button
           onClick={() => setMenuOpen((v) => !v)}
@@ -94,6 +132,25 @@ export function Topbar() {
                 </span>
               </Link>
             </div>
+            {balance !== null && (
+              <div className="px-4 py-3 border-b border-white/6">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[10px] uppercase tracking-widest text-white/35 font-semibold">Credits</span>
+                  <span className={cn("text-sm font-bold tabular-nums", lowCredits ? "text-amber-300" : "text-white")}>
+                    {balance.toLocaleString()}
+                  </span>
+                </div>
+                <button
+                  data-testid="button-grant-credits"
+                  onClick={(e) => { e.stopPropagation(); onGrant(); }}
+                  disabled={grant.isPending}
+                  className="w-full flex items-center justify-center gap-1.5 rounded-md bg-primary/15 hover:bg-primary/25 text-primary text-[11px] font-semibold py-1.5 transition-colors disabled:opacity-50"
+                >
+                  <Plus className="w-3 h-3" />
+                  {grant.isPending ? "…" : "+1,000 test credits"}
+                </button>
+              </div>
+            )}
             {user?.plan === "free" && (
               <Link href="/pricing">
                 <div className="px-4 py-3 border-b border-white/6 flex items-center gap-2 hover:bg-white/5 transition-colors cursor-pointer">
@@ -112,6 +169,7 @@ export function Topbar() {
             </button>
           </div>
         )}
+      </div>
       </div>
     </header>
   );

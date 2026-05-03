@@ -121,6 +121,9 @@ async function avgLuminance(imagePath: string): Promise<number> {
  *     overall vibe to every frame of the target video via FFmpeg softlight blend.
  *     This carries colour grades, lighting moods, and visible static objects.
  */
+// TODO(credits): this route is NOT yet gated by the credit system in
+// `lib/credits.ts`. Wire `chargeCredits()` / `refundCredits()` here before
+// exposing it to public users, otherwise it bypasses the per-user quota.
 router.post(
   "/videos/v2v",
   requireAuth,

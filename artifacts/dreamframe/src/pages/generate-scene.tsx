@@ -1,11 +1,13 @@
 import { useState, useRef, useCallback } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
+import { CREDIT_COSTS } from "@/lib/credits";
 import {
   Upload, Sparkles, Play, Pause, RotateCcw, Volume2, VolumeX,
-  CheckCircle2, X, Wand2, ImageIcon,
+  CheckCircle2, X, Wand2, ImageIcon, Coins,
 } from "lucide-react";
 
 function fmt(s: number) {
@@ -157,9 +159,11 @@ export default function GenerateScenePage() {
   const [dragging, setDragging] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
+  const qc = useQueryClient();
 
   const engine = ENGINES.find((e) => e.id === engineId)!;
   const effectiveDuration = duration ?? engine.durations[0] ?? null;
+  const creditCost = CREDIT_COSTS.scene[engineId]?.(effectiveDuration ?? 0) ?? 0;
 
   const handleFile = (f: File) => {
     if (!f.type.startsWith("image/")) {
@@ -209,7 +213,12 @@ export default function GenerateScenePage() {
       if (!resp.ok) throw new Error(data.error ?? "Scene generation failed");
       setResult(data);
       setStage("done");
-      toast({ title: "Scene ready", description: `${data.engineLabel} finished your clip.` });
+      // Refresh sidebar balance immediately so the user sees the deduction.
+      qc.invalidateQueries({ queryKey: ["credits"] });
+      toast({
+        title: "Scene ready",
+        description: `${data.engineLabel} finished. ${data.creditsCharged ?? 0} credits used · ${data.creditsRemaining?.toLocaleString() ?? "?"} left.`,
+      });
     } catch (err: any) {
       setError(err.message ?? "Scene generation failed");
       setStage("error");
@@ -263,7 +272,13 @@ export default function GenerateScenePage() {
           </div>
           <div className="mt-3 rounded-lg border border-white/5 bg-white/[0.02] px-4 py-3 text-xs text-white/50 flex flex-wrap items-center gap-x-6 gap-y-1">
             <span><span className="text-white/30">Best for:</span> {engine.best}</span>
-            <span><span className="text-white/30">Cost:</span> {engine.cost}</span>
+            <span className="flex items-center gap-1.5">
+              <Coins className="w-3 h-3 text-primary/70" />
+              <span className="text-white/30">Costs</span>
+              <span className="text-white font-semibold tabular-nums">{creditCost}</span>
+              <span className="text-white/30">credits</span>
+              <span className="text-white/20">({engine.cost})</span>
+            </span>
           </div>
         </div>
 
@@ -376,7 +391,7 @@ export default function GenerateScenePage() {
               ) : (
                 <>
                   <Wand2 className="w-4 h-4" />
-                  Generate scene
+                  Generate scene · {creditCost} credits
                 </>
               )}
             </Button>
