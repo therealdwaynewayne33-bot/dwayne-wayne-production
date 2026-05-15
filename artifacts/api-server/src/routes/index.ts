@@ -9,8 +9,15 @@ import billingRouter from "./billing";
 import bgReplaceRouter from "./bg-replace";
 import faceSwapRouter from "./face-swap";
 import v2vRouter from "./v2v";
+import colorGradeRouter from "./color-grade";
 import generateSceneRouter from "./generate-scene";
 import creditsRouter from "./credits";
+import productionRouter from "./production";
+import aiSegmentTrackRouter from "./ai-segment-track";
+import runwayGenerateRouter from "./runway-generate";
+import stockImagesRouter from "./stock-images";
+import stockVideosRouter from "./stock-videos";
+import libraryRouter from "./library";
 
 const router: IRouter = Router();
 
@@ -24,7 +31,14 @@ router.use(billingRouter);
 router.use(bgReplaceRouter);
 router.use(faceSwapRouter);
 router.use(v2vRouter);
+router.use(colorGradeRouter);
 router.use(generateSceneRouter);
 router.use(creditsRouter);
+router.use(productionRouter);
+router.use(aiSegmentTrackRouter);
+router.use(runwayGenerateRouter);
+router.use(stockImagesRouter);
+router.use(stockVideosRouter);
+router.use(libraryRouter);
 
 export default router;

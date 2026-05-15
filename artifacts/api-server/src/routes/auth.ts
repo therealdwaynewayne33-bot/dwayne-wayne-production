@@ -53,11 +53,74 @@ router.post("/auth/logout", (req, res) => {
 });
 
 router.get("/auth/me", requireAuth, async (req, res) => {
-  const [user] = await db.select().from(usersTable).where(eq(usersTable.id, req.session.userId!)).limit(1);
-  if (!user) {
-    return res.status(401).json({ error: "User not found" });
+  const isLocalDev = process.env.NODE_ENV !== "production" && !process.env.REPL_ID;
+
+  // If DB isn't configured locally, still allow the UI to load.
+  if (isLocalDev && !process.env.DATABASE_URL) {
+    return res.json({
+      id: 1,
+      email: "demo@localhost",
+      name: "Demo User",
+      plan: "free",
+      credits: 1000,
+      createdAt: new Date().toISOString(),
+    });
   }
-  return res.json({ id: user.id, email: user.email, name: user.name, plan: user.plan, credits: user.credits, createdAt: user.createdAt });
+
+  try {
+    const [user] = await db
+      .select()
+      .from(usersTable)
+      .where(eq(usersTable.id, req.session.userId!))
+      .limit(1);
+
+    if (!user) {
+      if (!isLocalDev) return res.status(401).json({ error: "User not found" });
+
+      // Local dev convenience: ensure a demo user exists.
+      const [created] = await db
+        .insert(usersTable)
+        .values({
+          id: 1,
+          email: "demo@localhost",
+          name: "Demo User",
+          passwordHash: "dev-only",
+          plan: "free",
+        })
+        .onConflictDoNothing()
+        .returning();
+
+      const u = created ?? {
+        id: 1,
+        email: "demo@localhost",
+        name: "Demo User",
+        plan: "free",
+        credits: 1000,
+        createdAt: new Date(),
+      };
+
+      return res.json({
+        id: u.id,
+        email: u.email,
+        name: u.name,
+        plan: u.plan,
+        credits: (u as any).credits ?? 1000,
+        createdAt: (u as any).createdAt ?? new Date().toISOString(),
+      });
+    }
+
+    return res.json({
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      plan: user.plan,
+      credits: user.credits,
+      createdAt: user.createdAt,
+    });
+  } catch (error: any) {
+    req.log?.error?.({ err: error }, "auth/me failed");
+    return res.status(500).json({ error: error?.message ? String(error.message) : "Internal server error" });
+  }
 });
 
 export default router;

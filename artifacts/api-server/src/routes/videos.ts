@@ -15,7 +15,13 @@ import { generateImageBuffer } from "@workspace/integrations-openai-ai-server/im
 import { writeFile, mkdir } from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
-import Replicate from "replicate";
+import {
+  generateCinematicAiVideo,
+  generateLegacyAiVideo,
+  type CinematicQuality,
+  type VideoEngine,
+  type OutputResolution,
+} from "../lib/cinematic-ai-video";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const THUMBS_DIR = path.join(__dirname, "../public/thumbs");
@@ -44,125 +50,60 @@ async function generateThumbnail(videoId: number, prompt: string): Promise<strin
   }
 }
 
-// Resolve Replicate output to a URL string
-function resolveReplicateUrl(output: unknown): string {
-  if (typeof output === "string") return output;
-  if (output && typeof (output as any).url === "function") return (output as any).url().href;
-  if (Array.isArray(output) && output.length > 0) {
-    const item = output[0];
-    return typeof item === "string" ? item : item.url().href;
-  }
-  throw new Error("Unexpected Replicate output format");
+type GenerationJobPayload = {
+  prompt: string;
+  sourceImageUrl?: string;
+  aiModel?: string;
+  cinematicQuality?: CinematicQuality;
+  videoEngine?: VideoEngine;
+  outputResolution?: OutputResolution;
+};
+
+function useLegacyPipeline(payload: GenerationJobPayload): boolean {
+  return (
+    payload.cinematicQuality === undefined &&
+    payload.videoEngine === undefined &&
+    payload.outputResolution === undefined
+  );
 }
 
-// Generate real video using AI
-// Priority order for model selection:
-//   1. sourceImageUrl present → WAN 2.1 i2v  (Modify/animate-image feature)
-//   2. characterImageUrl present → MiniMax    (face-lock, supports first_frame_image)
-//   3. aiModel = "hunyuan"   → HunyuanVideo  (Tencent premium quality)
-//   4. aiModel = "minimax-live" → MiniMax Live
-//   5. default               → WAN 2.1 t2v   (fast, sharp 720p)
-async function generateVideo(
-  videoId: number,
-  prompt: string,
-  characterImageUrl?: string,
-  sourceImageUrl?: string,
-  aiModel?: string,
-): Promise<{ videoUrl: string; duration: number }> {
-  const token = process.env.REPLICATE_API_TOKEN;
-  if (!token) throw new Error("REPLICATE_API_TOKEN not set");
-
-  const replicate = new Replicate({ auth: token });
-  let output: unknown;
-  let duration = 5;
-
-  if (sourceImageUrl) {
-    // Modify / image-to-video: animate a still image using WAN 2.1 i2v
-    output = await replicate.run("wavespeedai/wan-2.1-i2v-720p", {
-      input: {
-        image: sourceImageUrl,
-        prompt,
-        aspect_ratio: "16:9",
-        fast_mode: "Balanced",
-        sample_steps: 25,
-        negative_prompt: "blur, low quality, watermark, text",
-      },
-    });
-    duration = 5;
-  } else if (characterImageUrl) {
-    // Face-lock: MiniMax supports first_frame_image for character consistency
-    output = await replicate.run("minimax/video-01", {
-      input: { prompt, prompt_optimizer: true, first_frame_image: characterImageUrl },
-    });
-    duration = 6;
-  } else if (aiModel === "hunyuan") {
-    // HunyuanVideo — Tencent's premium model, high realism, comparable to Kling/Luma
-    output = await replicate.run("tencent/hunyuan-video", {
-      input: {
-        prompt,
-        width: 1280,
-        height: 720,
-        fps: 24,
-        video_length: 97, // ~4 seconds at 24fps
-        infer_steps: 40,
-        embedded_guidance_scale: 6,
-      },
-    });
-    duration = 4;
-  } else if (aiModel === "minimax-live") {
-    // MiniMax Live — good for faces, slightly smoother motion
-    output = await replicate.run("minimax/video-01-live", {
-      input: { prompt, prompt_optimizer: true },
-    });
-    duration = 6;
-  } else {
-    // Default: WAN 2.1 t2v — fast, sharp 720p, great motion
-    output = await replicate.run("wavespeedai/wan-2.1-t2v-720p", {
-      input: {
-        prompt,
-        aspect_ratio: "16:9",
-        fast_mode: "Balanced",
-        sample_steps: 30,
-        negative_prompt: "blur, low quality, distorted face, watermark, text",
-        disable_safety_checker: false,
-      },
-    });
-    duration = 5;
-  }
-
-  const remoteUrl = resolveReplicateUrl(output);
-
-  // Download and serve locally so the URL stays valid
-  await mkdir(VIDEOS_DIR, { recursive: true });
-  const videoResp = await fetch(remoteUrl);
-  if (!videoResp.ok) throw new Error(`Failed to fetch video: ${videoResp.status}`);
-  const buf = Buffer.from(await videoResp.arrayBuffer());
-  await writeFile(path.join(VIDEOS_DIR, `${videoId}.mp4`), buf);
-
-  return { videoUrl: `/api/videos-files/${videoId}.mp4`, duration };
+async function resolveCharacterImage(characterId?: number): Promise<string | undefined> {
+  if (!characterId) return undefined;
+  const [char] = await db.select().from(charactersTable).where(eq(charactersTable.id, characterId)).limit(1);
+  if (!char?.imageUrl || !char.imageUrl.startsWith("/api/char-files/")) return undefined;
+  const domain = process.env.REPLIT_DEV_DOMAIN ?? process.env.REPLIT_DOMAINS?.split(",")[0];
+  if (!domain) return undefined;
+  return `https://${domain}/api/char-files/${char.id}.png`;
 }
 
-async function runGeneration(videoId: number, prompt: string, sourceImageUrl?: string, aiModel?: string) {
+async function runGeneration(videoId: number, job: GenerationJobPayload) {
   try {
     await db.update(videosTable).set({ status: "processing" }).where(eq(videosTable.id, videoId));
 
-    // Fetch the video record to get characterId (for face lock)
     const [videoRecord] = await db.select().from(videosTable).where(eq(videosTable.id, videoId)).limit(1);
-    let characterImageUrl: string | undefined;
-    if (videoRecord?.characterId) {
-      const [char] = await db.select().from(charactersTable).where(eq(charactersTable.id, videoRecord.characterId)).limit(1);
-      if (char?.imageUrl && char.imageUrl.startsWith("/api/char-files/")) {
-        const domain = process.env.REPLIT_DEV_DOMAIN ?? process.env.REPLIT_DOMAINS?.split(",")[0];
-        if (domain) {
-          characterImageUrl = `https://${domain}/api/char-files/${char.id}.png`;
-        }
-      }
-    }
+    const characterImageUrl = await resolveCharacterImage(videoRecord?.characterId ?? undefined);
 
-    // Run thumbnail and video generation in parallel
+    const token = process.env.REPLICATE_API_TOKEN;
+    if (!token) throw new Error("REPLICATE_API_TOKEN not set");
+
+    const baseOpts = () => ({
+      videoId,
+      prompt: job.prompt,
+      replicateToken: token,
+      videosDir: VIDEOS_DIR,
+      characterImageUrl,
+      sourceImageUrl: job.sourceImageUrl,
+      aiModel: job.aiModel,
+      cinematicQuality: job.cinematicQuality,
+      videoEngine: job.videoEngine,
+      outputResolution: job.outputResolution,
+    });
+
     const [thumbnailUrl, videoResult] = await Promise.allSettled([
-      generateThumbnail(videoId, prompt),
-      generateVideo(videoId, prompt, characterImageUrl, sourceImageUrl, aiModel),
+      generateThumbnail(videoId, job.prompt),
+      useLegacyPipeline(job)
+        ? generateLegacyAiVideo(baseOpts())
+        : generateCinematicAiVideo(baseOpts()),
     ]);
 
     const thumb = thumbnailUrl.status === "fulfilled" ? thumbnailUrl.value : `https://picsum.photos/seed/${videoId}/640/360`;
@@ -170,7 +111,6 @@ async function runGeneration(videoId: number, prompt: string, sourceImageUrl?: s
     const duration = videoResult.status === "fulfilled" ? videoResult.value.duration : 6;
 
     if (videoResult.status === "rejected") {
-      // Log error but still complete with thumbnail only
       console.error("Video generation failed:", videoResult.reason);
     }
 
@@ -200,42 +140,64 @@ router.get("/videos", requireAuth, async (req, res) => {
   return res.json(videos.reverse());
 });
 
-router.post("/videos", requireAuth, async (req, res) => {
-  const parsed = GenerateVideoBody.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Invalid request body" });
+router.post("/videos", requireAuth, async (req, res, next) => {
+  try {
+    const parsed = GenerateVideoBody.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid request body" });
 
-  const [user] = await db.select().from(usersTable).where(eq(usersTable.id, req.session.userId!)).limit(1);
-  if (!user) return res.status(401).json({ error: "User not found" });
+    const [user] = await db.select().from(usersTable).where(eq(usersTable.id, req.session.userId!)).limit(1);
+    if (!user) return res.status(401).json({ error: "User not found" });
 
-  const planLimit = PLAN_LIMITS[user.plan] ?? 10;
-  const monthStart = new Date();
-  monthStart.setDate(1);
-  monthStart.setHours(0, 0, 0, 0);
+    const planLimit = PLAN_LIMITS[user.plan] ?? 10;
+    const monthStart = new Date();
+    monthStart.setDate(1);
+    monthStart.setHours(0, 0, 0, 0);
 
-  const [{ value: monthlyCount }] = await db
-    .select({ value: count() })
-    .from(videosTable)
-    .where(and(eq(videosTable.userId, user.id), gte(videosTable.createdAt, monthStart)));
+    const [{ value: monthlyCount }] = await db
+      .select({ value: count() })
+      .from(videosTable)
+      .where(and(eq(videosTable.userId, user.id), gte(videosTable.createdAt, monthStart)));
 
-  if (planLimit !== Infinity && monthlyCount >= planLimit) {
-    return res.status(402).json({
-      error: "Plan limit reached",
-      planLimit,
-      planUsed: monthlyCount,
-      plan: user.plan,
+    if (planLimit !== Infinity && monthlyCount >= planLimit) {
+      return res.status(402).json({
+        error: "Plan limit reached",
+        planLimit,
+        planUsed: monthlyCount,
+        plan: user.plan,
+      });
+    }
+
+    const {
+      sourceImageUrl,
+      aiModel,
+      cinematicQuality,
+      videoEngine,
+      outputResolution,
+      ...videoRow
+    } = parsed.data;
+    const [video] = await db.insert(videosTable).values({
+      ...videoRow,
+      userId: req.session.userId!,
+      status: "queued",
+      backgroundReplaced: parsed.data.backgroundReplaced ?? false,
+    }).returning();
+    await db.insert(activityTable).values({ userId: req.session.userId!, type: "video_generated", description: `Started generating "${video.title}"`, resourceId: video.id, resourceType: "video" });
+    await db.update(projectsTable).set({ status: "processing", updatedAt: new Date() }).where(eq(projectsTable.id, video.projectId));
+    void runGeneration(video.id, {
+      prompt: parsed.data.prompt,
+      sourceImageUrl,
+      aiModel,
+      cinematicQuality,
+      videoEngine,
+      outputResolution,
     });
+    return res.status(201).json(video);
+  } catch (err: unknown) {
+    console.error("[POST /videos] failed:", err);
+    req.log?.error?.({ err }, "POST /videos failed");
+    next(err);
+    return;
   }
-
-  const [video] = await db.insert(videosTable).values({
-    ...parsed.data,
-    userId: req.session.userId!,
-    status: "queued",
-    backgroundReplaced: parsed.data.backgroundReplaced ?? false,
-  }).returning();
-  await db.insert(activityTable).values({ userId: req.session.userId!, type: "video_generated", description: `Started generating "${video.title}"`, resourceId: video.id, resourceType: "video" });
-  await db.update(projectsTable).set({ status: "processing", updatedAt: new Date() }).where(eq(projectsTable.id, video.projectId));
-  void runGeneration(video.id, parsed.data.prompt, parsed.data.sourceImageUrl, parsed.data.aiModel);
-  return res.status(201).json(video);
 });
 
 router.get("/videos/:id", requireAuth, async (req, res) => {
@@ -262,7 +224,7 @@ router.post("/videos/:id/apply-style", requireAuth, async (req, res) => {
   const [video] = await db.update(videosTable).set({ style: body.data.style, status: "queued" }).where(and(eq(videosTable.id, params.data.id), eq(videosTable.userId, req.session.userId!))).returning();
   if (!video) return res.status(404).json({ error: "Video not found" });
   await db.insert(activityTable).values({ userId: req.session.userId!, type: "style_applied", description: `Applied ${body.data.style} style to "${video.title}"`, resourceId: video.id, resourceType: "video" });
-  void runGeneration(video.id, video.prompt);
+  void runGeneration(video.id, { prompt: video.prompt });
   return res.json(video);
 });
 

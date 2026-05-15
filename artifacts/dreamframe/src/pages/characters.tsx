@@ -30,6 +30,8 @@ export default function CharactersPage() {
   const queryClient = useQueryClient();
   const { toast } = useToast();
 
+  const characterList = Array.isArray(characters) ? characters : [];
+
   const form = useForm<CreateData>({
     resolver: zodResolver(createSchema),
     defaultValues: { name: "", description: "" },
@@ -100,7 +102,7 @@ export default function CharactersPage() {
               <div key={i} className="h-52 rounded-2xl bg-white/4 shimmer" />
             ))}
           </div>
-        ) : !characters || characters.length === 0 ? (
+        ) : characterList.length === 0 ? (
           <div className="text-center py-28 border border-dashed border-white/8 rounded-2xl">
             <Users className="w-10 h-10 mx-auto mb-5 text-white/15" />
             <p className="text-lg font-medium text-white/25">No characters yet</p>
@@ -108,7 +110,7 @@ export default function CharactersPage() {
           </div>
         ) : (
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
-            {characters.map((char) => (
+            {characterList.map((char) => (
               <div key={char.id} data-testid={`card-character-${char.id}`}
                 className="group border border-white/8 rounded-2xl overflow-hidden hover:border-white/20 transition-all duration-200 bg-white/[0.02]">
                 <div className="h-40 bg-white/5 flex items-center justify-center relative overflow-hidden">

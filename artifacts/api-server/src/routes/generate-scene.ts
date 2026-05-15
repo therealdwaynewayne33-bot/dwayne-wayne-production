@@ -6,13 +6,16 @@ import { mkdir, writeFile } from "fs/promises";
 import { exec } from "child_process";
 import { promisify } from "util";
 import Replicate from "replicate";
+import ffmpegPath from "ffmpeg-static";
 import { requireAuth } from "../middlewares/requireAuth";
+import { resolveFfmpegBin } from "../lib/ffmpeg";
 import {
   chargeCredits,
   refundCredits,
   costForSceneEngine,
   insufficientCreditsResponse,
 } from "../lib/credits";
+import { normalizeRunwayGen45Input, RUNWAY_GEN_45_MODEL } from "../lib/replicate-video";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOADS_DIR = path.join(__dirname, "../public/uploads");
@@ -44,7 +47,7 @@ const upload = multer({
 //                request body. Keep these minimal — Replicate fills in good
 //                defaults for anything we omit.
 // ---------------------------------------------------------------------------
-type EngineId = "kling-2.1" | "hailuo-02" | "pixverse-4.5" | "wan-2.2-i2v";
+type EngineId = "runway-gen-4.5" | "kling-2.1" | "hailuo-02" | "pixverse-4.5" | "wan-2.2-i2v";
 
 type ScenePayload = {
   prompt: string;
@@ -62,6 +65,18 @@ type EngineSpec = {
 };
 
 const ENGINES: Record<EngineId, EngineSpec> = {
+  "runway-gen-4.5": {
+    model: RUNWAY_GEN_45_MODEL,
+    label: "Runway Gen-4.5",
+    needsImage: false,
+    build: (p) =>
+      normalizeRunwayGen45Input({
+        prompt: p.prompt,
+        durationSeconds: p.duration ?? 5,
+        aspectRatio: p.aspectRatio ?? "16:9",
+        imageReferenceUrl: p.imageUrl,
+      }),
+  },
   "kling-2.1": {
     model: "kwaivgi/kling-v2.1",
     label: "Kling 2.1",
@@ -129,7 +144,11 @@ function resolveUrl(output: unknown): string {
 }
 
 async function makeThumbnail(videoPath: string, outPath: string) {
-  await execAsync(`ffmpeg -y -i "${videoPath}" -ss 0.5 -frames:v 1 -q:v 3 "${outPath}"`);
+  const bin = resolveFfmpegBin(ffmpegPath);
+  // Use exec with quoted args already; keep as-is for minimal changes, but
+  // ensure we reference the bundled binary path on Windows.
+  const q = (s: string) => `"${s.replaceAll('"', '\\"')}"`;
+  await execAsync(`${q(bin)} -y -i ${q(videoPath)} -ss 0.5 -frames:v 1 -q:v 3 ${q(outPath)}`);
 }
 
 async function downloadToFile(url: string, filePath: string) {

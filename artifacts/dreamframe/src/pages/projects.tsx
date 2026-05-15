@@ -34,12 +34,14 @@ export default function ProjectsPage() {
   const queryClient = useQueryClient();
   const { toast } = useToast();
 
+  const projectList = Array.isArray(projects) ? projects : [];
+
   const form = useForm<CreateData>({
     resolver: zodResolver(createSchema),
     defaultValues: { title: "", description: "" },
   });
 
-  const filtered = (projects ?? []).filter((p) =>
+  const filtered = projectList.filter((p) =>
     p.title.toLowerCase().includes(search.toLowerCase())
   );
 

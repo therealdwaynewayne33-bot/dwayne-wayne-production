@@ -1,19 +1,19 @@
 import { Router } from "express";
-import { db, projectsTable, videosTable, activityTable } from "@workspace/db";
+import { db, projectsTable, videosTable, activityTable, type Project } from "@workspace/db";
 import { eq, and, count } from "drizzle-orm";
 import { CreateProjectBody, GetProjectParams, UpdateProjectBody, UpdateProjectParams, DeleteProjectParams } from "@workspace/api-zod";
 import { requireAuth } from "../middlewares/requireAuth";
 
 const router = Router();
 
-async function projectWithCount(p: any, userId: number) {
+async function projectWithCount(p: Project, userId: number) {
   const [{ count: vc }] = await db.select({ count: count() }).from(videosTable).where(and(eq(videosTable.projectId, p.id), eq(videosTable.userId, userId)));
   return { ...p, videoCount: Number(vc) };
 }
 
 router.get("/projects", requireAuth, async (req, res) => {
   const projects = await db.select().from(projectsTable).where(eq(projectsTable.userId, req.session.userId!)).orderBy(projectsTable.updatedAt);
-  const result = await Promise.all(projects.map((p) => projectWithCount(p, req.session.userId!)));
+  const result = await Promise.all(projects.map((p: Project) => projectWithCount(p, req.session.userId!)));
   return res.json(result.reverse());
 });
 

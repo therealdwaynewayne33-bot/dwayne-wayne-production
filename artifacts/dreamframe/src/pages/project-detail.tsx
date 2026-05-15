@@ -18,6 +18,8 @@ export default function ProjectDetailPage({ id }: { id: number }) {
   const { data: project, isLoading: pLoading } = useGetProject(id, { query: { queryKey: getGetProjectQueryKey(id) } });
   const { data: videos, isLoading: vLoading } = useListVideos({ projectId: id }, { query: { queryKey: getListVideosQueryKey({ projectId: id }) } });
 
+  const videoList = Array.isArray(videos) ? videos : [];
+
   if (pLoading) {
     return (
       <AppLayout>
@@ -83,7 +85,7 @@ export default function ProjectDetailPage({ id }: { id: number }) {
               <div key={i} className="h-16 bg-card rounded-lg shimmer" />
             ))}
           </div>
-        ) : !videos || videos.length === 0 ? (
+        ) : videoList.length === 0 ? (
           <div className="text-center py-16 text-muted-foreground border border-dashed border-border rounded-xl">
             <Video className="w-10 h-10 mx-auto mb-3 opacity-30" />
             <p className="font-medium">No videos in this project</p>
@@ -91,7 +93,7 @@ export default function ProjectDetailPage({ id }: { id: number }) {
           </div>
         ) : (
           <div className="space-y-3">
-            {videos.map((video) => (
+            {videoList.map((video) => (
               <Link key={video.id} href={`/videos/${video.id}`}>
                 <div data-testid={`card-video-${video.id}`} className="flex items-center gap-4 p-4 bg-card border border-card-border rounded-xl hover:border-primary/40 cursor-pointer transition-all duration-200">
                   <div className="w-16 h-10 rounded-lg bg-background overflow-hidden shrink-0">

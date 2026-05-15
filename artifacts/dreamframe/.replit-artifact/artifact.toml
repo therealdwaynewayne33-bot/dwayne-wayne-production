@@ -1,6 +1,6 @@
 kind = "web"
 previewPath = "/"
-title = "DreamFrame AI Studio"
+title = "Dwayne Wayne Production AI Studio"
 version = "1.0.0"
 id = "artifacts/dreamframe"
 router = "path"

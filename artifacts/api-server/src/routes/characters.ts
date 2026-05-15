@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { db, charactersTable, videosTable, activityTable } from "@workspace/db";
+import { db, charactersTable, videosTable, activityTable, type Character } from "@workspace/db";
 import { eq, and, count } from "drizzle-orm";
 import { CreateCharacterBody, GetCharacterParams, DeleteCharacterParams } from "@workspace/api-zod";
 import { requireAuth } from "../middlewares/requireAuth";
@@ -23,7 +23,7 @@ async function saveCharacterImage(charId: number, dataUrl: string): Promise<stri
 router.get("/characters", requireAuth, async (req, res) => {
   const chars = await db.select().from(charactersTable).where(eq(charactersTable.userId, req.session.userId!));
   const result = await Promise.all(
-    chars.map(async (c) => {
+    chars.map(async (c: Character) => {
       const [{ count: vc }] = await db.select({ count: count() }).from(videosTable).where(eq(videosTable.characterId, c.id));
       return { ...c, videoCount: Number(vc) };
     })

@@ -1,13 +1,31 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { useLocation } from "wouter";
-import { useListProjects, useListCharacters, useGenerateVideo, useCreateProject, getListProjectsQueryKey, getListVideosQueryKey, getGetDashboardSummaryQueryKey } from "@workspace/api-client-react";
+import {
+  useListProjects,
+  useListCharacters,
+  useGenerateVideo,
+  useCreateProject,
+  getListProjectsQueryKey,
+  getListVideosQueryKey,
+  getGetDashboardSummaryQueryKey,
+  describeFetchFailure,
+  type GenerateVideoBody,
+} from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Slider } from "@/components/ui/slider";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
-import { Check, ChevronRight, Video, Image, Sparkles, Users, Layers, Film, Upload, Zap, Crown, Cpu } from "lucide-react";
+import { Check, ChevronRight, Video, Image, Sparkles, Users, Layers, Film, Upload } from "lucide-react";
 import { PlanLimitModal } from "@/components/PlanLimitModal";
 
 const STYLES = [
@@ -17,15 +35,42 @@ const STYLES = [
   { id: "cinematic",   label: "Cinematic",   icon: Video,    desc: "Film-grade visuals" },
 ];
 
-const AI_MODELS = [
-  { id: "wan-2.1",      label: "Wan 2.1",       badge: "Fast",    icon: Zap,   desc: "Sharp 720p · Best speed" },
-  { id: "hunyuan",      label: "HunyuanVideo",   badge: "Premium", icon: Crown, desc: "Tencent · Kling-level quality" },
-  { id: "minimax-live", label: "MiniMax Live",   badge: "Smooth",  icon: Cpu,   desc: "Luma-style fluid motion" },
-];
-
 type GenType  = "text-to-video" | "image-to-video";
 type Style    = "realistic" | "cartoon" | "animated-3d" | "cinematic";
-type AiModel  = "wan-2.1" | "hunyuan" | "minimax-live";
+
+type CinematicQuality = NonNullable<GenerateVideoBody["cinematicQuality"]>;
+type EngineId = NonNullable<GenerateVideoBody["videoEngine"]>;
+type DeliverRes = NonNullable<GenerateVideoBody["outputResolution"]>;
+
+const QUALITY_SEQUENCE: readonly CinematicQuality[] = ["standard", "high", "cinematic", "premium"] as const;
+const QUALITY_LABELS: Record<CinematicQuality, { title: string; hint: string }> = {
+  standard: {
+    title: "Standard — fast / efficient",
+    hint: "Hailuo MiniMax Video-01 by default • lower cost latency",
+  },
+  high: {
+    title: "High — cinematic motion",
+    hint: "Kling v1.6 Standard tier when AI engine is Auto",
+  },
+  cinematic: {
+    title: "Cinematic — Luma Dream Machine class",
+    hint: "Luma Ray‑2 · 540p anchor when AI engine is Auto",
+  },
+  premium: {
+    title: "Premium — Luma Ray‑2 HQ",
+    hint: "Luma Ray‑2 · 720p when AI engine is Auto",
+  },
+};
+
+const ENGINES: { id: EngineId; label: string; hint: string }[] = [
+  { id: "auto", label: "Auto (tier picks the engine)", hint: "Balances cost vs look from the quality slider." },
+  { id: "minimax-video-01", label: "Hailuo — MiniMax Video-01", hint: "Fluid motion • strong faces" },
+  { id: "kling-v1.6-standard", label: "Kling AI v1.6 Standard", hint: "Sharper choreography & camera energy" },
+  { id: "luma-ray-2-540p", label: "Luma Dream Machine — Ray‑2 · 540p", hint: "Close to public Dream Machine fidelity" },
+  { id: "luma-ray-2-720p", label: "Luma Dream Machine — Ray‑2 · 720p", hint: "Top Luma fidelity on Replicate" },
+  { id: "runway-gen-4.5", label: "Runway Gen‑4.5 (Gen‑3 lineage)", hint: "SOTA cinematic motion • text or image-conditioned" },
+  { id: "genmoai-mochi-1", label: "Mochi 1 — Genmo open model", hint: "Short photoreal-ish clips • text-first" },
+];
 
 export default function CreatePage() {
   const [step, setStep]                   = useState(1);
@@ -36,7 +81,9 @@ export default function CreatePage() {
   const [sourceImageUrl, setSourceImageUrl] = useState("");
   const [sourceImagePreview, setSourceImagePreview] = useState<string | null>(null);
   const [style, setStyle]                 = useState<Style>("cinematic");
-  const [aiModel, setAiModel]             = useState<AiModel>("wan-2.1");
+  const [cqIndex, setCqIndex]             = useState(1);
+  const [videoEngine, setVideoEngine]     = useState<EngineId>("auto");
+  const [outputResolution, setOutputResolution] = useState<DeliverRes>("1080p");
   const [characterId, setCharacterId]     = useState<number | null>(null);
   const [faceLock, setFaceLock]           = useState(false);
   const [bgReplace, setBgReplace]         = useState(false);
@@ -53,6 +100,38 @@ export default function CreatePage() {
   const createProject        = useCreateProject();
   const queryClient          = useQueryClient();
   const { toast }            = useToast();
+
+  const projectList = Array.isArray(projects) ? projects : [];
+  const characterList = Array.isArray(characters) ? characters : [];
+
+  useEffect(() => {
+    try {
+      const raw = sessionStorage.getItem("dreamframe_library_template_create");
+      if (!raw) return;
+      sessionStorage.removeItem("dreamframe_library_template_create");
+      const data = JSON.parse(raw) as { prompt?: string; style?: string; step?: number };
+      if (typeof data.prompt === "string" && data.prompt.trim()) setPrompt(data.prompt.trim());
+      const st = data.style;
+      if (st === "realistic" || st === "cartoon" || st === "animated-3d" || st === "cinematic") setStyle(st);
+      if (typeof data.step === "number" && data.step >= 1 && data.step <= 3) setStep(data.step);
+      toast({ title: "Library template applied", description: "Starter prompt loaded — edit before generating." });
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const pidRaw = params.get("projectId")?.trim();
+      if (!pidRaw) return;
+      const pid = Number(pidRaw);
+      if (!Number.isFinite(pid) || pid <= 0) return;
+      setProjectId(pid);
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   const handleImageFile = (file: File) => {
     const reader = new FileReader();
@@ -82,6 +161,7 @@ export default function CreatePage() {
       toast({ title: "Upload or paste an image to animate", variant: "destructive" }); return;
     }
 
+    const cinematicQuality = QUALITY_SEQUENCE[cqIndex]!;
     generateVideo.mutate({
       data: {
         projectId: pid,
@@ -89,7 +169,9 @@ export default function CreatePage() {
         prompt: prompt.trim(),
         generationType: genType,
         style,
-        aiModel: genType === "image-to-video" ? undefined : aiModel,
+        cinematicQuality,
+        videoEngine,
+        outputResolution,
         characterId: faceLock && characterId ? characterId : undefined,
         sourceImageUrl: genType === "image-to-video" ? sourceImageUrl : undefined,
         backgroundReplaced: bgReplace,
@@ -106,7 +188,13 @@ export default function CreatePage() {
         if (err?.status === 402 && err?.data) {
           setPlanLimitInfo({ plan: err.data.plan, planUsed: err.data.planUsed, planLimit: err.data.planLimit });
         } else {
-          toast({ title: "Generation failed", variant: "destructive" });
+          const wrapped =
+            err instanceof Error ? err : new Error(typeof err?.message === "string" ? err.message : "Something went wrong");
+          toast({
+            title: "Generation failed",
+            description: describeFetchFailure(wrapped),
+            variant: "destructive",
+          });
         }
       },
     });
@@ -150,7 +238,7 @@ export default function CreatePage() {
           <div className="space-y-6">
             <p className="text-white/40 text-sm">Videos are organized into projects</p>
             <div className="grid grid-cols-2 gap-3">
-              {(projects ?? []).map((p) => (
+              {projectList.map((p) => (
                 <button key={p.id} data-testid={`button-select-project-${p.id}`}
                   onClick={() => { setProjectId(p.id); setNewProjectTitle(""); }}
                   className={cn(
@@ -297,42 +385,80 @@ export default function CreatePage() {
               </div>
             </div>
 
-            {/* AI Engine */}
-            {genType === "text-to-video" && (
-              <div>
-                <p className="text-[11px] text-white/30 uppercase tracking-widest mb-3">AI engine</p>
-                <div className="grid grid-cols-3 gap-2">
-                  {AI_MODELS.map(({ id, label, badge, icon: Icon, desc }) => (
-                    <button key={id} data-testid={`button-model-${id}`}
-                      onClick={() => setAiModel(id as AiModel)}
-                      className={cn(
-                        "p-3.5 rounded-2xl border text-left transition-all",
-                        aiModel === id
-                          ? "border-white/40 bg-white/6"
-                          : "border-white/8 bg-white/[0.02] hover:border-white/20"
-                      )}>
-                      <div className="flex items-center justify-between mb-2">
-                        <Icon className={cn("w-4 h-4", aiModel === id ? "text-white" : "text-white/25")} />
-                        <span className={cn("text-[9px] font-bold px-1.5 py-0.5 rounded-full uppercase tracking-wide",
-                          aiModel === id ? "bg-white/15 text-white/70" : "bg-white/5 text-white/20")}>{badge}</span>
-                      </div>
-                      <p className={cn("text-xs font-semibold", aiModel === id ? "text-white" : "text-white/50")}>{label}</p>
-                      <p className="text-[10px] text-white/20 mt-0.5 leading-tight">{desc}</p>
-                    </button>
-                  ))}
-                </div>
-                {aiModel === "hunyuan" && (
-                  <p className="text-xs text-white/30 mt-2 flex items-center gap-1">
-                    <Crown className="w-3 h-3" /> HunyuanVideo takes 3–5 min but delivers cinematic quality
-                  </p>
-                )}
+            {/* Cinematic quality */}
+            <div>
+              <p className="text-[11px] text-white/30 uppercase tracking-widest mb-1">Cinematic quality</p>
+              <p className="text-sm font-medium text-white mb-1">{QUALITY_LABELS[QUALITY_SEQUENCE[cqIndex]!]!.title}</p>
+              <p className="text-xs text-white/35 mb-4">{QUALITY_LABELS[QUALITY_SEQUENCE[cqIndex]!]!.hint}</p>
+              <Slider
+                data-testid="slider-cinematic-quality"
+                min={0}
+                max={3}
+                step={1}
+                value={[cqIndex]}
+                onValueChange={(v) => setCqIndex(v[0] ?? 1)}
+                className="py-3"
+              />
+              <div className="flex justify-between text-[10px] uppercase tracking-wide text-white/25 mt-1">
+                <span>Standard</span>
+                <span>High</span>
+                <span>Cinematic</span>
+                <span>Premium</span>
               </div>
-            )}
+            </div>
+
+            {/* Model selector */}
+            <div>
+              <p className="text-[11px] text-white/30 uppercase tracking-widest mb-2">AI engine (Replicate)</p>
+              <Select value={videoEngine} onValueChange={(v) => setVideoEngine(v as EngineId)}>
+                <SelectTrigger
+                  data-testid="select-video-engine"
+                  className="rounded-2xl border-white/10 bg-white/5 text-white h-11"
+                >
+                  <SelectValue placeholder="Pick an engine" />
+                </SelectTrigger>
+                <SelectContent className="border-white/15 bg-neutral-950 text-white">
+                  {ENGINES.map((e) => (
+                    <SelectItem key={e.id} value={e.id} className="py-3">
+                      <div>
+                        <p className="text-sm font-medium">{e.label}</p>
+                        <p className="text-[11px] text-white/40 leading-snug">{e.hint}</p>
+                      </div>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* Output resolution */}
+            <div>
+              <p className="text-[11px] text-white/30 uppercase tracking-widest mb-2">Final delivery upscale</p>
+              <Select value={outputResolution} onValueChange={(v) => setOutputResolution(v as DeliverRes)}>
+                <SelectTrigger
+                  data-testid="select-output-resolution"
+                  className="rounded-2xl border-white/10 bg-white/5 text-white h-11"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="border-white/15 bg-neutral-950 text-white">
+                  <SelectItem value="native">Native (model resolution — skips Real‑ESRGAN pass)</SelectItem>
+                  <SelectItem value="1080p">1080p cinematic (Real‑ESRGAN video)</SelectItem>
+                  <SelectItem value="4k">4K (Real‑ESRGAN video — slowest)</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-[11px] text-white/25 mt-2">
+                FFmpeg adds a cinematic color blend plus motion smoothing on cinematic &amp; premium tiers. Video upscaler uses the same Real‑ESRGAN lineage as nightmareai/real‑esrgan,
+                routed through temporal video inference (`hbqdev/real‑esrgan-video`).
+              </p>
+            </div>
 
             {genType === "image-to-video" && (
-              <div className="p-4 rounded-2xl border border-white/8 bg-white/[0.02] text-xs text-white/30 flex items-center gap-2">
-                <Sparkles className="w-4 h-4 shrink-0" />
-                Modify uses Wan 2.1 Image-to-Video — your image becomes the first frame, the AI animates it
+              <div className="p-4 rounded-2xl border border-white/8 bg-white/[0.02] text-xs text-white/35 flex gap-2">
+                <Sparkles className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>
+                  Upload an anchor frame · Luma Ray‑2 / Kling / MiniMax / Runway can treat it as the first frame depending on engine.
+                  Mochi 1 ignores stills — we automatically route you to Kling if you insist on both.
+                </span>
               </div>
             )}
 
@@ -356,14 +482,14 @@ export default function CreatePage() {
               {faceLock && (
                 <div className="px-5 pb-5 border-t border-white/6 pt-4">
                   <p className="text-[11px] text-white/25 uppercase tracking-widest mb-3">Select character</p>
-                  {(!characters || characters.length === 0) ? (
+                  {characterList.length === 0 ? (
                     <p className="text-xs text-white/25">
                       No characters yet.{" "}
                       <a href="/characters" className="text-white/50 hover:text-white underline">Add one in Characters</a>
                     </p>
                   ) : (
                     <div className="grid grid-cols-3 gap-2">
-                      {characters.map((c) => (
+                      {characterList.map((c) => (
                         <button key={c.id} data-testid={`button-character-${c.id}`}
                           onClick={() => setCharacterId(c.id)}
                           className={cn(
@@ -431,11 +557,8 @@ export default function CreatePage() {
             </div>
             <h2 className="text-2xl font-semibold text-white mb-3">Video queued</h2>
             <p className="text-white/35 text-sm mb-2 max-w-sm mx-auto">
-              Your video is being generated by AI. This typically takes 1–5 minutes depending on the engine.
+              Your cinematic render is queued on Replicate. Expect roughly 3–15 minutes depending on Luma tier, upscale, and FFmpeg polish.
             </p>
-            {aiModel === "hunyuan" && (
-              <p className="text-xs text-white/25 mb-8">HunyuanVideo is processing — allow up to 5 min for cinematic quality.</p>
-            )}
             <div className="flex gap-4 justify-center mt-8">
               <Button data-testid="button-view-video"
                 onClick={() => generatedVideoId && setLocation(`/videos/${generatedVideoId}`)}
@@ -447,7 +570,9 @@ export default function CreatePage() {
                   setStep(1); setPrompt(""); setTitle(""); setProjectId(null);
                   setNewProjectTitle(""); setFaceLock(false); setBgReplace(false);
                   setCharacterId(null); setSourceImageUrl(""); setSourceImagePreview(null);
-                  setAiModel("wan-2.1");
+                  setCqIndex(1);
+                  setVideoEngine("auto");
+                  setOutputResolution("1080p");
                 }}
                 className="border-white/10 text-white/40 hover:text-white hover:bg-white/5 rounded-full">
                 Create Another

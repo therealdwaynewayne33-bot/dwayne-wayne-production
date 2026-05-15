@@ -1,3 +1,5 @@
+import { describeFetchFailure } from "./fetch-network-error";
+
 export type CustomFetchOptions = RequestInit & {
   responseType?: "json" | "text" | "blob" | "auto";
 };
@@ -360,7 +362,12 @@ export async function customFetch<T = unknown>(
 
   const requestInfo = { method, url: resolveUrl(input) };
 
-  const response = await fetch(input, { ...init, method, headers, credentials: "include" });
+  let response: Response;
+  try {
+    response = await fetch(input, { ...init, method, headers, credentials: "include" });
+  } catch (cause: unknown) {
+    throw new Error(describeFetchFailure(cause));
+  }
 
   if (!response.ok) {
     const errorData = await parseErrorBody(response, method);

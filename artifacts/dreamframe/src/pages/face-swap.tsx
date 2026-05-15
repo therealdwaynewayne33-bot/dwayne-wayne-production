@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
 import { Upload, Sparkles, UserCircle2, CheckCircle2, X, ArrowRight, ImageIcon } from "lucide-react";
-import { useListCharacters } from "@workspace/api-client-react";
+import { useListCharacters, describeFetchFailure } from "@workspace/api-client-react";
 
 type Stage = "idle" | "processing" | "done" | "error";
 
@@ -88,6 +88,8 @@ export default function FaceSwapPage() {
   const { data: characters }        = useListCharacters();
   const { toast }                   = useToast();
 
+  const characterList = Array.isArray(characters) ? characters : [];
+
   const loadFile = (file: File, setFile: typeof setSwapFile, setPreview: typeof setSwapPreview) => {
     setFile(file);
     const reader = new FileReader();
@@ -96,7 +98,7 @@ export default function FaceSwapPage() {
   };
 
   const useCharacter = async (charId: number) => {
-    const char = characters?.find((c) => c.id === charId);
+    const char = characterList.find((c) => c.id === charId);
     if (!char?.imageUrl) return;
     setSelectedCharId(charId);
     // Convert URL or data URL to a File
@@ -120,18 +122,26 @@ export default function FaceSwapPage() {
 
     try {
       const token = localStorage.getItem("dreamframe_token");
-      const resp = await fetch("/api/face-swap", {
+      form.append("selectedMode", "face_swap");
+      const resp = await fetch("/api/render/production", {
         method: "POST",
         body: form,
         credentials: "include",
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.error ?? "Unknown error");
+      const raw = await resp.text();
+      let data: { error?: string; imageUrl?: string } = {};
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch {
+        throw new Error(raw.trim() ? raw.slice(0, 400) : `Face swap failed (${resp.status})`);
+      }
+      if (!resp.ok) throw new Error(typeof data?.error === "string" ? data.error : "Unknown error");
+      if (!data.imageUrl) throw new Error("Face swap succeeded but no image URL was returned");
       setResult(data.imageUrl);
       setStage("done");
     } catch (err: any) {
-      setError(err.message ?? "Something went wrong");
+      setError(describeFetchFailure(err instanceof Error ? err : new Error(String(err?.message ?? err))));
       setStage("error");
     }
   };
@@ -159,11 +169,11 @@ export default function FaceSwapPage() {
           {/* Left: inputs */}
           <div className="space-y-7">
             {/* Character library shortcut */}
-            {characters && characters.length > 0 && (
+            {characterList.length > 0 && (
               <div>
                 <p className="text-[11px] text-white/30 uppercase tracking-widest mb-3">Use a character</p>
                 <div className="flex flex-wrap gap-2">
-                  {characters.map((c) => (
+                  {characterList.map((c) => (
                     <button
                       key={c.id}
                       onClick={() => useCharacter(c.id)}

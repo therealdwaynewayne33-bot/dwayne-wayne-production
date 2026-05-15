@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: dreamframe-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: dreamframe
+      POSTGRES_PASSWORD: dreamframe
+      POSTGRES_DB: dreamframe
+    volumes:
+      - dreamframe_pgdata:/var/lib/postgresql/data
+
+volumes:
+  dreamframe_pgdata:
+

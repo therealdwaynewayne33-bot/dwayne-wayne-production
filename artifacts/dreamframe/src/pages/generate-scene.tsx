@@ -1,5 +1,6 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { describeFetchFailure } from "@workspace/api-client-react";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -85,7 +86,7 @@ type SceneResult = {
   engineLabel: string;
 };
 
-type EngineId = "kling-2.1" | "hailuo-02" | "pixverse-4.5" | "wan-2.2-i2v";
+type EngineId = "runway-gen-4.5" | "kling-2.1" | "hailuo-02" | "pixverse-4.5" | "wan-2.2-i2v";
 
 // Static engine catalog rendered as the tab strip. The server validates the
 // id again, so this is purely UI metadata (descriptions, cost hints, which
@@ -100,6 +101,15 @@ const ENGINES: Array<{
   cost: string;
   best: string;
 }> = [
+  {
+    id: "runway-gen-4.5",
+    label: "Runway Gen-4.5",
+    tagline: "Top-tier fidelity via Replicate",
+    needsImage: false,
+    durations: [5, 8, 10],
+    cost: "≈ $0.55–1.05 per clip",
+    best: "Cinematic hero shots · text-first or anchored with a starting still",
+  },
   {
     id: "kling-2.1",
     label: "Kling 2.1",
@@ -148,7 +158,7 @@ const PROMPT_PRESETS = [
 ];
 
 export default function GenerateScenePage() {
-  const [engineId, setEngineId] = useState<EngineId>("hailuo-02");
+  const [engineId, setEngineId] = useState<EngineId>("runway-gen-4.5");
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
@@ -158,8 +168,40 @@ export default function GenerateScenePage() {
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  const [replicateConfigured, setReplicateConfigured] = useState<boolean | null>(null);
   const { toast } = useToast();
   const qc = useQueryClient();
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/render/targeted-mask-status")
+      .then((r) => r.json())
+      .then((d: { replicateConfigured?: boolean }) => {
+        if (cancelled) return;
+        setReplicateConfigured(Boolean(d?.replicateConfigured));
+      })
+      .catch(() => {
+        if (!cancelled) setReplicateConfigured(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    try {
+      const raw = sessionStorage.getItem("dreamframe_library_template_generate_scene");
+      if (!raw) return;
+      sessionStorage.removeItem("dreamframe_library_template_generate_scene");
+      const data = JSON.parse(raw) as { prompt?: string };
+      if (typeof data.prompt === "string" && data.prompt.trim()) {
+        setPrompt(data.prompt.trim());
+        toast({ title: "Library template applied", description: "Generate Scene prompt updated." });
+      }
+    } catch {
+      /* ignore */
+    }
+  }, [toast]);
 
   const engine = ENGINES.find((e) => e.id === engineId)!;
   const effectiveDuration = duration ?? engine.durations[0] ?? null;
@@ -200,27 +242,44 @@ export default function GenerateScenePage() {
     const fd = new FormData();
     fd.append("engine", engineId);
     fd.append("prompt", prompt.trim());
+    fd.append("selectedMode", "video_generate");
     if (effectiveDuration) fd.append("duration", String(effectiveDuration));
     if (file) fd.append("image", file);
 
     try {
-      const resp = await fetch("/api/scene/generate", {
+      const resp = await fetch("/api/render/production", {
         method:      "POST",
         credentials: "include",
         body:        fd,
       });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.error ?? "Scene generation failed");
-      setResult(data);
+      const raw = await resp.text();
+      let data: any = {};
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch {
+        throw new Error(raw.trim() ? raw.slice(0, 400) : `Scene generation failed (${resp.status})`);
+      }
+      if (!resp.ok) throw new Error(typeof data?.error === "string" ? data.error : "Scene generation failed");
+
+      const videoUrl =
+        typeof data.videoUrl === "string" ? data.videoUrl : typeof data.outputUrl === "string" ? data.outputUrl : "";
+
+      const done: SceneResult = {
+        videoUrl,
+        thumbnailUrl: typeof data.thumbnailUrl === "string" ? data.thumbnailUrl : undefined,
+        engine: typeof data.selectedEngine === "string" ? data.selectedEngine : engineId,
+        engineLabel: typeof data.engineLabel === "string" ? data.engineLabel : engine.label,
+      };
+      setResult(done);
       setStage("done");
       // Refresh sidebar balance immediately so the user sees the deduction.
       qc.invalidateQueries({ queryKey: ["credits"] });
       toast({
         title: "Scene ready",
-        description: `${data.engineLabel} finished. ${data.creditsCharged ?? 0} credits used · ${data.creditsRemaining?.toLocaleString() ?? "?"} left.`,
+        description: `${done.engineLabel} finished.`,
       });
     } catch (err: any) {
-      setError(err.message ?? "Scene generation failed");
+      setError(describeFetchFailure(err instanceof Error ? err : new Error(String(err?.message ?? err))));
       setStage("error");
     }
   };
@@ -242,6 +301,11 @@ export default function GenerateScenePage() {
           <p className="text-sm text-white/50 max-w-2xl">
             Pick an AI engine, drop in a starting image (optional for some), describe the shot, and get back a 5–10 second clip. Useful for B-roll, establishing shots, and anything you can't film yourself.
           </p>
+          {replicateConfigured === false ? (
+            <div className="mt-4 rounded-xl border border-amber-400/25 bg-amber-500/[0.08] px-4 py-3 text-sm text-amber-100/95">
+              Replicate API token missing. Runway generation cannot run.
+            </div>
+          ) : null}
         </div>
 
         {/* Engine tab strip */}

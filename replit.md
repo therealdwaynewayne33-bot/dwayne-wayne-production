@@ -1,4 +1,4 @@
-# DreamFrame AI Studio
+# Dwayne Wayne Production AI Studio
 
 ## Overview
 

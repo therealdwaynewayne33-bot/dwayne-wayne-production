@@ -65,6 +65,35 @@ app.use("/api/uploads", express.static(path.join(__dirname, "../public/uploads")
 // Serve face-swap result images
 app.use("/api/swaps", express.static(path.join(__dirname, "../public/swaps")));
 
+// API routers (includes GET /api/stock-images/search → routes/stock-images.ts; GET /api/stock-videos/search → routes/stock-videos.ts)
 app.use("/api", router);
+
+// ---------------------------------------------------------------------------
+// API fallbacks: ALWAYS return JSON for /api/*
+// ---------------------------------------------------------------------------
+app.use("/api", (_req, res) => {
+  return res.status(404).json({ error: "Not found" });
+});
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+app.use((err: any, req: any, res: any, _next: any) => {
+  const message =
+    typeof err?.message === "string" && err.message.trim()
+      ? err.message
+      : "Internal server error";
+
+  // Log full error to terminal/logger for debugging
+  try {
+    req?.log?.error?.({ err }, "Unhandled API error");
+  } catch {
+    // fall back to console if logger isn't available for some reason
+    // (e.g. thrown before pino-http attaches req.log)
+    console.error("Unhandled API error:", err);
+  }
+
+  if (res.headersSent) return;
+  const status = typeof err?.status === "number" ? err.status : 500;
+  return res.status(status).json({ error: message });
+});
 
 export default app;

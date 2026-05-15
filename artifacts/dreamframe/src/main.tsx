@@ -1,6 +1,7 @@
 import { createRoot } from "react-dom/client";
 import { setAuthTokenGetter } from "@workspace/api-client-react";
 import App from "./App";
+import { RootProviders } from "./root-providers";
 import "./index.css";
 
 setAuthTokenGetter(() => localStorage.getItem("dreamframe_token"));
@@ -25,4 +26,8 @@ window.addEventListener("unhandledrejection", (e) => {
   }
 });
 
-createRoot(document.getElementById("root")!).render(<App />);
+createRoot(document.getElementById("root")!).render(
+  <RootProviders>
+    <App />
+  </RootProviders>,
+);

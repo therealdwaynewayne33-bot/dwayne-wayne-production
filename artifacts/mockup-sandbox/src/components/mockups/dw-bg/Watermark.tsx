@@ -15,7 +15,7 @@ export function Watermark() {
       <div className="relative z-10 flex items-center justify-between px-8 py-5 border-b border-white/[0.04]">
         <div className="flex items-center gap-2">
           <div className="h-1.5 w-1.5 rounded-full bg-white" />
-          <span className="text-[11px] uppercase tracking-[0.35em] text-white/60">DwayneWayne</span>
+          <span className="text-[11px] uppercase tracking-[0.35em] text-white/60">Dwayne Wayne Production</span>
         </div>
         <span className="text-[11px] uppercase tracking-widest text-white/30">Production AI System</span>
       </div>

@@ -662,6 +662,27 @@ components:
         aiModel:
           type: string
           enum: [wan-2.1, hunyuan, minimax-live]
+        cinematicQuality:
+          type: string
+          enum: [standard, high, cinematic, premium]
+          description: |
+            Standard → Auto picks MiniMax Video-01. High → Kling v1.6 Standard. Cinematic → Luma Ray-2 540p. Premium → Luma Ray-2 720p.
+            When `videoEngine` is not `auto`, that engine wins; the slider still labels your intended budget tier in the UI.
+        videoEngine:
+          type: string
+          enum:
+            - auto
+            - minimax-video-01
+            - kling-v1.6-standard
+            - luma-ray-2-540p
+            - luma-ray-2-720p
+            - runway-gen-4.5
+            - genmoai-mochi-1
+        outputResolution:
+          type: string
+          enum: [native, 1080p, 4k]
+          description: |
+            native skips Real-ESRGAN video upscale. 1080p/4k runs hbqdev/real-esrgan-video (same RealESRGAN family as nightmareai/real-esrgan).
         characterId:
           type: integer
         sourceImageUrl:

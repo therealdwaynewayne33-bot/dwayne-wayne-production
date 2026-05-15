@@ -1,0 +1,39 @@
+# Full workspace build (typecheck + all package builds).
+# mockup-sandbox Vite config reads PORT and BASE_PATH; set them here so CI
+# matches an explicit contract (Replit uses 8081 + /__mockup via artifact.toml).
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build workspace
+        env:
+          # mockup-sandbox (vite.config.ts); local defaults are 5173 + /
+          PORT: "5173"
+          BASE_PATH: "/"
+        run: npm run build

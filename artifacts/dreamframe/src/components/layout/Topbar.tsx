@@ -8,10 +8,14 @@ import { useToast } from "@/hooks/use-toast";
 
 const navItems = [
   { label: "Dashboard",   href: "/dashboard" },
+  { label: "Wayne Knows", href: "/production" },
   { label: "Create",      href: "/create" },
   { label: "Face Swap",   href: "/face-swap",      badge: "AI" },
   { label: "BG Replace",  href: "/bg-replace",     badge: "AI" },
   { label: "V2V",         href: "/video-to-video", badge: "AI" },
+  { label: "Wayne Studio", href: "/ai-actor-studio", badge: "AI" },
+  { label: "Library",     href: "/creative-library" },
+  { label: "Sci-Fi",      href: "/sci-fi-builder" },
   { label: "Projects",    href: "/projects" },
   { label: "Characters",  href: "/characters" },
 ];
@@ -52,7 +56,7 @@ export function Topbar() {
           <div className="w-7 h-7 rounded-lg bg-white flex items-center justify-center">
             <Sparkles className="w-3.5 h-3.5 text-black" />
           </div>
-          <span className="text-[11px] font-bold text-white tracking-[0.14em] uppercase whitespace-nowrap">DwayneWayne Production<span className="text-white/40"> · AI System</span></span>
+          <span className="text-[11px] font-bold text-white tracking-[0.14em] uppercase whitespace-nowrap">Dwayne Wayne Production<span className="text-white/40"> · AI System</span></span>
         </div>
       </Link>
 

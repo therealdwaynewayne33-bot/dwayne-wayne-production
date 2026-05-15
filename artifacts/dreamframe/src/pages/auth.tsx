@@ -75,7 +75,7 @@ export default function AuthPage() {
       <div className="relative overflow-hidden border-r border-white/10 hidden lg:block">
         <img
           src={dwLogoBg}
-          alt="DwayneWayne"
+          alt="Dwayne Wayne Production"
           className="absolute inset-0 h-full w-full object-cover"
         />
         <div className="absolute inset-0 bg-gradient-to-tr from-black/70 via-black/20 to-transparent" />
@@ -128,7 +128,9 @@ export default function AuthPage() {
             {mode === "login" ? "Sign in" : "Create your account"}
           </h1>
           <p className="mt-2 text-sm text-white/50">
-            {mode === "login" ? "to your DwayneWayne workspace" : "Join the DwayneWayne Production AI System"}
+            {mode === "login"
+              ? "to your Dwayne Wayne Production workspace"
+              : "Join the Dwayne Wayne Production AI System"}
           </p>
 
           {/* Tab switcher */}

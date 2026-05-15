@@ -8,6 +8,7 @@ const navItems = [
   { label: "Create Video", href: "/create", icon: Plus },
   { label: "BG Replace", href: "/bg-replace", icon: Layers, badge: "NEW" },
   { label: "Generate Scene", href: "/generate-scene", icon: Wand2, badge: "NEW" },
+  { label: "Creative Library", href: "/creative-library", icon: Layers },
   { label: "Projects", href: "/projects", icon: FolderOpen },
   { label: "Characters", href: "/characters", icon: Users },
 ];
@@ -23,7 +24,7 @@ export function Sidebar() {
           <Sparkles className="w-4 h-4 text-white" />
         </div>
         <div>
-          <span className="text-[11px] font-bold text-foreground tracking-[0.14em] uppercase leading-tight">DwayneWayne<br/>Production AI</span>
+          <span className="text-[11px] font-bold text-foreground tracking-[0.14em] uppercase leading-tight">Dwayne Wayne<br/>Production AI</span>
           <span className="block text-[10px] text-muted-foreground uppercase tracking-widest">AI Studio</span>
         </div>
       </div>

@@ -29,6 +29,7 @@ async function buildAll() {
     // - use path traversal to read files (e.g. @google-cloud/secret-manager loads sibling .proto files)
     external: [
       "*.node",
+      "@electric-sql/pglite",
       "sharp",
       "better-sqlite3",
       "sqlite3",
@@ -36,6 +37,10 @@ async function buildAll() {
       "bcrypt",
       "argon2",
       "fsevents",
+      // Contains a platform-specific binary (ffmpeg.exe) resolved at runtime
+      "ffmpeg-static",
+      // Contains a platform-specific binary (ffprobe.exe) resolved at runtime
+      "ffprobe-static",
       "re2",
       "farmhash",
       "xxhash-addon",

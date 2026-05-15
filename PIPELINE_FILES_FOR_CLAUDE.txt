@@ -1,0 +1,4542 @@
+===== artifacts/api-server/src/lib/targeted-object-edit.ts =====
+/**
+ * Targeted object edit pipeline (server-side FFmpeg).
+ *
+ * | Mode | Mask source |
+ * |------|-------------|
+ * | GEOMETRIC (default) | Circular disk from click + radius (`nullsrc` + geq mask). |
+ * | SAM2 (`OBJECT_MASK_ENGINE=SAM2`) | Per-frame mask video from POST `/api/ai/segment-track` + `maskedmerge`. |
+ */
+
+import { execFile } from "child_process";
+import { promisify } from "util";
+import ffmpegPath from "ffmpeg-static";
+import ffprobeStatic from "ffprobe-static";
+import { resolveFfmpegBin } from "./ffmpeg";
+import {
+  buildTargetedMaskClientWarnings,
+  getDefaultTargetedMaskCapabilities,
+  mergeCapabilities,
+  type TargetedMaskCapabilities,
+} from "./targeted-mask-status";
+import { getObjectMaskEngine } from "./object-mask-engine";
+import { getSegmentTrackJob } from "./segment-track-jobs";
+
+const execFileAsync = promisify(execFile);
+
+export type ObjectMaskAnchor = {
+  nx: number;
+  ny: number;
+  radiusFrac: number;
+};
+
+export type DetectMaskResultGeometric = ObjectMaskAnchor & {
+  width: number;
+  height: number;
+  cx: number;
+  cy: number;
+  radiusPx: number;
+  strategy: "geometric_disk_not_sam";
+};
+
+export type DetectMaskResultSam2 = ObjectMaskAnchor & {
+  width: number;
+  height: number;
+  cx: number;
+  cy: number;
+  radiusPx: number;
+  strategy: "sam2_video_mask_sequence";
+  maskVideoPath: string;
+  segmentTrackJobId?: string;
+  trackedObjectIds: string[];
+};
+
+export type DetectMaskResult = DetectMaskResultGeometric | DetectMaskResultSam2;
+
+export type TrackMaskResult =
+  | {
+      connected: false;
+      trackingMode: "not_connected_static_first_frame_geometry";
+      implementationDetail: string;
+      geometry: DetectMaskResultGeometric;
+    }
+  | {
+      connected: true;
+      trackingMode: "sam2_replicate_video_masks";
+      implementationDetail: string;
+      geometry: DetectMaskResultSam2;
+    };
+
+async function ffprobeVideoSize(inputPath: string): Promise<{ width: number; height: number }> {
+  const ffprobeBin = ffprobeStatic?.path || "ffprobe";
+  const { stdout } = await execFileAsync(ffprobeBin, [
+    "-v",
+    "error",
+    "-select_streams",
+    "v:0",
+    "-show_entries",
+    "stream=width,height",
+    "-of",
+    "csv=p=0",
+    inputPath,
+  ]);
+  const parts = stdout.trim().split(/[\n,]/);
+  const width = Math.max(2, Math.round(parseInt(parts[0], 10) || 1280));
+  const height = Math.max(2, Math.round(parseInt(parts[1], 10) || 720));
+  return { width, height };
+}
+
+async function ffprobeAvgFpsString(inputPath: string): Promise<string> {
+  const ffprobeBin = ffprobeStatic?.path || "ffprobe";
+  const { stdout } = await execFileAsync(ffprobeBin, [
+    "-v",
+    "error",
+    "-select_streams",
+    "v:0",
+    "-show_entries",
+    "stream=avg_frame_rate",
+    "-of",
+    "csv=p=0",
+    inputPath,
+  ]);
+  const raw = stdout.trim().split("\n")[0] ?? "30/1";
+  const [n, d] = raw.split("/").map((x) => parseInt(x, 10));
+  const fps = Number.isFinite(n) && Number.isFinite(d) && d !== 0 ? n / d : 30;
+  const rounded = Math.round(fps * 1000) / 1000;
+  return rounded > 0 && rounded < 240 ? String(rounded) : "30";
+}
+
+function clamp01(v: number): number {
+  return Math.max(0, Math.min(1, v));
+}
+
+/**
+ * Builds disk geometry or resolves SAM2 mask video metadata for compositing.
+ */
+export async function detectObjectMask(
+  videoPath: string,
+  opts: {
+    promptOrClick: { nx?: number; ny?: number };
+    objectNameHint?: string;
+    radiusFrac?: number;
+    sam2MaskVideoPath?: string;
+    segmentTrackJobId?: string;
+    trackedObjectIds?: string[];
+  },
+): Promise<DetectMaskResult> {
+  const { width: vw, height: vh } = await ffprobeVideoSize(videoPath);
+  const outW = Math.round(vw / 2) * 2;
+  const outH = Math.round(vh / 2) * 2;
+
+  let nx = opts.promptOrClick.nx;
+  let ny = opts.promptOrClick.ny;
+  if (nx == null || ny == null || !Number.isFinite(nx) || !Number.isFinite(ny)) {
+    nx = 0.5;
+    ny = 0.55;
+  }
+  nx = clamp01(nx);
+  ny = clamp01(ny);
+
+  if (opts.sam2MaskVideoPath) {
+    return {
+      strategy: "sam2_video_mask_sequence",
+      width: outW,
+      height: outH,
+      nx,
+      ny,
+      radiusFrac: 0,
+      cx: Math.round(nx * outW),
+      cy: Math.round(ny * outH),
+      radiusPx: 0,
+      maskVideoPath: opts.sam2MaskVideoPath,
+      segmentTrackJobId: opts.segmentTrackJobId,
+      trackedObjectIds: opts.trackedObjectIds ?? ["target"],
+    };
+  }
+
+  let radiusFrac =
+    typeof opts.radiusFrac === "number" && Number.isFinite(opts.radiusFrac) ? opts.radiusFrac : 0.16;
+  const hint = (opts.objectNameHint ?? "").trim().toLowerCase();
+  if (hint.length >= 2) radiusFrac = Math.min(0.42, radiusFrac + 0.04);
+
+  const cx = Math.round(nx * outW);
+  const cy = Math.round(ny * outH);
+  const radiusPx = Math.max(24, Math.round(Math.min(outW, outH) * radiusFrac));
+
+  return {
+    nx,
+    ny,
+    radiusFrac,
+    width: outW,
+    height: outH,
+    cx,
+    cy,
+    radiusPx,
+    strategy: "geometric_disk_not_sam",
+  };
+}
+
+export async function trackMaskAcrossFrames(_videoPath: string, initial: DetectMaskResult): Promise<TrackMaskResult> {
+  if (initial.strategy === "sam2_video_mask_sequence") {
+    return {
+      connected: true,
+      trackingMode: "sam2_replicate_video_masks",
+      implementationDetail: "Per-frame masks from SAM 2 Video are applied via a grayscale mask video stream.",
+      geometry: initial,
+    };
+  }
+  return {
+    connected: false,
+    trackingMode: "not_connected_static_first_frame_geometry",
+    implementationDetail:
+      "Temporal mask propagation is not used. The geometric mask from detectObjectMask is fixed for all frames.",
+    geometry: initial,
+  };
+}
+
+function editBranchForPrompt(editPrompt: string): { vf: string; kind: "recolor" | "inpaint" } {
+  const p = editPrompt.toLowerCase();
+  if (/\b(remove|delete|erase)\b/.test(p) || /\breplace\s+(the\s+)?(object|item|logo|sign)\b/.test(p)) {
+    return { vf: "boxblur=18:3", kind: "inpaint" };
+  }
+  if (/\b(white|#fff|#ffffff)\b/.test(p)) {
+    return { vf: "eq=saturation=0.82:brightness=0.26:contrast=1.02", kind: "recolor" };
+  }
+  if (/\bred\b/.test(p)) {
+    return { vf: "eq=gamma_r=1.14:gamma_g=0.93:gamma_b=0.92:saturation=1.14", kind: "recolor" };
+  }
+  if (/\bblue\b/.test(p)) {
+    return { vf: "eq=gamma_r=0.92:gamma_g=0.96:gamma_b=1.12:saturation=1.07", kind: "recolor" };
+  }
+  if (/\bgreen\b/.test(p)) {
+    return { vf: "eq=gamma_r=0.92:gamma_g=1.12:gamma_b=0.94:saturation=1.06", kind: "recolor" };
+  }
+  if (/\byellow\b/.test(p)) {
+    return { vf: "eq=gamma_r=1.07:gamma_g=1.07:gamma_b=0.88:saturation=1.05", kind: "recolor" };
+  }
+  if (/\b(black|dark)\b/.test(p)) {
+    return { vf: "eq=brightness=-0.28:saturation=0.88:contrast=1.06", kind: "recolor" };
+  }
+  return { vf: "eq=saturation=1.06:brightness=0.02:contrast=1.04", kind: "recolor" };
+}
+
+export function recolorMaskedObjectFilter(editPrompt: string): string {
+  return editBranchForPrompt(editPrompt).vf;
+}
+
+export function inpaintMaskedObjectFilter(editPrompt: string): string {
+  const b = editBranchForPrompt(editPrompt);
+  return b.kind === "inpaint" ? b.vf : "boxblur=14:2";
+}
+
+export function maskGeqLum(cx: number, cy: number, radiusPx: number): string {
+  const r2 = radiusPx * radiusPx;
+  return `'if(lte((X-${cx})*(X-${cx})+(Y-${cy})*(Y-${cy}),${r2}),255,0)'`;
+}
+
+export function compositeMaskedEditFilterComplex(opts: {
+  outW: number;
+  outH: number;
+  cx: number;
+  cy: number;
+  radiusPx: number;
+  editedBranchVf: string;
+}): string {
+  const { outW, outH, cx, cy, radiusPx, editedBranchVf } = opts;
+  const geq = maskGeqLum(cx, cy, radiusPx);
+  return [
+    `[0:v]scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,split=2[base][src]`,
+    `[src]${editedBranchVf}[edited]`,
+    `nullsrc=size=${outW}x${outH},format=gray,geq=lum=${geq}[maskraw]`,
+    `[maskraw]gblur=sigma=5[mask]`,
+    `[base][edited][mask]maskedmerge[outv]`,
+  ].join(";");
+}
+
+/** SAM2 / tracked mask: input 0 = source video, input 1 = grayscale mask video (aligned duration). */
+export function compositeMaskedEditFilterComplexWithVideoMask(opts: {
+  outW: number;
+  outH: number;
+  editedBranchVf: string;
+  fps: string;
+}): string {
+  const { outW, outH, editedBranchVf, fps } = opts;
+  const scalePad = `scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2`;
+  return [
+    `[0:v]${scalePad},fps=${fps},split=2[base][src]`,
+    `[src]${editedBranchVf}[edited]`,
+    `[1:v]${scalePad},fps=${fps},format=gray,setsar=1[mask]`,
+    `[base][edited][mask]maskedmerge[outv]`,
+  ].join(";");
+}
+
+export type TargetedEditRunMeta = {
+  pipeline: "ffmpeg_maskedmerge_geometric_mask" | "ffmpeg_maskedmerge_sam2_video_mask";
+  maskStrategy: DetectMaskResult["strategy"];
+  maskTracking: TrackMaskResult["trackingMode"];
+  maskTrackingConnected: boolean;
+  editKind: "recolor" | "inpaint";
+  capabilities: TargetedMaskCapabilities;
+  clientWarnings: string[];
+  segmentTrackJobId?: string;
+  trackedObjectIds?: string[];
+};
+
+export async function runTargetedObjectEdit(opts: {
+  inputPath: string;
+  outputPath: string;
+  objectX: number;
+  objectY: number;
+  editPrompt: string;
+  selectedObject?: string;
+  maskRadiusFrac?: number;
+  segmentTrackJobId?: string;
+  trackedObjectIds?: string[];
+  sam2MaskVideoPath?: string;
+}): Promise<TargetedEditRunMeta> {
+  const engine = getObjectMaskEngine();
+  let maskPath = opts.sam2MaskVideoPath;
+  let trackedIds = opts.trackedObjectIds;
+  let resolvedJobId = opts.segmentTrackJobId;
+
+  if (engine === "SAM2") {
+    if (!opts.segmentTrackJobId && !maskPath) {
+      throw new Error(
+        "OBJECT_MASK_ENGINE=SAM2 requires segmentTrackJobId from POST /api/ai/segment-track after clicking the object.",
+      );
+    }
+    if (opts.segmentTrackJobId) {
+      const job = getSegmentTrackJob(opts.segmentTrackJobId);
+      if (!job) throw new Error("Invalid or expired segmentTrackJobId.");
+      maskPath = job.maskVideoPath;
+      trackedIds = job.trackedObjectIds;
+      resolvedJobId = job.jobId;
+    }
+    if (!maskPath) throw new Error("SAM2 mask video path missing.");
+  }
+
+  const detected = await detectObjectMask(opts.inputPath, {
+    promptOrClick: { nx: opts.objectX, ny: opts.objectY },
+    objectNameHint: opts.selectedObject,
+    radiusFrac: engine === "SAM2" ? undefined : opts.maskRadiusFrac,
+    sam2MaskVideoPath: engine === "SAM2" ? maskPath : undefined,
+    segmentTrackJobId: resolvedJobId,
+    trackedObjectIds: trackedIds,
+  });
+
+  const tracked = await trackMaskAcrossFrames(opts.inputPath, detected);
+  const g = tracked.geometry;
+  const branch = editBranchForPrompt(opts.editPrompt);
+  const bin = resolveFfmpegBin(ffmpegPath);
+
+  if (g.strategy === "sam2_video_mask_sequence") {
+    const fps = await ffprobeAvgFpsString(opts.inputPath);
+    const filterComplex = compositeMaskedEditFilterComplexWithVideoMask({
+      outW: g.width,
+      outH: g.height,
+      editedBranchVf: branch.vf,
+      fps,
+    });
+    await execFileAsync(bin, [
+      "-y",
+      "-i",
+      opts.inputPath,
+      "-i",
+      g.maskVideoPath,
+      "-filter_complex",
+      filterComplex,
+      "-map",
+      "[outv]",
+      "-map",
+      "0:a?",
+      "-shortest",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "fast",
+      "-crf",
+      "20",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+      "-movflags",
+      "+faststart",
+      opts.outputPath,
+    ]);
+  } else {
+    const filterComplex = compositeMaskedEditFilterComplex({
+      outW: g.width,
+      outH: g.height,
+      cx: g.cx,
+      cy: g.cy,
+      radiusPx: g.radiusPx,
+      editedBranchVf: branch.vf,
+    });
+    await execFileAsync(bin, [
+      "-y",
+      "-i",
+      opts.inputPath,
+      "-filter_complex",
+      filterComplex,
+      "-map",
+      "[outv]",
+      "-map",
+      "0:a?",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "fast",
+      "-crf",
+      "20",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+      "-movflags",
+      "+faststart",
+      opts.outputPath,
+    ]);
+  }
+
+  const capabilities =
+    g.strategy === "sam2_video_mask_sequence"
+      ? mergeCapabilities(getDefaultTargetedMaskCapabilities(), {
+          samSegmentationConnected: true,
+          temporalMaskTrackingConnected: true,
+        })
+      : getDefaultTargetedMaskCapabilities();
+
+  return {
+    pipeline:
+      g.strategy === "sam2_video_mask_sequence"
+        ? "ffmpeg_maskedmerge_sam2_video_mask"
+        : "ffmpeg_maskedmerge_geometric_mask",
+    maskStrategy: g.strategy,
+    maskTracking: tracked.trackingMode,
+    maskTrackingConnected: tracked.connected,
+    editKind: branch.kind,
+    capabilities,
+    clientWarnings: buildTargetedMaskClientWarnings(capabilities),
+    segmentTrackJobId: g.strategy === "sam2_video_mask_sequence" ? resolvedJobId : undefined,
+    trackedObjectIds: g.strategy === "sam2_video_mask_sequence" ? g.trackedObjectIds : undefined,
+  };
+}
+
+export async function recolorMaskedObject(
+  videoPath: string,
+  _masks: unknown,
+  targetColor: string,
+  outputPath: string,
+  anchor: { nx: number; ny: number; radiusFrac?: number },
+): Promise<TargetedEditRunMeta> {
+  return runTargetedObjectEdit({
+    inputPath: videoPath,
+    outputPath,
+    objectX: anchor.nx,
+    objectY: anchor.ny,
+    editPrompt: `change object to ${targetColor}`,
+    maskRadiusFrac: anchor.radiusFrac,
+  });
+}
+
+export async function inpaintMaskedObject(
+  videoPath: string,
+  _masks: unknown,
+  prompt: string,
+  outputPath: string,
+  anchor: { nx: number; ny: number; radiusFrac?: number },
+): Promise<TargetedEditRunMeta> {
+  return runTargetedObjectEdit({
+    inputPath: videoPath,
+    outputPath,
+    objectX: anchor.nx,
+    objectY: anchor.ny,
+    editPrompt: /\b(remove|delete|erase|replace)\b/i.test(prompt) ? prompt : `remove object. ${prompt}`,
+    maskRadiusFrac: anchor.radiusFrac,
+  });
+}
+
+export function compositeMaskedEdit(
+  _originalVideo: string,
+  _editedFrames: unknown,
+  _masks: unknown,
+  opts: {
+    outW: number;
+    outH: number;
+    cx: number;
+    cy: number;
+    radiusPx: number;
+    editedBranchVf: string;
+  },
+): string {
+  return compositeMaskedEditFilterComplex(opts);
+}
+
+===== artifacts/dreamframe/src/pages/bg-replace.tsx =====
+import { useState, useRef, useCallback, useEffect } from "react";
+import { AppLayout } from "@/components/layout/AppLayout";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { cn } from "@/lib/utils";
+import { useToast } from "@/hooks/use-toast";
+import {
+  Upload, Sparkles, Layers, Play, Pause, RotateCcw, Volume2, VolumeX,
+  CheckCircle2, X, ShieldCheck, Wand2,
+  AlertTriangle,
+} from "lucide-react";
+import { describeFetchFailure } from "@workspace/api-client-react";
+
+const OBJECT_MASK_ENGINE_WARNING =
+  "Object masking engine not connected. This will not change only one object until SAM/object masking is installed.";
+
+type ObjectMaskEngineMode = "GEOMETRIC" | "SAM2";
+
+function fmt(s: number) {
+  return `${Math.floor(s / 60)}:${Math.floor(s % 60).toString().padStart(2, "0")}`;
+}
+
+function VideoPlayer({ src, thumbnail }: { src: string; thumbnail?: string }) {
+  const ref = useRef<HTMLVideoElement>(null);
+  const [playing, setPlaying] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [muted, setMuted] = useState(false);
+  const [ended, setEnded] = useState(false);
+  const progress = duration > 0 ? (elapsed / duration) * 100 : 0;
+
+  const toggle = () => {
+    const v = ref.current; if (!v) return;
+    if (ended) { v.currentTime = 0; setEnded(false); v.play(); }
+    else if (playing) v.pause(); else v.play();
+  };
+
+  return (
+    <div className="rounded-2xl overflow-hidden border border-white/8 bg-black">
+      <div className="relative aspect-video">
+        <video ref={ref} src={src} poster={thumbnail} className="w-full h-full object-contain" playsInline
+          onPlay={() => { setPlaying(true); setEnded(false); }}
+          onPause={() => setPlaying(false)}
+          onEnded={() => { setPlaying(false); setEnded(true); }}
+          onTimeUpdate={() => setElapsed(ref.current?.currentTime ?? 0)}
+          onLoadedMetadata={() => setDuration(ref.current?.duration ?? 0)} />
+        {!playing && !ended && (
+          <div className="absolute inset-0 flex items-center justify-center">
+            <button onClick={toggle} className="w-14 h-14 rounded-full bg-white/90 hover:bg-white flex items-center justify-center shadow-2xl hover:scale-105 transition-all">
+              <Play className="w-6 h-6 text-black ml-0.5" />
+            </button>
+          </div>
+        )}
+        {ended && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/60">
+            <button onClick={toggle} className="w-12 h-12 rounded-full bg-white/90 hover:bg-white flex items-center justify-center shadow-2xl hover:scale-105 transition-all mb-1.5">
+              <RotateCcw className="w-5 h-5 text-black" />
+            </button>
+            <span className="text-white/50 text-xs">Replay</span>
+          </div>
+        )}
+      </div>
+      <div className="bg-black px-4 pt-2.5 pb-3 space-y-2">
+        <div className="relative h-px bg-white/10 overflow-visible">
+          <div className="absolute left-0 top-0 h-px bg-white transition-all" style={{ width: `${progress}%` }} />
+          <input type="range" min={0} max={100} step={0.1} value={progress}
+            onChange={(e) => { const v = ref.current; if (v && duration) v.currentTime = (Number(e.target.value) / 100) * duration; }}
+            className="absolute inset-0 w-full opacity-0 cursor-pointer h-4 -top-2" />
+        </div>
+        <div className="flex items-center gap-3">
+          <button onClick={toggle} className="w-7 h-7 rounded-full bg-white/8 hover:bg-white/15 flex items-center justify-center text-white transition-colors shrink-0">
+            {playing ? <Pause className="w-3 h-3" /> : ended ? <RotateCcw className="w-3 h-3" /> : <Play className="w-3 h-3 ml-0.5" />}
+          </button>
+          <button onClick={() => { const v = ref.current; if (v) { v.muted = !v.muted; setMuted(v.muted); } }}
+            className="w-7 h-7 rounded-full bg-white/8 hover:bg-white/15 flex items-center justify-center text-white transition-colors shrink-0">
+            {muted ? <VolumeX className="w-3 h-3" /> : <Volume2 className="w-3 h-3" />}
+          </button>
+          <span className="text-xs text-white/30 font-mono tabular-nums">{fmt(elapsed)} / {fmt(duration)}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+type Stage = "idle" | "processing" | "done" | "error";
+
+type BgResult = {
+  videoUrl: string;
+  thumbnailUrl?: string;
+  sourceUrl?: string;
+  lumaUrl?: string;
+  faceLocked?: boolean;
+  demoMode?: boolean;
+  selectedMode?: string;
+  selectedRoute?: string;
+  selectedEngine?: string;
+  renderMode?: string;
+  selectedObject?: string;
+  requestedEdit?: string;
+  protectedMask?: string;
+  editMask?: string;
+  renderProof?: {
+    selectedMode: string;
+    selectedRoute: string;
+    selectedEngine: string;
+    demoMode: boolean;
+    realAiCalled: boolean;
+    inputVideoUrlPresent: boolean;
+    inputImageUrlPresent: boolean;
+    faceLockActive: boolean;
+    backgroundReplaceActive: boolean;
+    objectEditActive: boolean;
+    colorGradeActive: boolean;
+    finalOutputUrlPresent: boolean;
+    errorMessage: string;
+  };
+};
+
+type RenderMode = "background_replace" | "character_lock" | "clothes_change" | "color_grade" | "object_edit";
+
+const PRESETS = [
+  { label: "White walls",     prompt: "Replace the background with clean white studio walls, soft natural lighting" },
+  { label: "Wooden floor",    prompt: "Place the subject in a warm wooden-floor interior, soft daylight" },
+  { label: "Tropical beach",  prompt: "Place the subject on a tropical beach at sunset with palm trees and ocean behind" },
+  { label: "Cyberpunk city",  prompt: "Place the subject in a neon-lit cyberpunk city street at night, rain reflections" },
+  { label: "Studio backdrop", prompt: "Plain seamless white studio backdrop, professional photography lighting" },
+  { label: "Dark walls",      prompt: "Place the subject in a moody dark-charcoal interior with dramatic side lighting" },
+  { label: "Brick wall",      prompt: "Place the subject in front of an exposed red brick wall, warm tungsten lighting" },
+  { label: "Forest",          prompt: "Place the subject in a lush green forest with dappled sunlight through the canopy" },
+];
+
+export default function BgReplacePage() {
+  const [file, setFile] = useState<File | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [bgPrompt, setBgPrompt] = useState("");
+  const [lockFace, setLockFace] = useState(true);
+  const [lockTargets, setLockTargets] = useState<string[]>(["face"]);
+  const [mode, setMode] = useState<RenderMode>("character_lock");
+  const [selectedObject, setSelectedObject] = useState<string>("");
+  const [objectAnchor, setObjectAnchor] = useState<{ x: number; y: number } | null>(null);
+  const [maskRadius, setMaskRadius] = useState(0.16);
+  const [maskEngineWarning, setMaskEngineWarning] = useState<string | null>(OBJECT_MASK_ENGINE_WARNING);
+  const objectMaskEngineRef = useRef<ObjectMaskEngineMode>("GEOMETRIC");
+  const [objectMaskEngine, setObjectMaskEngine] = useState<ObjectMaskEngineMode>("GEOMETRIC");
+  const [segmentTrackJobId, setSegmentTrackJobId] = useState<string | null>(null);
+  const [segmentTrackBusy, setSegmentTrackBusy] = useState(false);
+  const [segmentTrackError, setSegmentTrackError] = useState<string | null>(null);
+  const [stage, setStage] = useState<Stage>("idle");
+  const [result, setResult] = useState<BgResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const [fixing, setFixing] = useState(false);
+  const [clipDuration, setClipDuration] = useState<number | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const { toast } = useToast();
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/render/targeted-mask-status")
+      .then((r) => r.json())
+      .then(
+        (data: {
+          fullyConnected?: boolean;
+          clientWarnings?: string[];
+          objectMaskEngine?: ObjectMaskEngineMode;
+          replicateConfigured?: boolean;
+        }) => {
+          if (cancelled) return;
+          const engine: ObjectMaskEngineMode = data?.objectMaskEngine === "SAM2" ? "SAM2" : "GEOMETRIC";
+          objectMaskEngineRef.current = engine;
+          setObjectMaskEngine(engine);
+          if (engine === "SAM2" && data?.replicateConfigured) {
+            setMaskEngineWarning(null);
+          } else if (data?.fullyConnected) setMaskEngineWarning(null);
+          else if (Array.isArray(data?.clientWarnings) && data.clientWarnings[0])
+            setMaskEngineWarning(data.clientWarnings[0]);
+          else setMaskEngineWarning(OBJECT_MASK_ENGINE_WARNING);
+        },
+      )
+      .catch(() => {
+        if (!cancelled) setMaskEngineWarning(OBJECT_MASK_ENGINE_WARNING);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const VIDEO_EXTS = [".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v", ".3gp"];
+  const isVideoFile = (f: File) => {
+    const ext = "." + f.name.split(".").pop()?.toLowerCase();
+    // For local Windows dev, browsers sometimes provide empty/odd MIME types.
+    // Treat these extensions as authoritative.
+    return f.type.startsWith("video/") || VIDEO_EXTS.includes(ext);
+  };
+
+  const handleFile = (f: File) => {
+    console.log("[BG Replace] file.name", f.name);
+    console.log("[BG Replace] file.type", f.type);
+    console.log("[BG Replace] file.size", f.size);
+
+    if (!isVideoFile(f)) { toast({ title: "Please upload a video file (MP4, MOV, WebM…)", variant: "destructive" }); return; }
+    if (f.size > 100 * 1024 * 1024) { toast({ title: "Video must be under 100 MB (Luma limit)", variant: "destructive" }); return; }
+    const url = URL.createObjectURL(f);
+    setFile(f);
+    setPreviewUrl(url);
+    setClipDuration(null);
+    setResult(null);
+    setError(null);
+    setStage("idle");
+    setSegmentTrackJobId(null);
+    setSegmentTrackBusy(false);
+    setSegmentTrackError(null);
+
+    // Probe duration just so we can show a small "auto-trimmed" badge in the
+    // preview. The backend trims to the first 9 s automatically.
+    const probe = document.createElement("video");
+    probe.preload = "metadata";
+    probe.onloadedmetadata = () => {
+      const d = probe.duration;
+      if (Number.isFinite(d) && d > 0) setClipDuration(d);
+    };
+    probe.onerror = () => {
+      // Don't block uploads if metadata probing fails.
+      console.log("[BG Replace] metadata probe failed");
+    };
+    probe.src = url;
+  };
+
+  const onDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault(); setDragging(false);
+    const f = e.dataTransfer.files[0];
+    if (f) handleFile(f);
+  }, []);
+
+  const handleSubmit = async () => {
+    if (!file) { toast({ title: "Upload a video first", variant: "destructive" }); return; }
+    if ((mode === "background_replace" || mode === "clothes_change") && !bgPrompt.trim()) {
+      toast({ title: "Describe the edit first", variant: "destructive" });
+      return;
+    }
+    if (mode === "object_edit") {
+      if (!bgPrompt.trim()) {
+        toast({ title: "Describe the object edit (e.g. change wall to white)", variant: "destructive" });
+        return;
+      }
+      if (!selectedObject.trim()) {
+        toast({ title: "Pick or label the object (wall, car, couch…)", variant: "destructive" });
+        return;
+      }
+      if (objectMaskEngineRef.current === "SAM2" && !segmentTrackJobId) {
+        toast({
+          title: "Click the object on the video first",
+          description: "SAM2 tracks from your click through the whole clip before rendering.",
+          variant: "destructive",
+        });
+        return;
+      }
+    }
+
+    setStage("processing");
+    setError(null);
+
+    const form = new FormData();
+    form.append("video", file);
+    form.append("backgroundPrompt", bgPrompt.trim() || "keep original");
+    form.append("lockFace", String(lockFace));
+    form.append("lockTargets", JSON.stringify(lockTargets));
+    const selectedModeForProduction =
+      mode === "color_grade"
+        ? "color_grade"
+        : mode === "object_edit"
+          ? "object_edit"
+          : "full_production";
+    form.append("selectedMode", selectedModeForProduction);
+    if (mode === "object_edit") {
+      form.append("selectedObject", selectedObject);
+      form.append("requestedEdit", bgPrompt.trim());
+      form.append("objectX", String(objectAnchor?.x ?? ""));
+      form.append("objectY", String(objectAnchor?.y ?? ""));
+      form.append("maskRadius", String(maskRadius));
+      if (segmentTrackJobId) form.append("segmentTrackJobId", segmentTrackJobId);
+    }
+    if (mode === "color_grade") form.append("look", "luma_style_cinematic_fast");
+
+    const token = localStorage.getItem("dreamframe_token");
+    const route = "/api/render/production";
+    try {
+      const resp = await fetch(route, {
+        method: "POST",
+        body: form,
+        credentials: "include",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      const raw = await resp.text();
+      let data: any = {};
+      try { data = raw ? JSON.parse(raw) : {}; } catch (e: any) {
+        console.log("[BG Replace] response JSON parse failed:", e?.message ?? e);
+        console.log("[BG Replace] raw response:", raw);
+      }
+      if (!resp.ok) {
+        console.log("[BG Replace] backend error:", data?.error ?? raw);
+        throw new Error(data?.error ?? raw ?? "Unknown error");
+      }
+      const st = data?.targetedMaskEngineStatus as
+        | {
+            fullyConnected?: boolean;
+            clientWarnings?: string[];
+            objectMaskEngine?: ObjectMaskEngineMode;
+            replicateConfigured?: boolean;
+          }
+        | undefined;
+      if (st?.objectMaskEngine === "SAM2" && st?.replicateConfigured) setMaskEngineWarning(null);
+      else if (st?.fullyConnected) setMaskEngineWarning(null);
+      else if (Array.isArray(st?.clientWarnings) && st.clientWarnings[0]) setMaskEngineWarning(st.clientWarnings[0]);
+      else if (data?.targetedObjectEdit?.clientWarnings?.[0])
+        setMaskEngineWarning(data.targetedObjectEdit.clientWarnings[0]);
+      setResult(data);
+      setStage("done");
+    } catch (err: any) {
+      console.log("[BG Replace] submit error:", err?.message ?? err);
+      setError(describeFetchFailure(err instanceof Error ? err : new Error(String(err?.message ?? err))));
+      setStage("error");
+    }
+  };
+
+  const handleFixFace = async () => {
+    if (!result?.lumaUrl || !result?.sourceUrl) {
+      toast({ title: "Missing source video for face fix", variant: "destructive" });
+      return;
+    }
+    setFixing(true);
+    setError(null);
+    const token = localStorage.getItem("dreamframe_token");
+    try {
+      const resp = await fetch("/api/render/production", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        credentials: "include",
+        body: JSON.stringify({
+          selectedMode: "face_swap",
+          targetVideoUrl: result.lumaUrl,
+          faceSourceUrl: result.sourceUrl,
+        }),
+      });
+      const rawFix = await resp.text();
+      let data: { error?: string; videoUrl?: string; thumbnailUrl?: string } = {};
+      try {
+        data = rawFix ? JSON.parse(rawFix) : {};
+      } catch {
+        throw new Error(rawFix.trim() ? rawFix.slice(0, 400) : `Face fix failed (${resp.status})`);
+      }
+      if (!resp.ok) throw new Error(typeof data?.error === "string" ? data.error : "Face fix failed");
+      setResult({
+        ...result,
+        videoUrl: data.videoUrl ?? result.videoUrl,
+        thumbnailUrl: data.thumbnailUrl ?? result.thumbnailUrl,
+        faceLocked: true,
+      });
+      toast({ title: "Face locked back on", description: "Your original face is now stamped on the render." });
+    } catch (err: any) {
+      setError(describeFetchFailure(err instanceof Error ? err : new Error(String(err?.message ?? err))));
+    } finally {
+      setFixing(false);
+    }
+  };
+
+  const reset = () => {
+    setFile(null); setPreviewUrl(null); setResult(null); setError(null);
+    setStage("idle"); setBgPrompt(""); setClipDuration(null);
+    setLockTargets(["face"]);
+    setSelectedObject("");
+    setObjectAnchor(null);
+    setMaskRadius(0.16);
+    setSegmentTrackJobId(null);
+    setSegmentTrackBusy(false);
+    setSegmentTrackError(null);
+  };
+
+  const runSegmentTrack = async (vid: HTMLVideoElement, nx: number, ny: number) => {
+    if (!file || objectMaskEngineRef.current !== "SAM2") return;
+    setSegmentTrackBusy(true);
+    setSegmentTrackError(null);
+    setSegmentTrackJobId(null);
+    const token = localStorage.getItem("dreamframe_token");
+    const fd = new FormData();
+    fd.append("video", file);
+    fd.append("objectX", String(nx));
+    fd.append("objectY", String(ny));
+    fd.append("clickTimeSeconds", String(vid.currentTime));
+    try {
+      const resp = await fetch("/api/ai/segment-track", {
+        method: "POST",
+        body: fd,
+        credentials: "include",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      const raw = await resp.text();
+      let data: { jobId?: string; error?: string; code?: string } = {};
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch {
+        throw new Error(raw.trim().slice(0, 200) || `segment-track failed (${resp.status})`);
+      }
+      if (!resp.ok) {
+        if (data?.code === "SAM2_DISABLED") return;
+        throw new Error(typeof data?.error === "string" ? data.error : `segment-track failed (${resp.status})`);
+      }
+      if (typeof data.jobId === "string") {
+        setSegmentTrackJobId(data.jobId);
+        toast({ title: "Object tracked", description: "SAM2 mask spans the full video for your edit." });
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setSegmentTrackError(msg);
+      toast({ title: "Tracking failed", description: msg, variant: "destructive" });
+    } finally {
+      setSegmentTrackBusy(false);
+    }
+  };
+
+  const pickObjectAnchor = (e: React.MouseEvent<HTMLVideoElement>) => {
+    if (mode !== "object_edit") return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width;
+    const y = (e.clientY - rect.top) / rect.height;
+    const nx = Math.max(0, Math.min(1, x));
+    const ny = Math.max(0, Math.min(1, y));
+    setObjectAnchor({ x: nx, y: ny });
+    void runSegmentTrack(e.currentTarget, nx, ny);
+  };
+
+  const toggleLockTarget = (target: string) => {
+    setLockTargets((prev) =>
+      prev.includes(target) ? prev.filter((t) => t !== target) : [...prev, target]
+    );
+  };
+
+  return (
+    <AppLayout>
+      <div className="max-w-5xl mx-auto px-8 py-14">
+        {/* Header */}
+        <div className="mb-12">
+          <p className="text-xs text-white/30 uppercase tracking-widest mb-2">Luma Ray-2 · video to video</p>
+          <h1 className="text-4xl font-semibold text-white tracking-tight">Background Replace</h1>
+          <p className="text-sm text-white/30 mt-2">
+            Drop a video — Luma re-renders the entire scene from your prompt while keeping the motion. Optional face-lock stamps your original face back on.
+          </p>
+          <p className="text-xs text-white/45 mt-3">
+            {result?.renderMode === "production"
+              ? "PRODUCTION MODE — real AI rendering may cost credits."
+              : result?.renderMode === "local"
+                ? "LOCAL MODE — free local processing, no paid AI called."
+                : "MOCK TEST MODE — free testing, no paid AI called."}
+          </p>
+        </div>
+
+        {mode === "object_edit" && objectMaskEngine === "GEOMETRIC" && maskEngineWarning ? (
+          <Alert
+            className="mb-8 border-amber-500/45 bg-amber-950/35 text-amber-50 [&>svg]:text-amber-400"
+            variant="default"
+          >
+            <AlertTriangle className="h-4 w-4" />
+            <AlertDescription className="text-amber-50/95">{maskEngineWarning}</AlertDescription>
+          </Alert>
+        ) : null}
+
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-10">
+          {/* Left: inputs */}
+          <div className="space-y-7">
+            {/* Drop zone */}
+            <div>
+              <p className="text-[11px] text-white/30 uppercase tracking-widest mb-3">Your video</p>
+              <div
+                data-testid="drop-zone-video"
+                onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+                onDragLeave={() => setDragging(false)}
+                onDrop={onDrop}
+                onClick={() => !file && fileRef.current?.click()}
+                className={cn("relative rounded-2xl border-2 border-dashed transition-all overflow-hidden",
+                  dragging ? "border-white/40 bg-white/5" : file ? "border-white/15 cursor-default" : "border-white/10 hover:border-white/25 cursor-pointer",
+                  file ? "aspect-video" : "py-16"
+                )}>
+                {file && previewUrl ? (
+                  <>
+                    <video src={previewUrl} className="w-full h-full object-contain bg-black" muted onClick={pickObjectAnchor} />
+                    <button onClick={(e) => { e.stopPropagation(); reset(); }}
+                      className="absolute top-3 right-3 w-7 h-7 rounded-full bg-black/80 hover:bg-black flex items-center justify-center text-white transition-colors">
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                    <div className="absolute bottom-3 left-3 px-2.5 py-1 rounded-full bg-black/70 text-white text-[10px] font-medium">
+                      {file.name} · {(file.size / 1024 / 1024).toFixed(1)} MB
+                      {clipDuration ? ` · ${clipDuration.toFixed(1)}s` : ""}
+                    </div>
+                    {mode === "object_edit" && objectMaskEngine === "SAM2" && (
+                      <div className="absolute top-14 left-3 max-w-[70%] px-2.5 py-1 rounded-full bg-cyan-950/85 border border-cyan-500/35 text-cyan-100 text-[10px] font-medium leading-snug">
+                        {segmentTrackBusy
+                          ? "SAM2 tracking…"
+                          : segmentTrackJobId
+                            ? "SAM2 mask ready — you can render."
+                            : "SAM2: click the object to track the full video."}
+                      </div>
+                    )}
+                    {mode === "object_edit" && objectMaskEngine === "SAM2" && segmentTrackError ? (
+                      <div className="absolute bottom-14 left-3 right-3 px-2 py-1 rounded-md bg-red-950/80 border border-red-500/40 text-red-100 text-[10px]">
+                        {segmentTrackError}
+                      </div>
+                    ) : null}
+                    {mode === "object_edit" && objectAnchor && (
+                      <div
+                        className="absolute w-4 h-4 rounded-full border border-cyan-300 bg-cyan-300/30 pointer-events-none"
+                        style={{
+                          left: `calc(${(objectAnchor.x * 100).toFixed(2)}% - 8px)`,
+                          top: `calc(${(objectAnchor.y * 100).toFixed(2)}% - 8px)`,
+                        }}
+                      />
+                    )}
+                    {clipDuration && clipDuration > 9.5 ? (
+                      <div className="absolute top-3 left-3 px-2.5 py-1 rounded-full bg-amber-500/90 text-black text-[10px] font-semibold">
+                        Will trim to first 9s
+                      </div>
+                    ) : null}
+                  </>
+                ) : (
+                  <div className="flex flex-col items-center gap-4 text-center px-6">
+                    <div className="w-12 h-12 rounded-full bg-white/6 flex items-center justify-center">
+                      <Upload className={cn("w-5 h-5", dragging ? "text-white/70" : "text-white/25")} />
+                    </div>
+                    <div>
+                      <p className="text-sm font-medium text-white/50">Drop your video here</p>
+                      <p className="text-xs text-white/20 mt-1">MP4, MOV, WebM · up to 100 MB · trimmed to first 9 seconds</p>
+                    </div>
+                    <button onClick={() => fileRef.current?.click()}
+                      className="text-xs text-white/40 hover:text-white transition-colors font-medium">Browse file</button>
+                  </div>
+                )}
+                <input ref={fileRef} type="file" accept="video/*,.mp4,.mov,.webm,.avi,.mkv,.m4v,.3gp" className="hidden"
+                  onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])} />
+              </div>
+            </div>
+
+            {/* Background prompt */}
+            <div>
+              <p className="text-[11px] text-white/30 uppercase tracking-widest mb-3">Mode</p>
+              <div className="grid grid-cols-1 gap-2 mb-4">
+                {[
+                  { id: "character_lock" as const, title: "Character Lock", desc: "Protect full person. Only requested non-character areas should change." },
+                  { id: "object_edit" as const, title: "Object Edit", desc: "Mask + composite: only the anchored region changes; video is not fully regenerated." },
+                  { id: "clothes_change" as const, title: "Clothes Change", desc: "Modify clothing area only while preserving face/body/background." },
+                  { id: "background_replace" as const, title: "Background Replace", desc: "Modify background scene while preserving subject motion." },
+                  { id: "color_grade" as const, title: "Color Grade", desc: "Apply color/lighting grade without changing person or scene layout." },
+                ].map((m) => (
+                  <button
+                    key={m.id}
+                    onClick={() => setMode(m.id)}
+                    className={cn(
+                      "w-full rounded-xl border px-3 py-2.5 text-left transition-all",
+                      mode === m.id ? "border-white/40 bg-white/10" : "border-white/8 hover:border-white/20",
+                    )}
+                  >
+                    <p className={cn("text-xs font-medium", mode === m.id ? "text-white" : "text-white/45")}>{m.title}</p>
+                    <p className="text-[10px] text-white/25 mt-1">{m.desc}</p>
+                  </button>
+                ))}
+              </div>
+
+              <p className="text-[11px] text-white/30 uppercase tracking-widest mb-3">Describe the new scene</p>
+              <Input data-testid="input-bg-prompt"
+                placeholder='e.g. "Place the subject on a tropical beach at sunset"'
+                value={bgPrompt} onChange={(e) => setBgPrompt(e.target.value)}
+                className="bg-white/5 border-white/10 text-white placeholder:text-white/25 focus-visible:ring-white/20 mb-2" />
+              <p className="text-[11px] text-white/20 mb-3">
+                {mode === "character_lock"
+                  ? "Character protected. No full-scene regeneration."
+                  : mode === "object_edit"
+                  ? "Uses FFmpeg masked composite — click optional (defaults to center). Describe color/remove/replace in the prompt."
+                  : mode === "clothes_change"
+                    ? "Only clothing region should be changed from your prompt."
+                    : mode === "color_grade"
+                      ? "Color/lighting grade only. Person and scene geometry are preserved."
+                    : "Luma re-renders the whole scene from this prompt while keeping your motion intact"}
+              </p>
+              {mode === "object_edit" && (
+                <div className="mb-3 space-y-2">
+                  <p className="text-[10px] text-white/30 uppercase tracking-widest">Select object</p>
+                  <div className="flex flex-wrap gap-2">
+                    {["couch", "chair", "table", "lamp", "wall"].map((obj) => (
+                      <button
+                        key={obj}
+                        type="button"
+                        onClick={() => setSelectedObject(obj)}
+                        className={cn(
+                          "text-xs px-3 py-1.5 rounded-full border transition-all",
+                          selectedObject === obj
+                            ? "border-cyan-300/70 bg-cyan-300/15 text-cyan-200"
+                            : "border-white/10 text-white/45 hover:border-white/25 hover:text-white/70",
+                        )}
+                      >
+                        {obj}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-[11px] text-white/30">
+                    Optional: click the video to anchor the mask. Otherwise the edit centers on frame — adjust radius below.
+                  </p>
+                  <label className="flex flex-col gap-1 text-[11px] text-white/40 pt-2">
+                    <span className="text-white/50">Mask radius ({maskRadius.toFixed(2)})</span>
+                    <input
+                      type="range"
+                      min={0.08}
+                      max={0.4}
+                      step={0.01}
+                      value={maskRadius}
+                      onChange={(e) => setMaskRadius(Number(e.target.value))}
+                      className="w-full accent-cyan-400"
+                    />
+                  </label>
+                </div>
+              )}
+              <div className="flex flex-wrap gap-2">
+                {PRESETS.map((p) => (
+                  <button key={p.label} onClick={() => setBgPrompt(p.prompt)}
+                    className={cn("text-xs px-3 py-1.5 rounded-full border transition-all",
+                      bgPrompt === p.prompt
+                        ? "border-white/40 bg-white/10 text-white"
+                        : "border-white/8 text-white/30 hover:border-white/20 hover:text-white/60")}>
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Lock my face toggle */}
+            <div className="rounded-2xl border border-white/8 bg-white/[0.02] p-4 flex items-start gap-4">
+              <button
+                data-testid="toggle-lock-face"
+                onClick={() => setLockFace(v => !v)}
+                role="switch"
+                aria-checked={lockFace}
+                className={cn(
+                  "relative w-10 h-6 rounded-full transition-colors shrink-0 mt-0.5",
+                  lockFace ? "bg-white" : "bg-white/15"
+                )}>
+                <span
+                  className={cn(
+                    "absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-black transition-transform",
+                    lockFace ? "translate-x-4" : "translate-x-0"
+                  )}
+                />
+              </button>
+              <div className="flex-1">
+                <div className="flex items-center gap-2 mb-1">
+                  <ShieldCheck className={cn("w-3.5 h-3.5", lockFace ? "text-white" : "text-white/30")} />
+                  <p className={cn("text-sm font-medium", lockFace ? "text-white" : "text-white/50")}>Lock my face</p>
+                </div>
+                <p className="text-[11px] text-white/30 leading-relaxed">
+                  After render, we stamp your original face back on every frame so your character stays recognizable. Adds about a minute and a small extra cost.
+                </p>
+                <div className="mt-3">
+                  <p className="text-[10px] text-white/30 uppercase tracking-widest mb-2">Face lock options</p>
+                  <div className="grid grid-cols-2 gap-2">
+                    {[
+                      { id: "face", label: "Face" },
+                      { id: "hair", label: "Hair" },
+                      { id: "skin_tone", label: "Skin tone" },
+                      { id: "accessories", label: "Accessories" },
+                    ].map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => toggleLockTarget(opt.id)}
+                        className={cn(
+                          "flex items-center gap-2 rounded-lg border px-2.5 py-2 text-xs text-left transition-all",
+                          lockTargets.includes(opt.id)
+                            ? "border-white/40 bg-white/10 text-white"
+                            : "border-white/10 text-white/45 hover:border-white/25"
+                        )}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={lockTargets.includes(opt.id)}
+                          readOnly
+                          className="accent-white"
+                        />
+                        <span>{opt.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {mode === "character_lock" && (
+              <div className="rounded-2xl border border-emerald-400/20 bg-emerald-400/5 p-4">
+                <p className="text-xs text-emerald-200">Character protected. No full-scene regeneration.</p>
+              </div>
+            )}
+
+            {/* Submit */}
+            <Button data-testid="button-replace-bg" onClick={handleSubmit}
+              disabled={!file || !bgPrompt.trim() || stage === "processing"}
+              className="w-full bg-white text-black hover:bg-white/90 font-semibold gap-2 h-11 rounded-full">
+              {stage === "processing" ? (
+                <>
+                  <div className="w-4 h-4 rounded-full border-2 border-black/20 border-t-black animate-spin" />
+                  {mode === "character_lock" ? "Protecting character..." : mode === "object_edit" ? "Editing selected object..." : "Rendering..."}
+                </>
+              ) : (
+                <>
+                  <Sparkles className="w-4 h-4" />
+                  {mode === "character_lock"
+                    ? "Apply character lock"
+                    : mode === "object_edit"
+                      ? "Apply object edit"
+                    : mode === "clothes_change"
+                      ? "Apply clothes change"
+                      : mode === "color_grade"
+                        ? "Apply color grade"
+                        : "Replace background"}
+                </>
+              )}
+            </Button>
+
+            {stage === "processing" && (
+              <div className="border border-white/8 rounded-2xl p-5 space-y-4">
+                <p className="text-xs font-semibold text-white/50 uppercase tracking-widest">Pipeline</p>
+                {[
+                  "Uploading your video",
+                  "Luma Ray-2 re-rendering scene",
+                  ...(lockFace ? ["Locking your face back on every frame"] : []),
+                  "Encoding final video",
+                ].map((step, i) => (
+                  <div key={step} className="flex items-center gap-3">
+                    <div className={cn("w-1.5 h-1.5 rounded-full shrink-0", i < 2 ? "bg-white animate-pulse" : "bg-white/15")} />
+                    <span className="text-xs text-white/40">{step}</span>
+                  </div>
+                ))}
+                <p className="text-[11px] text-white/20 pt-1">
+                  Takes about {lockFace ? "4–6" : "3–4"} minutes — Luma renders in the cloud
+                </p>
+              </div>
+            )}
+
+            {error && (
+              <div className="border border-red-500/20 bg-red-500/5 rounded-2xl p-4 text-sm text-red-400">
+                {error}
+              </div>
+            )}
+          </div>
+
+          {/* Right: result */}
+          <div>
+            {stage === "done" && result ? (
+              <div className="space-y-5">
+                <div className="flex items-center justify-between mb-2 gap-2">
+                  <div className="flex items-center gap-2 text-sm font-medium text-white/60">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                    <span>{result.demoMode ? "DEMO ONLY render" : "Scene re-rendered"}</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {result.demoMode && (
+                      <div className="flex items-center gap-1.5 text-[11px] text-amber-300 bg-amber-400/10 px-2.5 py-1 rounded-full border border-amber-400/20">
+                        <span>DEMO</span>
+                      </div>
+                    )}
+                    {result.faceLocked && (
+                      <div className="flex items-center gap-1.5 text-[11px] text-emerald-400/80 bg-emerald-400/5 px-2.5 py-1 rounded-full border border-emerald-400/15">
+                        <ShieldCheck className="w-3 h-3" />
+                        <span>Face locked</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+                {(result.selectedMode || result.renderProof) && (
+                  <div className="border border-amber-400/15 bg-amber-400/5 rounded-2xl p-4 space-y-1.5">
+                    <p className="text-[11px] text-amber-200/80 uppercase tracking-widest">Render debug proof</p>
+                    <p className="text-[10px] text-white/35 break-all">selectedMode: {result.renderProof?.selectedMode ?? result.selectedMode}</p>
+                    <p className="text-[10px] text-white/35 break-all">selectedRoute: {result.renderProof?.selectedRoute ?? result.selectedRoute}</p>
+                    <p className="text-[10px] text-white/35 break-all">selectedEngine: {result.renderProof?.selectedEngine ?? result.selectedEngine}</p>
+                    <p className="text-[10px] text-white/35 break-all">demoMode: {String(result.renderProof?.demoMode ?? result.demoMode ?? false)}</p>
+                    <p className="text-[10px] text-white/35 break-all">realAiCalled: {String(result.renderProof?.realAiCalled ?? !result.demoMode)}</p>
+                    <p className="text-[10px] text-white/35 break-all">inputVideoUrl present: {String(result.renderProof?.inputVideoUrlPresent ?? Boolean(previewUrl))}</p>
+                    <p className="text-[10px] text-white/35 break-all">inputImageUrl present: {String(result.renderProof?.inputImageUrlPresent ?? false)}</p>
+                    <p className="text-[10px] text-white/35 break-all">faceLock active: {String(result.renderProof?.faceLockActive ?? result.faceLocked ?? false)}</p>
+                    <p className="text-[10px] text-white/35 break-all">backgroundReplace active: {String(result.renderProof?.backgroundReplaceActive ?? (mode === "background_replace" || mode === "character_lock"))}</p>
+                    <p className="text-[10px] text-white/35 break-all">objectEdit active: {String(result.renderProof?.objectEditActive ?? mode === "object_edit")}</p>
+                    <p className="text-[10px] text-white/35 break-all">colorGrade active: {String(result.renderProof?.colorGradeActive ?? mode === "color_grade")}</p>
+                    <p className="text-[10px] text-white/35 break-all">finalOutputUrl present: {String(result.renderProof?.finalOutputUrlPresent ?? Boolean(result.videoUrl))}</p>
+                    <p className="text-[10px] text-white/35 break-all">errorMessage: {result.renderProof?.errorMessage || ""}</p>
+                    {result.selectedObject && <p className="text-[10px] text-white/35 break-all">selectedObject: {result.selectedObject}</p>}
+                    {result.requestedEdit && <p className="text-[10px] text-white/35 break-all">requestedEdit: {result.requestedEdit}</p>}
+                    {result.protectedMask && <p className="text-[10px] text-white/35 break-all">protectedMask: {result.protectedMask}</p>}
+                    {result.editMask && <p className="text-[10px] text-white/35 break-all">editMask: {result.editMask}</p>}
+                  </div>
+                )}
+                <VideoPlayer src={result.videoUrl} thumbnail={result.thumbnailUrl} />
+
+                {/* Fix face button */}
+                {result.lumaUrl && result.sourceUrl && (
+                  <Button
+                    data-testid="button-fix-face"
+                    onClick={handleFixFace}
+                    disabled={fixing}
+                    variant="outline"
+                    className="w-full border-white/10 text-white/70 hover:text-white hover:border-white/25 hover:bg-white/5 rounded-full gap-2"
+                  >
+                    {fixing ? (
+                      <>
+                        <div className="w-3.5 h-3.5 rounded-full border-2 border-white/20 border-t-white animate-spin" />
+                        Re-locking face...
+                      </>
+                    ) : (
+                      <>
+                        <Wand2 className="w-3.5 h-3.5" />
+                        {result.faceLocked ? "Re-run face lock" : "Fix face"}
+                      </>
+                    )}
+                  </Button>
+                )}
+
+                <a href={result.videoUrl} download className="block">
+                  <Button variant="outline" className="w-full border-white/10 text-white/50 hover:text-white hover:border-white/25 hover:bg-white/5 rounded-full">
+                    Download video
+                  </Button>
+                </a>
+                <button onClick={reset} className="w-full text-xs text-white/20 hover:text-white/40 transition-colors py-2">
+                  Process another video
+                </button>
+              </div>
+            ) : (
+              <div className="rounded-2xl border border-dashed border-white/8 aspect-video flex flex-col items-center justify-center text-center p-10 gap-6">
+                <div className="w-14 h-14 rounded-2xl bg-white/4 flex items-center justify-center">
+                  <Layers className="w-7 h-7 text-white/15" />
+                </div>
+                <div>
+                  <p className="text-sm font-medium text-white/25 mb-1">Result appears here</p>
+                  <p className="text-xs text-white/15">Upload a video and describe the new scene</p>
+                </div>
+                <div className="text-[11px] text-white/15 space-y-1.5 text-left w-full max-w-xs">
+                  <p className="text-white/25 font-medium mb-2">How it works</p>
+                  <p>1. Luma Ray-2 re-renders the entire scene from your prompt</p>
+                  <p>2. Your motion and framing are preserved</p>
+                  <p>3. Optional face lock stamps your original face back on</p>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </AppLayout>
+  );
+}
+
+===== artifacts/api-server/src/routes/production.ts =====
+import { Router } from "express";
+import multer from "multer";
+import path from "path";
+import { fileURLToPath } from "url";
+import { access, mkdir, open, readFile, stat, writeFile } from "fs/promises";
+import { statSync } from "fs";
+import { execFile, spawn } from "child_process";
+import { promisify } from "util";
+import { createHash, randomUUID } from "crypto";
+import Replicate from "replicate";
+import ffmpegPath from "ffmpeg-static";
+import ffprobeStatic from "ffprobe-static";
+import { requireAuth } from "../middlewares/requireAuth";
+import { resolveFfmpegBin } from "../lib/ffmpeg";
+import { allowsFullSceneVideoTransfer, isSpecificObjectEditIntent } from "../lib/object-edit-intent";
+import { runTargetedObjectEdit, type TargetedEditRunMeta } from "../lib/targeted-object-edit";
+import { getPublicTargetedMaskStatus } from "../lib/targeted-mask-status";
+import { getSegmentTrackJob } from "../lib/segment-track-jobs";
+import { sam2MaskEngineRequested } from "../lib/object-mask-engine";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const UPLOADS_DIR = path.join(__dirname, "../public/uploads");
+const VIDEOS_DIR = path.join(__dirname, "../public/videos");
+const THUMBS_DIR = path.join(__dirname, "../public/thumbs");
+const SWAPS_DIR = path.join(__dirname, "../public/swaps");
+const execFileAsync = promisify(execFile);
+
+const VIDEO_EXTS = new Set([".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v", ".3gp"]);
+const IMAGE_EXTS = new Set([".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".heif"]);
+
+type ProductionMode =
+  | "face_swap"
+  | "background_replace"
+  | "object_edit"
+  | "color_grade"
+  | "locked_reference_color_match"
+  | "image_generate"
+  | "video_generate"
+  | "audio_cleanup"
+  | "full_production";
+
+type RenderMode = "mock" | "local" | "production";
+
+const DEFAULT_COLOR_INSTRUCTION =
+  "Apply cinematic movie color grading with natural skin tones, correct white balance, clean contrast, realistic lighting, balanced shadows, and professional film look. Do not make it black and white. Do not add yellow, green, gray, or washed-out color cast. Preserve the character exactly.";
+
+const CHARACTER_LOCK_INSTRUCTION = [
+  "Preserve character identity exactly at every step.",
+  "Do not change face, skin tone, body type, clothing, pose, hair, or style.",
+  "Do not replace, remove, or alter the person.",
+  "Keep original composition unless explicitly requested.",
+].join(" ");
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 250 * 1024 * 1024 },
+});
+
+const router = Router();
+
+type LockedColorJobState = {
+  jobId: string;
+  status: "queued" | "validating" | "uploading" | "processing" | "encoding" | "verifying" | "complete" | "failed";
+  currentStep: string;
+  progressPercent: number;
+  lastProgressAt: string;
+  targetVideoUrl: string;
+  referenceVideoUrl: string;
+  referenceImageUrl: string;
+  targetFileExists: boolean;
+  referenceFileExists: boolean;
+  targetDuration: number | null;
+  referenceDuration: number | null;
+  targetCodec: string | null;
+  referenceCodec: string | null;
+  ffmpegStarted: boolean;
+  ffmpegCommand: string;
+  ffmpegLastLog: string;
+  ffmpegProgressPercent: number;
+  ffmpegElapsedSeconds: number;
+  ffmpegExitCode: number | null;
+  framesExtracted: number;
+  referenceFramesExtracted: number;
+  colorStatsComputed: boolean;
+  colorTransferStarted: boolean;
+  colorTransferCompleted: boolean;
+  encodeStarted: boolean;
+  encodeCompleted: boolean;
+  finalOutputUrl: string;
+  outputFileExists: boolean;
+  outputFileSize: number;
+  inputFileSize: number;
+  inputFileHash: string;
+  outputFileHash: string;
+  inputOutputHashesDifferent: boolean;
+  inputDurationSeconds: number;
+  outputDurationSeconds: number;
+  warning: string | null;
+  realTargetUrlReady: boolean;
+  realReferenceUrlReady: boolean;
+  startedBeforeUploadFinished: boolean;
+  usedPlaceholderUrl: boolean;
+  usedOldOutputUrl: boolean;
+  actualInputVideoUrl: string;
+  actualReferenceUrl: string;
+  actualFinalOutputUrl: string;
+  targetFrameSampleBefore: string;
+  referenceFrameSample: string;
+  processedFrameSampleAfter: string;
+  contactSheetUrl: string;
+  beforeColorStats: Record<string, unknown> | null;
+  referenceColorStats: Record<string, unknown> | null;
+  afterColorStats: Record<string, unknown> | null;
+  colorDeltaBeforeToReference: number | null;
+  colorDeltaAfterToReference: number | null;
+  transformStrength: number;
+  exposureMatchStrength: number;
+  contrastMatchStrength: number;
+  saturationMatchStrength: number;
+  whiteBalanceStrength: number;
+  toneCurveStrength: number;
+  filterGraphUsed: string;
+  processedFramesUsedInEncode: boolean;
+  referenceFrameExtracted: boolean;
+  targetFrameExtracted: boolean;
+  colorTransformApplied: boolean;
+  processedFramesCreated: boolean;
+  ffmpegUsedOriginalVideoCopy: boolean;
+  averagePixelDifferencePercent: number;
+  sampledFrameDiffs: Array<{
+    timestamp: number;
+    inputFrameUrl: string;
+    outputFrameUrl: string;
+    referenceFrameUrl: string;
+    averagePixelDifferencePercent: number;
+  }>;
+  visibleChangeDetected: boolean;
+  error: string | null;
+  analyzeReferenceComplete: boolean;
+  thumbnailUrl?: string;
+  /** Mock-only: production color pipeline was not run. */
+  heavyColorTransferSkipped?: boolean;
+  debugProof?: Record<string, unknown>;
+  /** FFmpeg-only locked reference path (never Luma for this mode). */
+  actualEngineUsed: string;
+  preserveTargetLuminance: boolean;
+  /** Always true for this pipeline — limits copying absolute WB casts. */
+  whiteBalanceProtection: boolean;
+  yellowCastReduction: number;
+  greenCastReduction: number;
+  brightnessShift: number;
+  saturationShift: number;
+  contrastShift: number;
+  rerenderedBecauseTooStrong: boolean;
+};
+
+const lockedColorJobs = new Map<string, LockedColorJobState>();
+
+function isDemoModeEnabled(): boolean {
+  const v = (process.env.BG_REPLACE_DEMO_MODE ?? "false").toLowerCase();
+  return v !== "false" && v !== "0" && v !== "off";
+}
+
+function getRenderMode(): RenderMode {
+  // Default "local" runs the real FFmpeg locked-reference color pipeline (no paid AI for that mode).
+  // RENDER_MODE=mock still labels the server tier (UI / billing); locked-reference jobs always use the full pipeline.
+  const raw = String(process.env.RENDER_MODE ?? "local").trim().toLowerCase();
+  if (raw === "production" || raw === "local" || raw === "mock") return raw;
+  return "local";
+}
+
+function assertPaidAiAllowed() {
+  if (getRenderMode() !== "production") {
+    throw new Error("Paid AI calls are blocked outside production mode.");
+  }
+}
+
+/** Locked-reference mock jobs only — matches mock FFmpeg contract (AAC re-encode, ultrafast). */
+const MOCK_FAST_EQ_FILTER = "eq=contrast=1.15:saturation=1.25:brightness=0.02";
+
+async function runMockLockedColorFfmpeg(
+  inputPath: string,
+  outputPath: string,
+  opts: { maxSeconds: number; timeoutMs: number },
+): Promise<void> {
+  const bin = resolveFfmpegBin(ffmpegPath);
+  const args = [
+    "-y",
+    "-i",
+    inputPath,
+    "-vf",
+    MOCK_FAST_EQ_FILTER,
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-crf",
+    "28",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "96k",
+    "-movflags",
+    "+faststart",
+    outputPath,
+  ];
+  if (opts.maxSeconds > 0) {
+    args.splice(1, 0, "-t", String(opts.maxSeconds));
+  }
+  const execOnce = () => execFileAsync(bin, args);
+  await withTimeout(execOnce(), opts.timeoutMs, "Mock FFmpeg render timed out.");
+}
+
+const MOCK_VISIBLE_FILTER = MOCK_FAST_EQ_FILTER;
+
+function parseEnvMs(key: string, defaultMs: number): number {
+  const n = Number(process.env[key]);
+  return Number.isFinite(n) && n > 0 ? n : defaultMs;
+}
+
+function getMockRenderTimeoutMs(): number {
+  return parseEnvMs("MOCK_RENDER_TIMEOUT_MS", 60_000);
+}
+
+function getMockEncodeMaxSeconds(): number {
+  const raw = Number(process.env.MOCK_RENDER_MAX_INPUT_SECONDS ?? "12");
+  if (!Number.isFinite(raw) || raw <= 0) return 12;
+  return Math.min(raw, 120);
+}
+
+function getDomain(): string | null {
+  return process.env.REPLIT_DEV_DOMAIN ?? process.env.REPLIT_DOMAINS?.split(",")[0] ?? null;
+}
+
+function resolveReplicateUrl(output: unknown): string {
+  if (typeof output === "string") return output;
+  if (output && typeof (output as any).url === "function") return (output as any).url().href;
+  if (Array.isArray(output) && output.length > 0) {
+    const first = output[0];
+    if (typeof first === "string") return first;
+    if (first && typeof (first as any).url === "function") return (first as any).url().href;
+  }
+  throw new Error("Unexpected output format from Replicate model");
+}
+
+async function downloadToFile(url: string, outPath: string) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Failed to download ${url}: ${r.status}`);
+  await writeFile(outPath, Buffer.from(await r.arrayBuffer()));
+}
+
+async function makeThumbnail(videoPath: string, outPath: string) {
+  const bin = resolveFfmpegBin(ffmpegPath);
+  await execFileAsync(bin, ["-y", "-i", videoPath, "-ss", "0.5", "-frames:v", "1", "-q:v", "3", outPath]);
+}
+
+async function extractFaceFrame(videoPath: string, outPath: string) {
+  const bin = resolveFfmpegBin(ffmpegPath);
+  await execFileAsync(bin, ["-y", "-ss", "0.5", "-i", videoPath, "-frames:v", "1", "-q:v", "2", outPath]);
+}
+
+function envValue(key: string): string {
+  return String(process.env[key] ?? "").trim();
+}
+
+function missingKeysForMode(mode: ProductionMode): string[] {
+  const missing: string[] = [];
+  const replicateToken = envValue("REPLICATE_API_TOKEN");
+  const lumaKey = envValue("LUMA_API_KEY");
+
+  const needsReplicate = [
+    "face_swap",
+    "background_replace",
+    "image_generate",
+    "video_generate",
+    "full_production",
+  ].includes(mode);
+  if (needsReplicate && !replicateToken) {
+    missing.push("REPLICATE_API_TOKEN");
+  }
+
+  // Luma operations are currently executed through Replicate models in this app.
+  // Accept either LUMA_API_KEY (direct) OR REPLICATE_API_TOKEN (proxy path).
+  const needsLuma = ["background_replace", "full_production"].includes(mode);
+  if (needsLuma && !lumaKey && !replicateToken) {
+    missing.push("LUMA_API_KEY");
+  }
+
+  if (mode === "image_generate" && !envValue("GOOGLE_API_KEY")) {
+    missing.push("GOOGLE_API_KEY");
+  }
+
+  return missing;
+}
+
+function parseMode(value: unknown): ProductionMode {
+  const mode = String(value ?? "").trim() as ProductionMode;
+  const valid: ProductionMode[] = [
+    "face_swap",
+    "background_replace",
+    "object_edit",
+    "color_grade",
+    "locked_reference_color_match",
+    "image_generate",
+    "video_generate",
+    "audio_cleanup",
+    "full_production",
+  ];
+  if (!valid.includes(mode)) throw new Error("Invalid selectedMode for production render");
+  return mode;
+}
+
+function parseAssetPath(value: unknown): string | null {
+  if (typeof value !== "string" || !value.startsWith("/api/") || value.includes("..")) return null;
+  if (value.startsWith("/api/uploads/")) return path.join(UPLOADS_DIR, value.slice("/api/uploads/".length));
+  if (value.startsWith("/api/videos-files/")) return path.join(VIDEOS_DIR, value.slice("/api/videos-files/".length));
+  if (value.startsWith("/api/swaps/")) return path.join(SWAPS_DIR, value.slice("/api/swaps/".length));
+  return null;
+}
+
+function isUnresolvedUrl(value: unknown): boolean {
+  if (value == null) return true;
+  const v = String(value).trim();
+  if (!v) return true;
+  if (v.includes("pending upload")) return true;
+  if (v === "null" || v === "undefined") return true;
+  if (v.startsWith("blob:") || v.startsWith("data:")) return true;
+  return false;
+}
+
+async function uploadLocalFileToReplicate(replicate: Replicate, localPath: string, name: string): Promise<string> {
+  const buf = await readFile(localPath);
+  const uploaded = await replicate.files.create(buf, { filename: name });
+  const getUrl = uploaded?.urls?.get;
+  if (typeof getUrl !== "string" || !getUrl.startsWith("http")) {
+    throw new Error("Replicate file upload returned an invalid URL");
+  }
+  return getUrl;
+}
+
+async function applyCinematicColorGrade(inputPath: string, outputPath: string) {
+  const bin = resolveFfmpegBin(ffmpegPath);
+  const filter =
+    "eq=contrast=1.08:brightness=0.01:saturation=1.07:gamma=1.0,colorbalance=rs=0.005:gs=0.0:bs=-0.01,curves=all='0/0 0.18/0.14 0.50/0.52 0.82/0.90 1/1',format=yuv420p";
+  await execFileAsync(bin, [
+    "-y",
+    "-i", inputPath,
+    "-vf", filter,
+    "-c:v", "libx264",
+    "-preset", "fast",
+    "-crf", "20",
+    "-pix_fmt", "yuv420p",
+    "-c:a", "copy",
+    "-movflags", "+faststart",
+    outputPath,
+  ]);
+}
+
+type VisibleTestRenderOpts = {
+  maxInputSeconds?: number;
+  timeoutMs?: number;
+};
+
+async function applyVisibleTestRender(inputPath: string, outputPath: string, opts?: VisibleTestRenderOpts) {
+  const bin = resolveFfmpegBin(ffmpegPath);
+  const buildArgs = (audioMode: "copy" | "aac"): string[] => {
+    const args = ["-y"];
+    if (opts?.maxInputSeconds != null && opts.maxInputSeconds > 0) {
+      args.push("-t", String(opts.maxInputSeconds));
+    }
+    args.push(
+      "-i",
+      inputPath,
+      "-vf",
+      MOCK_VISIBLE_FILTER,
+      "-c:v",
+      "libx264",
+      "-preset",
+      "ultrafast",
+      "-crf",
+      "28",
+      "-pix_fmt",
+      "yuv420p",
+    );
+    if (audioMode === "copy") {
+      args.push("-c:a", "copy");
+    } else {
+      args.push("-c:a", "aac", "-b:a", "96k");
+    }
+    args.push("-movflags", "+faststart", outputPath);
+    return args;
+  };
+  const run = () =>
+    execFileAsync(bin, buildArgs("copy")).catch(() => execFileAsync(bin, buildArgs("aac")));
+  if (opts?.timeoutMs != null && opts.timeoutMs > 0) {
+    return withTimeout(run(), opts.timeoutMs, "Mock FFmpeg render timed out.");
+  }
+  return run();
+}
+
+type FrameStats = {
+  rgbMean: { r: number; g: number; b: number };
+  rgbStd: { r: number; g: number; b: number };
+  labMean: { l: number; a: number; b: number };
+  labStd: { l: number; a: number; b: number };
+  saturation: number;
+  luminance: number;
+  contrast: number;
+  blackPoint: number;
+  whitePoint: number;
+  shadowTint: { r: number; g: number; b: number };
+  highlightTint: { r: number; g: number; b: number };
+};
+
+function clamp(v: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, v));
+}
+
+function tailLog(raw: string, lines = 8): string {
+  return raw.split("\n").filter(Boolean).slice(-lines).join(" | ");
+}
+
+async function exists(pathname: string): Promise<boolean> {
+  try {
+    await access(pathname);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
+  let timer: NodeJS.Timeout | null = null;
+  const timeoutPromise = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+type MediaInfo = { duration: number; codec: string };
+
+async function probeMedia(inputPath: string): Promise<MediaInfo> {
+  const ffprobeBin = ffprobeStatic?.path || "ffprobe";
+  const { stdout } = await execFileAsync(ffprobeBin, [
+    "-v", "error",
+    "-select_streams", "v:0",
+    "-show_entries", "stream=codec_name:format=duration",
+    "-of", "default=noprint_wrappers=1:nokey=1",
+    inputPath,
+  ]);
+  const parts = stdout.split("\n").map((v) => v.trim()).filter(Boolean);
+  const codec = parts[0] ?? "unknown";
+  const duration = Number(parts[1] ?? "0");
+  return { codec, duration: Number.isFinite(duration) ? duration : 0 };
+}
+
+async function probeVideoFps(inputPath: string): Promise<number> {
+  const ffprobeBin = ffprobeStatic?.path || "ffprobe";
+  const { stdout } = await execFileAsync(ffprobeBin, [
+    "-v", "error",
+    "-select_streams", "v:0",
+    "-show_entries", "stream=avg_frame_rate",
+    "-of", "default=noprint_wrappers=1:nokey=1",
+    inputPath,
+  ]);
+  const raw = stdout.trim();
+  if (!raw) return 30;
+  if (raw.includes("/")) {
+    const [nRaw, dRaw] = raw.split("/");
+    const n = Number(nRaw);
+    const d = Number(dRaw);
+    if (Number.isFinite(n) && Number.isFinite(d) && d > 0) return clamp(n / d, 1, 60);
+  }
+  const v = Number(raw);
+  return Number.isFinite(v) ? clamp(v, 1, 60) : 30;
+}
+
+function updateJob(job: LockedColorJobState, patch: Partial<LockedColorJobState>) {
+  Object.assign(job, patch, { lastProgressAt: new Date().toISOString() });
+}
+
+function parseFfmpegTimeToSeconds(line: string): number | null {
+  const m = /time=(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)/.exec(line);
+  if (!m) return null;
+  const hh = Number(m[1]);
+  const mm = Number(m[2]);
+  const ss = Number(m[3]);
+  return hh * 3600 + mm * 60 + ss;
+}
+
+function encodeTimeoutMsForDuration(durationSec: number): number {
+  if (durationSec < 15) return 5 * 60_000;
+  if (durationSec <= 60) return 10 * 60_000;
+  if (durationSec <= 5 * 60) return 20 * 60_000;
+  return 30 * 60_000;
+}
+
+async function runFfmpegEncodeWithProgress(params: {
+  job: LockedColorJobState;
+  args: string[];
+  timeoutMs: number;
+  totalDurationSec: number;
+  progressStart: number;
+  progressEnd: number;
+}) {
+  const { job, args, timeoutMs, totalDurationSec, progressStart, progressEnd } = params;
+  const bin = resolveFfmpegBin(ffmpegPath);
+  const commandText = `${bin} ${args.join(" ")}`;
+  updateJob(job, {
+    ffmpegStarted: true,
+    ffmpegCommand: commandText,
+    ffmpegLastLog: "FFmpeg encode started.",
+    ffmpegProgressPercent: 0,
+    ffmpegElapsedSeconds: 0,
+    ffmpegExitCode: null,
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let lastLog = "";
+    let settled = false;
+
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      updateJob(job, {
+        ffmpegLastLog: "Timed out during final FFmpeg encode.",
+        ffmpegExitCode: -1,
+      });
+      child.kill("SIGTERM");
+      setTimeout(() => {
+        try { child.kill("SIGKILL"); } catch {}
+      }, 3000);
+      reject(new Error("Timed out during final FFmpeg encode."));
+    }, timeoutMs);
+
+    child.stderr.on("data", (chunk) => {
+      const text = String(chunk);
+      lastLog = text.trim() || lastLog;
+      const elapsed = parseFfmpegTimeToSeconds(text);
+      if (elapsed !== null) {
+        const frac = totalDurationSec > 0 ? clamp(elapsed / totalDurationSec, 0, 1) : 0;
+        const percent = Math.round(progressStart + frac * (progressEnd - progressStart));
+        updateJob(job, {
+          ffmpegElapsedSeconds: elapsed,
+          ffmpegProgressPercent: Math.round(frac * 100),
+          progressPercent: clamp(percent, progressStart, progressEnd),
+          ffmpegLastLog: tailLog(text, 3),
+        });
+      } else if (text.trim()) {
+        updateJob(job, { ffmpegLastLog: tailLog(text, 3) });
+      }
+    });
+
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      updateJob(job, { ffmpegExitCode: 1, ffmpegLastLog: err.message });
+      reject(err);
+    });
+
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      const exitCode = typeof code === "number" ? code : 1;
+      updateJob(job, {
+        ffmpegExitCode: exitCode,
+        ffmpegLastLog: lastLog ? tailLog(lastLog, 3) : "FFmpeg exited.",
+      });
+      if (exitCode === 0) resolve();
+      else reject(new Error(`FFmpeg exited with code ${exitCode}. ${lastLog}`));
+    });
+  });
+}
+
+function srgbToLinear(channel: number): number {
+  const c = channel / 255;
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+function rgbToLab(r: number, g: number, b: number): { l: number; a: number; b: number } {
+  const rl = srgbToLinear(r);
+  const gl = srgbToLinear(g);
+  const bl = srgbToLinear(b);
+  const x = rl * 0.4124564 + gl * 0.3575761 + bl * 0.1804375;
+  const y = rl * 0.2126729 + gl * 0.7151522 + bl * 0.072175;
+  const z = rl * 0.0193339 + gl * 0.119192 + bl * 0.9503041;
+  const xr = x / 0.95047;
+  const yr = y / 1.0;
+  const zr = z / 1.08883;
+  const f = (t: number) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+  const fx = f(xr);
+  const fy = f(yr);
+  const fz = f(zr);
+  return { l: 116 * fy - 16, a: 500 * (fx - fy), b: 200 * (fy - fz) };
+}
+
+async function extractRepresentativeFrames(inputPath: string, outputPrefix: string, isImage: boolean): Promise<string[]> {
+  const bin = resolveFfmpegBin(ffmpegPath);
+  if (isImage) {
+    const p = `${outputPrefix}-0.png`;
+    await execFileAsync(bin, ["-y", "-i", inputPath, "-vf", "scale=160:160:force_original_aspect_ratio=decrease,pad=160:160:(ow-iw)/2:(oh-ih)/2", "-frames:v", "1", p]);
+    return [p];
+  }
+  const ffprobeBin = ffprobeStatic?.path || "ffprobe";
+  let durationSec = 6;
+  try {
+    const { stdout } = await execFileAsync(ffprobeBin, ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", inputPath]);
+    durationSec = Math.max(1, Number(stdout.trim()) || 6);
+  } catch {
+    // keep default
+  }
+  const times = [0.2, 0.5, 0.8].map((ratio) => clamp(durationSec * ratio, 0.2, Math.max(0.2, durationSec - 0.2)));
+  const out: string[] = [];
+  for (let i = 0; i < times.length; i++) {
+    const p = `${outputPrefix}-${i}.png`;
+    out.push(p);
+    await execFileAsync(bin, [
+      "-y",
+      "-ss", times[i].toFixed(2),
+      "-i", inputPath,
+      "-vf", "thumbnail=40,scale=160:160:force_original_aspect_ratio=decrease,pad=160:160:(ow-iw)/2:(oh-ih)/2",
+      "-frames:v", "1",
+      p,
+    ]);
+  }
+  return out;
+}
+
+async function analyzeFrame(framePath: string): Promise<FrameStats> {
+  const ppmPath = `${framePath}.ppm`;
+  const bin = resolveFfmpegBin(ffmpegPath);
+  await execFileAsync(bin, ["-y", "-i", framePath, "-f", "image2", "-vcodec", "ppm", ppmPath]);
+  const buf = await readFile(ppmPath);
+  let idx = 0;
+  let nls = 0;
+  while (idx < buf.length && nls < 3) {
+    if (buf[idx] === 0x0a) nls++;
+    idx++;
+  }
+  const px: Array<{ r: number; g: number; b: number; lum: number; sat: number; labL: number; labA: number; labB: number }> = [];
+  for (let i = idx; i + 2 < buf.length; i += 3) {
+    const r = buf[i];
+    const g = buf[i + 1];
+    const b = buf[i + 2];
+    const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const sat = max === 0 ? 0 : (max - min) / max;
+    const lab = rgbToLab(r, g, b);
+    px.push({ r, g, b, lum, sat, labL: lab.l, labA: lab.a, labB: lab.b });
+  }
+  const n = Math.max(1, px.length);
+  let sr = 0, sg = 0, sb = 0, sl = 0, ss = 0, sll = 0, sla = 0, slb = 0;
+  for (const p of px) {
+    sr += p.r; sg += p.g; sb += p.b; sl += p.lum; ss += p.sat; sll += p.labL; sla += p.labA; slb += p.labB;
+  }
+  const mr = sr / n, mg = sg / n, mb = sb / n, ml = sl / n, ms = ss / n, mll = sll / n, mla = sla / n, mlb = slb / n;
+  let vr = 0, vg = 0, vb = 0, vl = 0, vll = 0, vla = 0, vlb = 0;
+  for (const p of px) {
+    vr += Math.pow(p.r - mr, 2);
+    vg += Math.pow(p.g - mg, 2);
+    vb += Math.pow(p.b - mb, 2);
+    vl += Math.pow(p.lum - ml, 2);
+    vll += Math.pow(p.labL - mll, 2);
+    vla += Math.pow(p.labA - mla, 2);
+    vlb += Math.pow(p.labB - mlb, 2);
+  }
+  const sorted = [...px].sort((a, b) => a.lum - b.lum);
+  const low = sorted.slice(0, Math.max(1, Math.floor(n * 0.08)));
+  const high = sorted.slice(Math.max(0, Math.floor(n * 0.92)));
+  const avgRgb = (items: typeof px) => {
+    let r = 0, g = 0, b = 0;
+    for (const p of items) { r += p.r; g += p.g; b += p.b; }
+    const d = Math.max(1, items.length);
+    return { r: r / d, g: g / d, b: b / d };
+  };
+  const shadowTint = avgRgb(low);
+  const highlightTint = avgRgb(high);
+  return {
+    rgbMean: { r: mr, g: mg, b: mb },
+    rgbStd: { r: Math.sqrt(vr / n), g: Math.sqrt(vg / n), b: Math.sqrt(vb / n) },
+    labMean: { l: mll, a: mla, b: mlb },
+    labStd: { l: Math.sqrt(vll / n), a: Math.sqrt(vla / n), b: Math.sqrt(vlb / n) },
+    saturation: ms,
+    luminance: ml,
+    contrast: Math.sqrt(vl / n),
+    blackPoint: low.reduce((acc, p) => acc + p.lum, 0) / Math.max(1, low.length),
+    whitePoint: high.reduce((acc, p) => acc + p.lum, 0) / Math.max(1, high.length),
+    shadowTint,
+    highlightTint,
+  };
+}
+
+async function averagePixelDifferencePercent(imageAPath: string, imageBPath: string): Promise<number> {
+  const ffmpegBin = resolveFfmpegBin(ffmpegPath);
+  const aPpm = `${imageAPath}.cmp.ppm`;
+  const bPpm = `${imageBPath}.cmp.ppm`;
+  const scale = "scale=160:160:force_original_aspect_ratio=decrease,pad=160:160:(ow-iw)/2:(oh-ih)/2";
+  await execFileAsync(ffmpegBin, ["-y", "-i", imageAPath, "-vf", scale, "-frames:v", "1", aPpm]);
+  await execFileAsync(ffmpegBin, ["-y", "-i", imageBPath, "-vf", scale, "-frames:v", "1", bPpm]);
+  const [aBuf, bBuf] = await Promise.all([readFile(aPpm), readFile(bPpm)]);
+  const skipHeader = (buf: Buffer) => {
+    let idx = 0;
+    let nls = 0;
+    while (idx < buf.length && nls < 3) {
+      if (buf[idx] === 0x0a) nls++;
+      idx++;
+    }
+    return idx;
+  };
+  const aStart = skipHeader(aBuf);
+  const bStart = skipHeader(bBuf);
+  const length = Math.min(aBuf.length - aStart, bBuf.length - bStart);
+  if (length <= 0) return 0;
+  let diff = 0;
+  for (let i = 0; i < length; i++) {
+    diff += Math.abs(aBuf[aStart + i] - bBuf[bStart + i]);
+  }
+  const max = length * 255;
+  return (diff / max) * 100;
+}
+
+async function sha256ForFile(filePath: string): Promise<string> {
+  const buf = await readFile(filePath);
+  return createHash("sha256").update(buf).digest("hex");
+}
+
+/** Fast content fingerprint for mock mode — avoids reading multi‑GB uploads. */
+async function sha256PrefixForFile(filePath: string, maxBytes = 512 * 1024): Promise<string> {
+  const st = await stat(filePath);
+  const toRead = Math.min(maxBytes, st.size);
+  const fh = await open(filePath, "r");
+  try {
+    const buf = Buffer.alloc(toRead);
+    const { bytesRead } = await fh.read(buf, 0, toRead, 0);
+    const body = bytesRead === toRead ? buf : buf.subarray(0, bytesRead);
+    return createHash("sha256").update(`size:${st.size}:`).update(body).digest("hex");
+  } finally {
+    await fh.close();
+  }
+}
+
+async function extractFrameAtTime(inputPath: string, timeSec: number, outPath: string): Promise<void> {
+  const bin = resolveFfmpegBin(ffmpegPath);
+  await execFileAsync(bin, [
+    "-y",
+    "-ss", Math.max(0, timeSec).toFixed(3),
+    "-i", inputPath,
+    "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2",
+    "-frames:v", "1",
+    outPath,
+  ]);
+}
+
+function averageStats(samples: FrameStats[]): FrameStats {
+  const c = Math.max(1, samples.length);
+  const sum = samples.reduce((acc, s) => ({
+    rgbMean: { r: acc.rgbMean.r + s.rgbMean.r, g: acc.rgbMean.g + s.rgbMean.g, b: acc.rgbMean.b + s.rgbMean.b },
+    rgbStd: { r: acc.rgbStd.r + s.rgbStd.r, g: acc.rgbStd.g + s.rgbStd.g, b: acc.rgbStd.b + s.rgbStd.b },
+    labMean: { l: acc.labMean.l + s.labMean.l, a: acc.labMean.a + s.labMean.a, b: acc.labMean.b + s.labMean.b },
+    labStd: { l: acc.labStd.l + s.labStd.l, a: acc.labStd.a + s.labStd.a, b: acc.labStd.b + s.labStd.b },
+    saturation: acc.saturation + s.saturation,
+    luminance: acc.luminance + s.luminance,
+    contrast: acc.contrast + s.contrast,
+    blackPoint: acc.blackPoint + s.blackPoint,
+    whitePoint: acc.whitePoint + s.whitePoint,
+    shadowTint: { r: acc.shadowTint.r + s.shadowTint.r, g: acc.shadowTint.g + s.shadowTint.g, b: acc.shadowTint.b + s.shadowTint.b },
+    highlightTint: { r: acc.highlightTint.r + s.highlightTint.r, g: acc.highlightTint.g + s.highlightTint.g, b: acc.highlightTint.b + s.highlightTint.b },
+  }), {
+    rgbMean: { r: 0, g: 0, b: 0 },
+    rgbStd: { r: 0, g: 0, b: 0 },
+    labMean: { l: 0, a: 0, b: 0 },
+    labStd: { l: 0, a: 0, b: 0 },
+    saturation: 0,
+    luminance: 0,
+    contrast: 0,
+    blackPoint: 0,
+    whitePoint: 0,
+    shadowTint: { r: 0, g: 0, b: 0 },
+    highlightTint: { r: 0, g: 0, b: 0 },
+  });
+  return {
+    rgbMean: { r: sum.rgbMean.r / c, g: sum.rgbMean.g / c, b: sum.rgbMean.b / c },
+    rgbStd: { r: sum.rgbStd.r / c, g: sum.rgbStd.g / c, b: sum.rgbStd.b / c },
+    labMean: { l: sum.labMean.l / c, a: sum.labMean.a / c, b: sum.labMean.b / c },
+    labStd: { l: sum.labStd.l / c, a: sum.labStd.a / c, b: sum.labStd.b / c },
+    saturation: sum.saturation / c,
+    luminance: sum.luminance / c,
+    contrast: sum.contrast / c,
+    blackPoint: sum.blackPoint / c,
+    whitePoint: sum.whitePoint / c,
+    shadowTint: { r: sum.shadowTint.r / c, g: sum.shadowTint.g / c, b: sum.shadowTint.b / c },
+    highlightTint: { r: sum.highlightTint.r / c, g: sum.highlightTint.g / c, b: sum.highlightTint.b / c },
+  };
+}
+
+type LockedRefFilterBuild = {
+  filter: string;
+  yellowCastReduction: number;
+  greenCastReduction: number;
+  brightnessShift: number;
+  saturationShift: number;
+  contrastShift: number;
+  whiteBalanceProtection: boolean;
+};
+
+/**
+ * Controlled reference “mood” transfer: tight limits on WB / gamma / saturation so the output
+ * cannot absorb full warm, green, crushed, or blown highlights from the reference.
+ */
+function buildLockedReferenceFilter(
+  target: FrameStats,
+  reference: FrameStats,
+  strength: number,
+  exposureStrength: number,
+  contrastStrength: number,
+  saturationStrength: number,
+  whiteBalanceStrength: number,
+  shadowHighlightStrength: number,
+  preserveSkinTone: boolean,
+  preserveTargetLuminance: boolean,
+): LockedRefFilterBuild {
+  const whiteBalanceProtection = true;
+  const s = clamp(strength, 0.05, 0.65);
+
+  const refRbWarm = Math.max(0, reference.rgbMean.r - reference.rgbMean.b) / 255;
+  const yellowLab = Math.max(0, reference.labMean.b - 2) / 30;
+  const yellowCastReduction = clamp(refRbWarm * 0.9 + yellowLab * 0.55, 0, 0.96);
+
+  const refGreenBias = Math.max(0, reference.rgbMean.g - (reference.rgbMean.r + reference.rgbMean.b) / 2) / 255;
+  const greenLab = Math.max(0, -reference.labMean.a - 2) / 30;
+  const greenCastReduction = clamp(refGreenBias * 0.95 + greenLab * 0.55, 0, 0.96);
+
+  const castTone = clamp(yellowCastReduction * 0.62 + greenCastReduction * 0.58, 0, 0.88);
+  const lumPreserve = preserveTargetLuminance ? 0.26 : 1;
+
+  const eStr = clamp(exposureStrength, 0, 1.25) * lumPreserve;
+  const cStr = clamp(contrastStrength, 0, 1.25);
+  const satStr = clamp(saturationStrength, 0, 1.25);
+  const wbStr = clamp(whiteBalanceStrength, 0, 1.25);
+  const shStr = clamp(shadowHighlightStrength, 0, 1.25) * lumPreserve;
+
+  const skin = preserveSkinTone ? 0.54 : 1;
+  const wbDampen = 1 - castTone * 0.48 * s;
+
+  const mixWB = (ratioRaw: number, yellowAxis: number, greenAxis: number) => {
+    const toward =
+      1 +
+      (ratioRaw - 1) *
+        wbDampen *
+        (1 - yellowAxis * yellowCastReduction * 0.55) *
+        (1 - greenAxis * greenCastReduction * 0.5);
+    const scaled = 1 + (toward - 1) * s * wbStr * skin;
+    return clamp(scaled, 0.93, 1.09);
+  };
+
+  const rRaw = reference.rgbMean.r / Math.max(8, target.rgbMean.r);
+  const gRaw = reference.rgbMean.g / Math.max(8, target.rgbMean.g);
+  const bRaw = reference.rgbMean.b / Math.max(8, target.rgbMean.b);
+
+  const rr = mixWB(rRaw, 1, 0.25);
+  const gg = mixWB(gRaw, 0.35, 1);
+  const bb = mixWB(bRaw, 0.55, 0.35);
+
+  const satRatioRaw = reference.saturation / Math.max(0.001, target.saturation);
+  const satRatio = clamp(satRatioRaw, 0.9, 1.12);
+  const sat = clamp(1 + (satRatio - 1) * s * satStr * skin * (1 - castTone * 0.42), 0.91, 1.14);
+
+  const contrastRatioRaw = reference.contrast / Math.max(1, target.contrast);
+  const contrastRatio = clamp(contrastRatioRaw, 0.93, 1.1);
+  const contrast = clamp(1 + (contrastRatio - 1) * s * cStr * (1 - castTone * 0.22), 0.92, 1.12);
+
+  const gamma = clamp(
+    1 +
+      ((reference.luminance - target.luminance) / 255) * 0.055 * eStr * (1 - yellowCastReduction * 0.18),
+    0.965,
+    1.042,
+  );
+  const brightness = clamp((reference.luminance - target.luminance) / 255 * 0.032 * eStr, -0.02, 0.02);
+
+  const shadowBlueShift = clamp((reference.shadowTint.b - target.shadowTint.b) / 255 * 0.14 * shStr, -0.04, 0.04);
+  const highlightWarmth = clamp(
+    ((reference.highlightTint.r - target.highlightTint.r) - (reference.highlightTint.b - target.highlightTint.b)) /
+      255 *
+      0.12 *
+      shStr *
+      (1 - yellowCastReduction * 0.62),
+    -0.04,
+    0.04,
+  );
+
+  const lowIn = 0.18;
+  const highIn = 0.82;
+  const lowOut = clamp(lowIn + ((reference.blackPoint - target.blackPoint) / 255) * 0.09 * s * shStr, 0.14, 0.29);
+  const highOut = clamp(highIn + ((reference.whitePoint - target.whitePoint) / 255) * 0.09 * s * shStr, 0.73, 0.93);
+  const midOut = clamp(0.5 + ((reference.labMean.l - target.labMean.l) / 100) * 0.09 * s * shStr, 0.43, 0.57);
+
+  const filter =
+    `colorchannelmixer=rr=${rr.toFixed(4)}:gg=${gg.toFixed(4)}:bb=${bb.toFixed(4)},` +
+    `eq=contrast=${contrast.toFixed(4)}:brightness=${brightness.toFixed(4)}:saturation=${sat.toFixed(4)}:gamma=${gamma.toFixed(4)},` +
+    `colorbalance=rs=${(highlightWarmth * 0.4).toFixed(4)}:gs=${(-highlightWarmth * 0.22).toFixed(4)}:bs=${(shadowBlueShift * 0.62).toFixed(4)}:rm=${(highlightWarmth * 0.36).toFixed(4)}:gm=${(-highlightWarmth * 0.18).toFixed(4)}:bm=${(shadowBlueShift * 0.5).toFixed(4)}:rh=${(highlightWarmth * 0.52).toFixed(4)}:gh=${(-highlightWarmth * 0.2).toFixed(4)}:bh=${(shadowBlueShift * 0.56).toFixed(4)},` +
+    `curves=all='0/0 ${lowIn.toFixed(2)}/${lowOut.toFixed(2)} 0.50/${midOut.toFixed(2)} ${highIn.toFixed(2)}/${highOut.toFixed(2)} 1/1',format=yuv420p`;
+
+  return {
+    filter,
+    yellowCastReduction,
+    greenCastReduction,
+    brightnessShift: brightness,
+    saturationShift: sat - 1,
+    contrastShift: contrast - 1,
+    whiteBalanceProtection,
+  };
+}
+
+type LockedRefPassResult = {
+  avgDiffPercent: number;
+  afterStats: FrameStats;
+  filterComplex: string;
+  filterMeta: LockedRefFilterBuild;
+  outputStat: Awaited<ReturnType<typeof stat>>;
+  outputInfo: MediaInfo;
+  outputFileHash: string;
+  inputOutputHashesDifferent: boolean;
+  sampledFrameDiffs: LockedColorJobState["sampledFrameDiffs"];
+  sampleFrames: Array<{ target: string; reference: string; output: string }>;
+  colorDeltaBeforeToReference: number;
+  colorDeltaAfterToReference: number;
+};
+
+async function runLockedReferenceEncodeSamplePass(params: {
+  job: LockedColorJobState;
+  jobId: string;
+  resolvedInputPath: string;
+  safeReferencePath: string;
+  refIsImage: boolean;
+  sourceFramePattern: string;
+  processedFramePattern: string;
+  processedFramesDir: string;
+  outputPath: string;
+  targetFps: number;
+  encodeTimeoutMs: number;
+  effectiveDuration: number;
+  preserveOriginalAudio: boolean;
+  targetStats: FrameStats;
+  referenceStats: FrameStats;
+  targetInfo: MediaInfo;
+  passStrength: number;
+  exposureMatchStrength: number;
+  contrastMatchStrength: number;
+  saturationMatchStrength: number;
+  whiteBalanceStrength: number;
+  toneCurveStrength: number;
+  preserveSkinTone: boolean;
+  preserveTargetLuminance: boolean;
+  inputFileHash: string;
+}): Promise<LockedRefPassResult> {
+  const {
+    job,
+    jobId,
+    resolvedInputPath,
+    safeReferencePath,
+    refIsImage,
+    sourceFramePattern,
+    processedFramePattern,
+    processedFramesDir,
+    outputPath,
+    targetFps,
+    encodeTimeoutMs,
+    effectiveDuration,
+    preserveOriginalAudio,
+    targetStats,
+    referenceStats,
+    targetInfo,
+    passStrength,
+    exposureMatchStrength,
+    contrastMatchStrength,
+    saturationMatchStrength,
+    whiteBalanceStrength,
+    toneCurveStrength,
+    preserveSkinTone,
+    preserveTargetLuminance,
+    inputFileHash,
+  } = params;
+
+  const fb = buildLockedReferenceFilter(
+    targetStats,
+    referenceStats,
+    passStrength,
+    exposureMatchStrength,
+    contrastMatchStrength,
+    saturationMatchStrength,
+    whiteBalanceStrength,
+    toneCurveStrength,
+    preserveSkinTone,
+    preserveTargetLuminance,
+  );
+  const filterComplex = fb.filter;
+
+  updateJob(job, {
+    transformStrength: passStrength,
+    filterGraphUsed: filterComplex,
+    yellowCastReduction: fb.yellowCastReduction,
+    greenCastReduction: fb.greenCastReduction,
+    brightnessShift: fb.brightnessShift,
+    saturationShift: fb.saturationShift,
+    contrastShift: fb.contrastShift,
+    whiteBalanceProtection: fb.whiteBalanceProtection,
+    preserveTargetLuminance,
+    actualEngineUsed: "ffmpeg",
+  });
+
+  const ffmpegBin = resolveFfmpegBin(ffmpegPath);
+
+  await runFfmpegEncodeWithProgress({
+    job,
+    args: [
+      "-y",
+      "-framerate",
+      targetFps.toFixed(3),
+      "-i",
+      sourceFramePattern,
+      "-vf",
+      filterComplex,
+      processedFramePattern,
+    ],
+    timeoutMs: Math.max(180_000, Math.floor(encodeTimeoutMs * 0.6)),
+    totalDurationSec: Math.max(1, effectiveDuration),
+    progressStart: 84,
+    progressEnd: 89,
+  });
+
+  const firstProcessedFrame = path.join(processedFramesDir, "frame_000001.png");
+  const processedExists = await exists(firstProcessedFrame);
+  if (!processedExists) {
+    throw new Error("Color transfer did not create processed frames.");
+  }
+  updateJob(job, { processedFramesCreated: true });
+
+  updateJob(job, { status: "encoding", currentStep: "encoding", progressPercent: 70, encodeStarted: true });
+  try {
+    const baseArgs = [
+      "-y",
+      "-framerate",
+      targetFps.toFixed(3),
+      "-i",
+      processedFramePattern,
+      "-i",
+      resolvedInputPath,
+      "-map",
+      "0:v:0",
+      "-map",
+      "1:a?",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "ultrafast",
+      "-crf",
+      "23",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      preserveOriginalAudio ? "copy" : "aac",
+      ...(preserveOriginalAudio ? [] : ["-b:a", "128k"]),
+      "-shortest",
+      "-movflags",
+      "+faststart",
+      outputPath,
+    ];
+    await runFfmpegEncodeWithProgress({
+      job,
+      args: baseArgs,
+      timeoutMs: encodeTimeoutMs,
+      totalDurationSec: Math.max(1, effectiveDuration),
+      progressStart: 90,
+      progressEnd: 99,
+    });
+    updateJob(job, { ffmpegExitCode: 0, ffmpegLastLog: "Encode completed.", ffmpegProgressPercent: 100 });
+  } catch (err: unknown) {
+    const message = String((err as { message?: string })?.message ?? "");
+    const audioCopyFailed = /audio|stream|copy|codec/i.test(message) && preserveOriginalAudio;
+    const timedOut = /Timed out during final FFmpeg encode/i.test(message);
+    if (audioCopyFailed) {
+      updateJob(job, { ffmpegLastLog: "Audio copy failed, retrying with AAC 128k fallback." });
+      const retryAudioArgs = [
+        "-y",
+        "-framerate",
+        targetFps.toFixed(3),
+        "-i",
+        processedFramePattern,
+        "-i",
+        resolvedInputPath,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        outputPath,
+      ];
+      await runFfmpegEncodeWithProgress({
+        job,
+        args: retryAudioArgs,
+        timeoutMs: encodeTimeoutMs,
+        totalDurationSec: Math.max(1, effectiveDuration),
+        progressStart: 90,
+        progressEnd: 99,
+      });
+    } else if (timedOut) {
+      updateJob(job, { ffmpegLastLog: "Primary encode timed out, retrying once with faster fallback settings." });
+      const retryFastArgs = [
+        "-y",
+        "-framerate",
+        targetFps.toFixed(3),
+        "-i",
+        processedFramePattern,
+        "-i",
+        resolvedInputPath,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "24",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        outputPath,
+      ];
+      await runFfmpegEncodeWithProgress({
+        job,
+        args: retryFastArgs,
+        timeoutMs: Math.max(5 * 60_000, Math.floor(encodeTimeoutMs * 0.75)),
+        totalDurationSec: Math.max(1, effectiveDuration),
+        progressStart: 90,
+        progressEnd: 99,
+      });
+    } else {
+      const msg = `FFmpeg encode failed: ${message || "unknown error"}`;
+      updateJob(job, { ffmpegExitCode: 1, ffmpegLastLog: msg });
+      throw new Error(msg);
+    }
+  }
+
+  const outputStat = await withTimeout(stat(outputPath), 20_000, "Timed out while verifying output file save.");
+  updateJob(job, { processedFramesUsedInEncode: true });
+  const processedFramePath = path.join(UPLOADS_DIR, `${jobId}-processed-sample.png`);
+  await execFileAsync(ffmpegBin, ["-y", "-ss", "0.5", "-i", outputPath, "-frames:v", "1", "-q:v", "2", processedFramePath]);
+  const afterStats = await analyzeFrame(processedFramePath);
+
+  const verificationFailureMsg = "Final video verification failed. The app cannot prove color transfer was applied.";
+  const outputInfo = await withTimeout(probeMedia(outputPath), 20_000, "Timed out while probing output media.");
+  const outputFileHash = await withTimeout(sha256ForFile(outputPath), 60_000, "Timed out while hashing output file.");
+  if (!outputFileHash) {
+    throw new Error(verificationFailureMsg);
+  }
+  const inputOutputHashesDifferent = outputFileHash !== inputFileHash;
+  if (!inputOutputHashesDifferent) {
+    throw new Error("Final output file is identical to input. Color transfer was not applied.");
+  }
+
+  const samplePercents = [10, 30, 50, 70, 90];
+  const sampledFrameDiffs: LockedColorJobState["sampledFrameDiffs"] = [];
+  const sampleFrames: Array<{ target: string; reference: string; output: string }> = [];
+  let sampledBeforeDelta = 0;
+  let sampledAfterDelta = 0;
+  const referenceDuration = Math.max(0.1, job.referenceDuration ?? targetInfo.duration);
+  const safeOutputDuration = Math.max(0.1, outputInfo.duration);
+  for (let i = 0; i < samplePercents.length; i++) {
+    const percent = samplePercents[i];
+    const ratio = percent / 100;
+    const targetSamplePath = path.join(UPLOADS_DIR, `${jobId}-target-sample-${percent}.jpg`);
+    const referenceSamplePath = path.join(UPLOADS_DIR, `${jobId}-reference-sample-${percent}.jpg`);
+    const outputSamplePath = path.join(UPLOADS_DIR, `${jobId}-output-sample-${percent}.jpg`);
+    const sampleTime = clamp(targetInfo.duration * ratio, 0, Math.max(0, targetInfo.duration - 0.1));
+    await extractFrameAtTime(resolvedInputPath, sampleTime, targetSamplePath);
+    await extractFrameAtTime(
+      safeReferencePath,
+      refIsImage ? 0 : clamp(referenceDuration * ratio, 0, Math.max(0, referenceDuration - 0.1)),
+      referenceSamplePath,
+    );
+    await extractFrameAtTime(
+      outputPath,
+      clamp(safeOutputDuration * ratio, 0, Math.max(0, safeOutputDuration - 0.1)),
+      outputSamplePath,
+    );
+    sampleFrames.push({ target: targetSamplePath, reference: referenceSamplePath, output: outputSamplePath });
+    const diffPercent = await averagePixelDifferencePercent(targetSamplePath, outputSamplePath);
+    sampledFrameDiffs.push({
+      timestamp: Number(sampleTime.toFixed(3)),
+      inputFrameUrl: `/api/uploads/${path.basename(targetSamplePath)}`,
+      outputFrameUrl: `/api/uploads/${path.basename(outputSamplePath)}`,
+      referenceFrameUrl: `/api/uploads/${path.basename(referenceSamplePath)}`,
+      averagePixelDifferencePercent: diffPercent,
+    });
+    const [targetSampleStats, referenceSampleStats, outputSampleStats] = await Promise.all([
+      analyzeFrame(targetSamplePath),
+      analyzeFrame(referenceSamplePath),
+      analyzeFrame(outputSamplePath),
+    ]);
+    sampledBeforeDelta += Math.sqrt(
+      Math.pow(targetSampleStats.labMean.l - referenceSampleStats.labMean.l, 2) +
+        Math.pow(targetSampleStats.labMean.a - referenceSampleStats.labMean.a, 2) +
+        Math.pow(targetSampleStats.labMean.b - referenceSampleStats.labMean.b, 2),
+    );
+    sampledAfterDelta += Math.sqrt(
+      Math.pow(outputSampleStats.labMean.l - referenceSampleStats.labMean.l, 2) +
+        Math.pow(outputSampleStats.labMean.a - referenceSampleStats.labMean.a, 2) +
+        Math.pow(outputSampleStats.labMean.b - referenceSampleStats.labMean.b, 2),
+    );
+  }
+  const avgDiffPercent =
+    sampledFrameDiffs.reduce((acc, sample) => acc + sample.averagePixelDifferencePercent, 0) /
+    Math.max(1, sampledFrameDiffs.length);
+  if (sampledFrameDiffs.length === 0) {
+    throw new Error(verificationFailureMsg);
+  }
+  const colorDeltaBeforeToReference = sampledBeforeDelta / Math.max(1, sampledFrameDiffs.length);
+  const colorDeltaAfterToReference = sampledAfterDelta / Math.max(1, sampledFrameDiffs.length);
+
+  return {
+    avgDiffPercent,
+    afterStats,
+    filterComplex,
+    filterMeta: fb,
+    outputStat,
+    outputInfo,
+    outputFileHash,
+    inputOutputHashesDifferent,
+    sampledFrameDiffs,
+    sampleFrames,
+    colorDeltaBeforeToReference,
+    colorDeltaAfterToReference,
+  };
+}
+
+async function ensureReferenceVideoReadable(referencePath: string, jobId: string): Promise<string> {
+  const ext = path.extname(referencePath).toLowerCase();
+  if (ext === ".mp4") return referencePath;
+  const transcoded = path.join(UPLOADS_DIR, `${jobId}-reference-safe.mp4`);
+  const bin = resolveFfmpegBin(ffmpegPath);
+  await execFileAsync(bin, [
+    "-y",
+    "-i", referencePath,
+    "-c:v", "libx264",
+    "-preset", "fast",
+    "-crf", "20",
+    "-pix_fmt", "yuv420p",
+    "-c:a", "aac",
+    "-b:a", "128k",
+    "-movflags", "+faststart",
+    transcoded,
+  ]);
+  return transcoded;
+}
+
+async function runMockLockedReferenceColorJob(params: {
+  job: LockedColorJobState;
+  jobId: string;
+  targetPath: string;
+  referencePath: string;
+  targetVideoUrl: string;
+  referenceVideoUrl: string;
+  referenceImageUrl: string;
+  resolvedInputPath: string;
+  colorMatchStrength: number;
+  exposureMatchStrength: number;
+  contrastMatchStrength: number;
+  saturationMatchStrength: number;
+  whiteBalanceStrength: number;
+  toneCurveStrength: number;
+}) {
+  const {
+    job,
+    jobId,
+    targetVideoUrl,
+    referenceVideoUrl,
+    referenceImageUrl,
+    resolvedInputPath,
+    colorMatchStrength,
+    exposureMatchStrength,
+    contrastMatchStrength,
+    saturationMatchStrength,
+    whiteBalanceStrength,
+    toneCurveStrength,
+  } = params;
+
+  const mockTimeout = getMockRenderTimeoutMs();
+  const maxEncodeSeconds = Math.min(getMockEncodeMaxSeconds(), 15);
+
+  const targetInfo = await withTimeout(probeMedia(resolvedInputPath), 6_000, "Timed out probing target media.");
+  const inputStat = await withTimeout(stat(resolvedInputPath), 4_000, "Timed out while reading input file metadata.");
+  const inputFileHash = `mock-in:${jobId}:${inputStat.size}`;
+
+  // No reference probe, no frame extraction, no sampled diffs — single FFmpeg pass only.
+  updateJob(job, {
+    targetDuration: targetInfo.duration,
+    targetCodec: targetInfo.codec,
+    inputDurationSeconds: targetInfo.duration,
+    inputFileSize: inputStat.size,
+    inputFileHash,
+    status: "processing",
+    currentStep: "mock_ffmpeg_encode",
+    progressPercent: 30,
+    heavyColorTransferSkipped: true,
+    analyzeReferenceComplete: true,
+    warning: null,
+    referenceDuration: null,
+    referenceCodec: null,
+    colorTransferStarted: false,
+    referenceFrameExtracted: false,
+    targetFrameExtracted: false,
+    colorStatsComputed: false,
+  });
+
+  const outputPath = path.join(VIDEOS_DIR, `${jobId}-locked-color-match.mp4`);
+  await runMockLockedColorFfmpeg(resolvedInputPath, outputPath, {
+    maxSeconds: maxEncodeSeconds,
+    timeoutMs: mockTimeout,
+  });
+
+  const finalOutputUrl = `/api/videos-files/${jobId}-locked-color-match.mp4`;
+  const resolvedOutputPath = parseAssetPath(finalOutputUrl) ?? outputPath;
+  const outputInfo = await withTimeout(probeMedia(resolvedOutputPath), 6_000, "Timed out probing mock output.");
+  const outputStat = await withTimeout(stat(resolvedOutputPath), 4_000, "Timed out reading mock output.");
+  const outputFileHash = `mock-out:${jobId}:${outputStat.size}`;
+  if (!(outputStat.size > 0 && outputInfo.duration > 0)) {
+    throw new Error("Mock encode produced no playable output.");
+  }
+
+  await withTimeout(makeThumbnail(resolvedOutputPath, path.join(THUMBS_DIR, `${jobId}.jpg`)), 8_000, "Timed out creating thumbnail.");
+
+  updateJob(job, {
+    status: "complete",
+    currentStep: "complete",
+    progressPercent: 100,
+    heavyColorTransferSkipped: true,
+    encodeStarted: true,
+    encodeCompleted: true,
+    colorTransferCompleted: true,
+    finalOutputUrl,
+    outputFileExists: true,
+    outputFileSize: outputStat.size,
+    outputFileHash,
+    outputDurationSeconds: outputInfo.duration,
+    inputOutputHashesDifferent: true,
+    sampledFrameDiffs: [],
+    averagePixelDifferencePercent: 0,
+    visibleChangeDetected: true,
+    colorTransformApplied: false,
+    processedFramesCreated: false,
+    processedFramesUsedInEncode: true,
+    filterGraphUsed: MOCK_FAST_EQ_FILTER,
+    transformStrength: colorMatchStrength,
+    exposureMatchStrength,
+    contrastMatchStrength,
+    saturationMatchStrength,
+    whiteBalanceStrength,
+    toneCurveStrength,
+    error: null,
+    thumbnailUrl: `/api/thumbs/${jobId}.jpg`,
+    actualEngineUsed: "ffmpeg-mock-eq",
+    preserveTargetLuminance: false,
+    whiteBalanceProtection: false,
+    yellowCastReduction: 0,
+    greenCastReduction: 0,
+    brightnessShift: 0,
+    saturationShift: 0,
+    contrastShift: 0,
+    rerenderedBecauseTooStrong: false,
+    targetFrameSampleBefore: "",
+    referenceFrameSample: "",
+    processedFrameSampleAfter: "",
+    actualFinalOutputUrl: finalOutputUrl,
+    targetVideoUrl,
+    referenceVideoUrl,
+    referenceImageUrl,
+    debugProof: {
+      renderMode: "mock",
+      paidAiCalled: false,
+      mockOutputGenerated: true,
+      heavyColorTransferSkipped: true,
+      finalOutputUrl: "present",
+      verificationPassed: true,
+      mode: "locked_reference_color_match",
+      progressPercent: 100,
+      currentStep: "complete",
+      analyzeReferenceComplete: true,
+      colorTransferComplete: true,
+      encodeComplete: true,
+      inputFileHash,
+      outputFileHash,
+      inputOutputHashesDifferent: true,
+      inputFileSize: inputStat.size,
+      inputDurationSeconds: targetInfo.duration,
+      outputDurationSeconds: outputInfo.duration,
+      sampledFrameDiffs: [],
+      filterGraphUsed: MOCK_FAST_EQ_FILTER,
+      actualEngineUsed: "ffmpeg-mock-eq",
+      preserveTargetLuminance: false,
+      whiteBalanceProtection: false,
+      yellowCastReduction: 0,
+      greenCastReduction: 0,
+      brightnessShift: 0,
+      saturationShift: 0,
+      contrastShift: 0,
+      rerenderedBecauseTooStrong: false,
+      error: null,
+    },
+  });
+}
+
+async function runLockedReferenceColorJob(params: {
+  job: LockedColorJobState;
+  jobId: string;
+  targetPath: string;
+  referencePath: string;
+  targetVideoUrl: string;
+  referenceVideoUrl: string;
+  referenceImageUrl: string;
+  colorMatchStrength: number;
+  exposureMatchStrength: number;
+  contrastMatchStrength: number;
+  saturationMatchStrength: number;
+  whiteBalanceStrength: number;
+  toneCurveStrength: number;
+  preserveSkinTone: boolean;
+  preserveOriginalAudio: boolean;
+  preserveTargetLuminance: boolean;
+}) {
+  const {
+    job,
+    jobId,
+    targetPath,
+    referencePath,
+    targetVideoUrl,
+    referenceVideoUrl,
+    referenceImageUrl,
+    colorMatchStrength,
+    exposureMatchStrength,
+    contrastMatchStrength,
+    saturationMatchStrength,
+    whiteBalanceStrength,
+    toneCurveStrength,
+    preserveSkinTone,
+    preserveOriginalAudio,
+    preserveTargetLuminance,
+  } = params;
+  try {
+    updateJob(job, {
+      status: "validating",
+      currentStep: "validating",
+      progressPercent: 10,
+      targetVideoUrl,
+      referenceVideoUrl,
+      referenceImageUrl,
+      targetFileExists: await exists(targetPath),
+      referenceFileExists: await exists(referencePath),
+    });
+    if (!job.targetFileExists) throw new Error("Target media file not found on server.");
+    if (!job.referenceFileExists) throw new Error("Reference media file not found on server.");
+
+    const resolvedInputPath = parseAssetPath(targetVideoUrl) ?? targetPath;
+
+    const targetInfo = await withTimeout(
+      probeMedia(resolvedInputPath),
+      20_000,
+      "Timed out probing target media.",
+    );
+    const inputStat = await withTimeout(
+      stat(resolvedInputPath),
+      20_000,
+      "Timed out while reading input file metadata.",
+    );
+    const inputFileHash = await withTimeout(
+      sha256ForFile(resolvedInputPath),
+      60_000,
+      "Timed out while hashing input file.",
+    );
+    if (!inputFileHash) {
+      throw new Error("Input file hash could not be computed.");
+    }
+    const encodeTimeoutMs = encodeTimeoutMsForDuration(targetInfo.duration);
+    const devTrimSeconds = Number(process.env.COLOR_MATCH_TEST_SECONDS ?? "0");
+    const effectiveTrimSeconds = Number.isFinite(devTrimSeconds) && devTrimSeconds > 0 ? devTrimSeconds : 0;
+    const effectiveDuration = effectiveTrimSeconds > 0 ? Math.min(targetInfo.duration, effectiveTrimSeconds) : targetInfo.duration;
+    const longVideoWarning =
+      targetInfo.duration > 5 * 60
+        ? "Long input detected (>5 min). Processing as background job with extended encode timeout."
+        : null;
+    updateJob(job, {
+      targetDuration: targetInfo.duration,
+      targetCodec: targetInfo.codec,
+      inputDurationSeconds: targetInfo.duration,
+      inputFileSize: inputStat.size,
+      inputFileHash,
+      status: "uploading",
+      currentStep: "preparing_files",
+      progressPercent: 20,
+      warning: longVideoWarning,
+    });
+
+    const refIsImage = IMAGE_EXTS.has(path.extname(referencePath).toLowerCase());
+    let safeReferencePath = referencePath;
+    if (!refIsImage) {
+      safeReferencePath = await withTimeout(
+        ensureReferenceVideoReadable(referencePath, jobId),
+        60_000,
+        "Timed out transcoding reference video to safe format.",
+      );
+      const refInfo = await withTimeout(
+        probeMedia(safeReferencePath),
+        20_000,
+        "Timed out probing reference media.",
+      );
+      updateJob(job, { referenceDuration: refInfo.duration, referenceCodec: refInfo.codec });
+    }
+
+    updateJob(job, { status: "processing", currentStep: "processing", progressPercent: 40, ffmpegStarted: true });
+    let targetFrames: string[] = [];
+    let referenceFrames: string[] = [];
+    try {
+      targetFrames = await withTimeout(
+        extractRepresentativeFrames(resolvedInputPath, `${resolvedInputPath}-sample`, false),
+        45_000,
+        "Timed out during target frame extraction.",
+      );
+      referenceFrames = await withTimeout(
+        extractRepresentativeFrames(safeReferencePath, `${safeReferencePath}-sample`, refIsImage),
+        45_000,
+        "Timed out during reference frame extraction.",
+      );
+    } catch (err: any) {
+      const stderr = typeof err?.stderr === "string" ? tailLog(err.stderr) : "";
+      const msg = `FFmpeg failed during reference analysis: ${stderr || err?.message || "unknown error"}`;
+      updateJob(job, { ffmpegLastLog: msg, ffmpegExitCode: 1 });
+      throw new Error(msg);
+    }
+    updateJob(job, {
+      framesExtracted: targetFrames.length,
+      referenceFramesExtracted: referenceFrames.length,
+      targetFrameExtracted: targetFrames.length > 0,
+      referenceFrameExtracted: referenceFrames.length > 0,
+      analyzeReferenceComplete: true,
+    });
+    if (!targetFrames.length) {
+      throw new Error("Failed to extract target sample frames.");
+    }
+    if (!referenceFrames.length) {
+      throw new Error("Failed to extract reference sample frames.");
+    }
+
+    updateJob(job, { status: "processing", currentStep: "processing", progressPercent: 60 });
+    const [targetStats, referenceStats] = await withTimeout(
+      Promise.all([
+        Promise.all(targetFrames.map((p) => analyzeFrame(p))).then(averageStats),
+        Promise.all(referenceFrames.map((p) => analyzeFrame(p))).then(averageStats),
+      ]),
+      45_000,
+      "Timed out during color analysis.",
+    );
+    updateJob(job, { colorStatsComputed: true });
+
+    updateJob(job, { status: "processing", currentStep: "processing", progressPercent: 40, colorTransferStarted: true });
+    const outputPath = path.join(VIDEOS_DIR, `${jobId}-locked-color-match.mp4`);
+    const sourceFramesDir = path.join(VIDEOS_DIR, `${jobId}-source-frames`);
+    const processedFramesDir = path.join(VIDEOS_DIR, `${jobId}-processed-frames`);
+    await mkdir(sourceFramesDir, { recursive: true });
+    await mkdir(processedFramesDir, { recursive: true });
+    const sourceFramePattern = path.join(sourceFramesDir, "frame_%06d.png");
+    const processedFramePattern = path.join(processedFramesDir, "frame_%06d.png");
+    const targetFps = await probeVideoFps(resolvedInputPath);
+    updateJob(job, {
+      beforeColorStats: targetStats as unknown as Record<string, unknown>,
+      referenceColorStats: referenceStats as unknown as Record<string, unknown>,
+      colorTransformApplied: true,
+      transformStrength: colorMatchStrength,
+      exposureMatchStrength,
+      contrastMatchStrength,
+      saturationMatchStrength,
+      whiteBalanceStrength,
+      toneCurveStrength,
+      preserveTargetLuminance,
+      actualEngineUsed: "ffmpeg",
+      whiteBalanceProtection: true,
+      yellowCastReduction: 0,
+      greenCastReduction: 0,
+      brightnessShift: 0,
+      saturationShift: 0,
+      contrastShift: 0,
+      rerenderedBecauseTooStrong: false,
+      filterGraphUsed: "",
+      processedFramesUsedInEncode: false,
+    });
+
+    const ffmpegBin = resolveFfmpegBin(ffmpegPath);
+    await runFfmpegEncodeWithProgress({
+      job,
+      args: [
+        "-y",
+        "-i", resolvedInputPath,
+        ...(effectiveTrimSeconds > 0 ? ["-t", String(effectiveTrimSeconds)] : []),
+        "-vsync", "0",
+        sourceFramePattern,
+      ],
+      timeoutMs: Math.max(120_000, Math.floor(encodeTimeoutMs * 0.5)),
+      totalDurationSec: Math.max(1, effectiveDuration),
+      progressStart: 80,
+      progressEnd: 84,
+    });
+
+    let rerenderedBecauseTooStrong = false;
+    let strengthPass = colorMatchStrength;
+
+    const runPass = (pw: number) =>
+      runLockedReferenceEncodeSamplePass({
+        job,
+        jobId,
+        resolvedInputPath,
+        safeReferencePath,
+        refIsImage,
+        sourceFramePattern,
+        processedFramePattern,
+        processedFramesDir,
+        outputPath,
+        targetFps,
+        encodeTimeoutMs,
+        effectiveDuration,
+        preserveOriginalAudio,
+        targetStats,
+        referenceStats,
+        targetInfo,
+        passStrength: pw,
+        exposureMatchStrength,
+        contrastMatchStrength,
+        saturationMatchStrength,
+        whiteBalanceStrength,
+        toneCurveStrength,
+        preserveSkinTone,
+        preserveTargetLuminance,
+        inputFileHash,
+      });
+
+    let pass = await runPass(strengthPass);
+    while (pass.avgDiffPercent > 25 && !rerenderedBecauseTooStrong) {
+      rerenderedBecauseTooStrong = true;
+      strengthPass = clamp(strengthPass - 0.15, 0.08, 0.6);
+      updateJob(job, { rerenderedBecauseTooStrong: true });
+      pass = await runPass(strengthPass);
+    }
+
+    const {
+      avgDiffPercent,
+      afterStats,
+      filterComplex,
+      filterMeta,
+      outputInfo,
+      outputFileHash,
+      inputOutputHashesDifferent,
+      sampledFrameDiffs,
+      sampleFrames,
+      colorDeltaBeforeToReference,
+      colorDeltaAfterToReference,
+    } = pass;
+
+    if (colorDeltaAfterToReference >= colorDeltaBeforeToReference) {
+      throw new Error("Color match failed: output did not move closer to reference.");
+    }
+
+    const thumbPath = path.join(THUMBS_DIR, `${jobId}.jpg`);
+    await makeThumbnail(outputPath, thumbPath);
+    const finalOutputUrl = `/api/videos-files/${jobId}-locked-color-match.mp4`;
+    const resolvedOutputPath = parseAssetPath(finalOutputUrl) ?? outputPath;
+    const debugTargetBeforePath = path.join(UPLOADS_DIR, `${jobId}-debug-target-before.jpg`);
+    const debugReferenceFramePath = path.join(UPLOADS_DIR, `${jobId}-debug-reference-frame.jpg`);
+    const debugTargetAfterPath = path.join(UPLOADS_DIR, `${jobId}-debug-target-after.jpg`);
+    const debugContactSheetPath = path.join(UPLOADS_DIR, "debug-color-match-contact-sheet.jpg");
+    const processedFramePath = path.join(UPLOADS_DIR, `${jobId}-processed-sample.png`);
+    if (targetFrames[0]) {
+      await execFileAsync(ffmpegBin, ["-y", "-i", targetFrames[0], "-frames:v", "1", "-q:v", "2", debugTargetBeforePath]);
+    }
+    if (referenceFrames[0]) {
+      await execFileAsync(ffmpegBin, ["-y", "-i", referenceFrames[0], "-frames:v", "1", "-q:v", "2", debugReferenceFramePath]);
+    }
+    await execFileAsync(ffmpegBin, ["-y", "-i", processedFramePath, "-frames:v", "1", "-q:v", "2", debugTargetAfterPath]);
+    if (!(await exists(debugTargetAfterPath))) {
+      throw new Error("Color transfer did not create processed frames.");
+    }
+    const targetBeforeUrl = `/api/uploads/${jobId}-debug-target-before.jpg`;
+    const referenceSampleUrl = `/api/uploads/${jobId}-debug-reference-frame.jpg`;
+    const processedAfterUrl = `/api/uploads/${jobId}-debug-target-after.jpg`;
+
+    const verificationFailureMsg = "Final video verification failed. The app cannot prove color transfer was applied.";
+    const minVisibleDiff = rerenderedBecauseTooStrong ? 3 : 5;
+
+    const contactSource = sampleFrames[Math.floor(sampleFrames.length / 2)] ?? sampleFrames[0];
+    if (contactSource) {
+      await execFileAsync(ffmpegBin, [
+        "-y",
+        "-i", contactSource.target,
+        "-i", contactSource.reference,
+        "-i", contactSource.output,
+        "-filter_complex", "[0:v][1:v][2:v]hstack=inputs=3[outv]",
+        "-map", "[outv]",
+        "-frames:v", "1",
+        debugContactSheetPath,
+      ]);
+    }
+    if (avgDiffPercent < minVisibleDiff) {
+      throw new Error("Color transfer produced no visible change.");
+    }
+    if (!job.processedFramesUsedInEncode) {
+      throw new Error("Final video was not encoded from processed color frames.");
+    }
+    const inputSize = statSync(resolvedInputPath).size;
+    const outputSize = statSync(resolvedOutputPath).size;
+    const verificationPassed =
+      Boolean(inputFileHash) &&
+      Boolean(outputFileHash) &&
+      inputOutputHashesDifferent &&
+      inputSize > 0 &&
+      outputSize > 0 &&
+      targetInfo.duration > 0 &&
+      outputInfo.duration > 0 &&
+      sampledFrameDiffs.length >= 3 &&
+      avgDiffPercent > minVisibleDiff;
+    if (!verificationPassed) {
+      throw new Error(verificationFailureMsg);
+    }
+    updateJob(job, { status: "verifying", progressPercent: 90, currentStep: "verifying" });
+    const veryStrongWarning =
+      verificationPassed && avgDiffPercent > 28 ? "Color match is very strong and may look unnatural." : null;
+    updateJob(job, {
+      colorTransferCompleted: true,
+      encodeCompleted: true,
+      finalOutputUrl,
+      outputFileExists: true,
+      outputFileSize: outputSize,
+      outputFileHash,
+      inputOutputHashesDifferent,
+      outputDurationSeconds: outputInfo.duration,
+      actualFinalOutputUrl: finalOutputUrl,
+      targetFrameSampleBefore: targetBeforeUrl,
+      referenceFrameSample: referenceSampleUrl,
+      processedFrameSampleAfter: processedAfterUrl,
+      contactSheetUrl: "/api/uploads/debug-color-match-contact-sheet.jpg",
+      afterColorStats: afterStats as unknown as Record<string, unknown>,
+      colorDeltaBeforeToReference,
+      colorDeltaAfterToReference,
+      warning: veryStrongWarning,
+      processedFramesCreated: true,
+      ffmpegUsedOriginalVideoCopy: false,
+      averagePixelDifferencePercent: avgDiffPercent,
+      sampledFrameDiffs,
+      visibleChangeDetected: verificationPassed,
+      processedFramesUsedInEncode: true,
+      status: "complete",
+      progressPercent: 100,
+      currentStep: "complete",
+      error: null,
+      rerenderedBecauseTooStrong,
+      preserveTargetLuminance,
+      actualEngineUsed: "ffmpeg",
+      whiteBalanceProtection: filterMeta.whiteBalanceProtection,
+      yellowCastReduction: filterMeta.yellowCastReduction,
+      greenCastReduction: filterMeta.greenCastReduction,
+      brightnessShift: filterMeta.brightnessShift,
+      saturationShift: filterMeta.saturationShift,
+      contrastShift: filterMeta.contrastShift,
+      transformStrength: job.transformStrength,
+      debugProof: {
+        mode: "locked_reference_color_match",
+        progressPercent: 100,
+        currentStep: "complete",
+        analyzeReferenceComplete: true,
+        colorTransferComplete: true,
+        encodeComplete: true,
+        finalOutputUrl: "present",
+        ffmpegCommand: job.ffmpegCommand,
+        ffmpegLastLog: job.ffmpegLastLog,
+        ffmpegExitCode: job.ffmpegExitCode,
+        ffmpegProgressPercent: job.ffmpegProgressPercent,
+        ffmpegElapsedSeconds: job.ffmpegElapsedSeconds,
+        outputFileExists: true,
+        outputFileSize: outputSize,
+        inputFileHash,
+        outputFileHash,
+        inputOutputHashesDifferent,
+        inputFileSize: inputSize,
+        inputDurationSeconds: targetInfo.duration,
+        outputDurationSeconds: outputInfo.duration,
+        targetFrameSampleBefore: targetBeforeUrl,
+        referenceFrameSample: referenceSampleUrl,
+        processedFrameSampleAfter: processedAfterUrl,
+        contactSheetUrl: "/api/uploads/debug-color-match-contact-sheet.jpg",
+        beforeColorStats: targetStats,
+        referenceColorStats: referenceStats,
+        afterColorStats: afterStats,
+        targetBeforeRgb: targetStats.rgbMean,
+        targetBeforeRgbStd: targetStats.rgbStd,
+        referenceRgb: referenceStats.rgbMean,
+        referenceRgbStd: referenceStats.rgbStd,
+        targetAfterRgb: afterStats.rgbMean,
+        targetAfterRgbStd: afterStats.rgbStd,
+        targetBeforeLab: targetStats.labMean,
+        targetBeforeLabStd: targetStats.labStd,
+        referenceLab: referenceStats.labMean,
+        referenceLabStd: referenceStats.labStd,
+        targetAfterLab: afterStats.labMean,
+        targetAfterLabStd: afterStats.labStd,
+        targetBeforeSaturation: targetStats.saturation,
+        referenceSaturation: referenceStats.saturation,
+        targetAfterSaturation: afterStats.saturation,
+        targetBeforeContrast: targetStats.contrast,
+        referenceContrast: referenceStats.contrast,
+        targetAfterContrast: afterStats.contrast,
+        colorDeltaBeforeToReference,
+        colorDeltaAfterToReference,
+        transformStrength: job.transformStrength,
+        actualEngineUsed: "ffmpeg",
+        preserveTargetLuminance,
+        whiteBalanceProtection: filterMeta.whiteBalanceProtection,
+        yellowCastReduction: filterMeta.yellowCastReduction,
+        greenCastReduction: filterMeta.greenCastReduction,
+        brightnessShift: filterMeta.brightnessShift,
+        saturationShift: filterMeta.saturationShift,
+        contrastShift: filterMeta.contrastShift,
+        rerenderedBecauseTooStrong,
+        exposureMatchStrength,
+        filterGraphUsed: filterComplex,
+        processedFramesUsedInEncode: true,
+        referenceFrameExtracted: true,
+        targetFrameExtracted: true,
+        colorStatsComputed: true,
+        colorTransformApplied: true,
+        processedFramesCreated: true,
+        ffmpegUsedOriginalVideoCopy: false,
+        averagePixelDifferencePercent: avgDiffPercent,
+        sampledFrameDiffs,
+        visibleChangeDetected: verificationPassed,
+        verificationPassed,
+        realTargetUrlReady: job.realTargetUrlReady,
+        realReferenceUrlReady: job.realReferenceUrlReady,
+        startedBeforeUploadFinished: job.startedBeforeUploadFinished,
+        usedPlaceholderUrl: job.usedPlaceholderUrl,
+        usedOldOutputUrl: job.usedOldOutputUrl,
+        actualInputVideoUrl: job.actualInputVideoUrl,
+        actualReferenceUrl: job.actualReferenceUrl,
+        actualFinalOutputUrl: finalOutputUrl,
+        warning: veryStrongWarning,
+        error: null,
+      },
+    });
+  } catch (err: any) {
+    updateJob(job, {
+      status: "failed",
+      currentStep: "error",
+      error: err?.message ?? "Locked reference color match failed",
+      debugProof: {
+        mode: "locked_reference_color_match",
+        progressPercent: job.progressPercent,
+        currentStep: "error",
+        analyzeReferenceComplete: job.analyzeReferenceComplete,
+        colorTransferComplete: job.colorTransferCompleted,
+        encodeComplete: job.encodeCompleted,
+        finalOutputUrl: job.finalOutputUrl ? "present" : "missing",
+        ffmpegCommand: job.ffmpegCommand,
+        ffmpegLastLog: job.ffmpegLastLog,
+        ffmpegExitCode: job.ffmpegExitCode,
+        ffmpegProgressPercent: job.ffmpegProgressPercent,
+        ffmpegElapsedSeconds: job.ffmpegElapsedSeconds,
+        outputFileExists: job.outputFileExists,
+        outputFileSize: job.outputFileSize,
+        inputFileSize: job.inputFileSize,
+        inputFileHash: job.inputFileHash,
+        outputFileHash: job.outputFileHash,
+        inputOutputHashesDifferent: job.inputOutputHashesDifferent,
+        inputDurationSeconds: job.inputDurationSeconds,
+        outputDurationSeconds: job.outputDurationSeconds,
+        targetFrameSampleBefore: job.targetFrameSampleBefore,
+        referenceFrameSample: job.referenceFrameSample,
+        processedFrameSampleAfter: job.processedFrameSampleAfter,
+        contactSheetUrl: job.contactSheetUrl,
+        beforeColorStats: job.beforeColorStats,
+        referenceColorStats: job.referenceColorStats,
+        afterColorStats: job.afterColorStats,
+        colorDeltaBeforeToReference: job.colorDeltaBeforeToReference,
+        colorDeltaAfterToReference: job.colorDeltaAfterToReference,
+        transformStrength: job.transformStrength,
+        exposureMatchStrength: job.exposureMatchStrength,
+        filterGraphUsed: job.filterGraphUsed,
+        processedFramesUsedInEncode: job.processedFramesUsedInEncode,
+        referenceFrameExtracted: job.referenceFrameExtracted,
+        targetFrameExtracted: job.targetFrameExtracted,
+        colorStatsComputed: job.colorStatsComputed,
+        colorTransformApplied: job.colorTransformApplied,
+        processedFramesCreated: job.processedFramesCreated,
+        ffmpegUsedOriginalVideoCopy: job.ffmpegUsedOriginalVideoCopy,
+        averagePixelDifferencePercent: job.averagePixelDifferencePercent,
+        sampledFrameDiffs: job.sampledFrameDiffs,
+        visibleChangeDetected: job.visibleChangeDetected,
+        realTargetUrlReady: job.realTargetUrlReady,
+        realReferenceUrlReady: job.realReferenceUrlReady,
+        startedBeforeUploadFinished: job.startedBeforeUploadFinished,
+        usedPlaceholderUrl: job.usedPlaceholderUrl,
+        usedOldOutputUrl: job.usedOldOutputUrl,
+        actualInputVideoUrl: job.actualInputVideoUrl,
+        actualReferenceUrl: job.actualReferenceUrl,
+        actualFinalOutputUrl: job.actualFinalOutputUrl,
+        error: err?.message ?? "Locked reference color match failed",
+      },
+    });
+  }
+}
+
+router.get("/render/targeted-mask-status", (_req, res) => {
+  res.json(getPublicTargetedMaskStatus());
+});
+
+router.get("/render/status", requireAuth, async (req, res) => {
+  const jobId = String(req.query?.jobId ?? "").trim();
+  if (!jobId) return res.status(400).json({ error: "jobId is required" });
+  const job = lockedColorJobs.get(jobId);
+  if (!job) return res.status(404).json({ error: "Render job not found" });
+  const renderMode = getRenderMode();
+  const mockEqUsed = job.heavyColorTransferSkipped === true;
+  const referencePipeline: "mock_eq" | "ffmpeg_locked_reference" = mockEqUsed ? "mock_eq" : "ffmpeg_locked_reference";
+  return res.json({
+    ...job,
+    renderMode,
+    serverRenderMode: renderMode,
+    paidAiCalled: false,
+    creditsDeducted: false,
+    selectedMode: "locked_reference_color_match",
+    selectedRoute: "/api/render/production",
+    selectedEngine: mockEqUsed ? "ffmpeg-mock-visible-filter" : "ffmpeg-locked-reference-color-transfer",
+    referencePipeline,
+    mockEqUsed,
+    targetUrlReady: job.realTargetUrlReady,
+    referenceUrlReady: job.realReferenceUrlReady,
+    inputVideoUrl: job.actualInputVideoUrl,
+    referenceVideoUrl: job.referenceVideoUrl,
+    referenceImageUrl: job.referenceImageUrl,
+    previewUsingFinalOutputUrl: Boolean(job.finalOutputUrl),
+    /** True only when this job used the fast mock EQ path (not the reference-driven pipeline). */
+    mockOutputGenerated: mockEqUsed && Boolean(job.finalOutputUrl),
+    heavyColorTransferSkipped: mockEqUsed,
+    localOutputGenerated: renderMode === "local" && Boolean(job.finalOutputUrl),
+    productionAiCalled: false,
+  });
+});
+
+router.post(
+  "/render/production",
+  requireAuth,
+  upload.fields([
+    { name: "video", maxCount: 1 },
+    { name: "image", maxCount: 1 },
+    { name: "target", maxCount: 1 },
+    { name: "reference", maxCount: 1 },
+    { name: "swapImage", maxCount: 1 },
+    { name: "targetImage", maxCount: 1 },
+  ]),
+  async (req, res) => {
+    const files = req.files as Record<string, Express.Multer.File[]> | undefined;
+    const jobId = `prod-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const selectedRoute = "/api/render/production";
+    let selectedMode: ProductionMode = "full_production";
+    let selectedEngine = "production-unified";
+    let finalOutputUrl = "";
+    let errorMessage = "";
+    let realAiCalled = false;
+    const renderMode = getRenderMode();
+    let paidAiCalled = false;
+    let creditsDeducted = false;
+    let demoMode = isDemoModeEnabled();
+    let faceLockActive = false;
+    let backgroundReplaceActive = false;
+    let objectEditActive = false;
+    let targetedObjectEditMeta: TargetedEditRunMeta | undefined;
+    let colorGradeActive = false;
+    let inputVideoUrlPresent = false;
+    let inputImageUrlPresent = false;
+
+    try {
+      await mkdir(UPLOADS_DIR, { recursive: true });
+      await mkdir(VIDEOS_DIR, { recursive: true });
+      await mkdir(THUMBS_DIR, { recursive: true });
+      await mkdir(SWAPS_DIR, { recursive: true });
+
+      selectedMode = parseMode(req.body?.selectedMode ?? req.body?.mode);
+      const requiresPaidAi = !["locked_reference_color_match", "color_grade", "object_edit", "audio_cleanup"].includes(selectedMode);
+      if (renderMode === "production") {
+        const missing = missingKeysForMode(selectedMode);
+        if (missing.length > 0) {
+          throw new Error(`AI render failed because ${missing[0]} is missing.`);
+        }
+      }
+      if (demoMode && requiresPaidAi) {
+        throw new Error("BG_REPLACE_DEMO_MODE=true blocks paid AI. Disable it or use RENDER_MODE=mock/local.");
+      }
+
+      const token = process.env.REPLICATE_API_TOKEN;
+      let replicate: Replicate | null = null;
+      const ensureReplicate = () => {
+        assertPaidAiAllowed();
+        if (!replicate) {
+          if (!token) throw new Error("AI render failed because REPLICATE_API_TOKEN is missing.");
+          replicate = new Replicate({ auth: token });
+        }
+        paidAiCalled = true;
+        creditsDeducted = true;
+        return replicate;
+      };
+      const domain = getDomain();
+
+      const prompt = String(
+        req.body?.prompt ??
+          req.body?.requestedEdit ??
+          req.body?.backgroundPrompt ??
+          req.body?.transferPrompt ??
+          "",
+      ).trim();
+      const colorPrompt = String(req.body?.colorPrompt ?? DEFAULT_COLOR_INSTRUCTION).trim();
+      const lockFace = String(req.body?.lockFace ?? "true").toLowerCase() === "true";
+      const objectX = Number(req.body?.objectX);
+      const objectY = Number(req.body?.objectY);
+      const selectedObject = String(req.body?.selectedObject ?? "").trim();
+      const rawMaskR = Number(req.body?.maskRadius ?? req.body?.maskRadiusFrac);
+      const maskRadiusFrac = Number.isFinite(rawMaskR) ? clamp(rawMaskR, 0.06, 0.48) : undefined;
+      const segmentTrackJobId = String(req.body?.segmentTrackJobId ?? "").trim();
+
+      const saveFileFromUpload = async (file: Express.Multer.File | undefined, suffix: string) => {
+        if (!file) return null;
+        const ext = "." + (file.originalname.split(".").pop() ?? "bin").toLowerCase();
+        const safeExt = file.mimetype.startsWith("video/")
+          ? (VIDEO_EXTS.has(ext) ? ext : ".mp4")
+          : (IMAGE_EXTS.has(ext) ? ext : ".png");
+        const diskPath = path.join(UPLOADS_DIR, `${jobId}-${suffix}${safeExt}`);
+        await writeFile(diskPath, file.buffer);
+        return { diskPath, relativeUrl: `/api/uploads/${jobId}-${suffix}${safeExt}` };
+      };
+
+      const uploadedVideo = await saveFileFromUpload(files?.video?.[0] ?? files?.target?.[0], "input-video");
+      const uploadedImage = await saveFileFromUpload(files?.image?.[0], "input-image");
+      const swapImage = await saveFileFromUpload(files?.swapImage?.[0], "swap-image");
+      const targetImage = await saveFileFromUpload(files?.targetImage?.[0], "target-image");
+      const referenceMedia = await saveFileFromUpload(files?.reference?.[0], "reference");
+
+      const bodyVideoPath = parseAssetPath(req.body?.inputVideoUrl);
+      const bodyImagePath = parseAssetPath(req.body?.inputImageUrl);
+      const bodyReferencePath = parseAssetPath(req.body?.referenceUrl);
+      const bodyReferenceVideoPath = parseAssetPath(req.body?.referenceVideoUrl);
+      const bodyReferenceImagePath = parseAssetPath(req.body?.referenceImageUrl);
+      const inputVideoPath = uploadedVideo?.diskPath ?? bodyVideoPath;
+      const inputImagePath = uploadedImage?.diskPath ?? bodyImagePath;
+      const referencePath =
+        referenceMedia?.diskPath ?? bodyReferenceVideoPath ?? bodyReferenceImagePath ?? bodyReferencePath;
+      inputVideoUrlPresent = Boolean(inputVideoPath);
+      inputImageUrlPresent = Boolean(inputImagePath || referencePath);
+
+      if (selectedMode === "locked_reference_color_match") {
+        selectedEngine = "ffmpeg-locked-reference-color-transfer";
+        const targetVideoUrl = String(req.body?.targetVideoUrl ?? req.body?.inputVideoUrl ?? "").trim();
+        const referenceVideoUrl = String(req.body?.referenceVideoUrl ?? "").trim();
+        const referenceImageUrl = String(req.body?.referenceImageUrl ?? "").trim();
+        const colorMatchStrength = clamp(Number(req.body?.colorMatchStrength ?? 0.3), 0.05, 0.65);
+        const exposureMatchStrength = clamp(Number(req.body?.exposureMatchStrength ?? 0.35), 0, 1.25);
+        const contrastMatchStrength = clamp(Number(req.body?.contrastMatchStrength ?? 0.5), 0, 1.25);
+        const saturationMatchStrength = clamp(Number(req.body?.saturationMatchStrength ?? 0.45), 0, 1.25);
+        const whiteBalanceStrength = clamp(Number(req.body?.whiteBalanceStrength ?? 0.45), 0, 1.25);
+        const toneCurveStrength = clamp(Number(req.body?.toneCurveStrength ?? 0.4), 0, 1.25);
+        const preserveSkinTone = String(req.body?.preserveSkinTone ?? "true").toLowerCase() !== "false";
+        const preserveOriginalAudio = String(req.body?.preserveOriginalAudio ?? "true").toLowerCase() !== "false";
+        const preserveTargetLuminance = String(req.body?.preserveTargetLuminance ?? "true").toLowerCase() !== "false";
+        if (isUnresolvedUrl(targetVideoUrl)) {
+          throw new Error("Target upload is not ready yet.");
+        }
+        if (isUnresolvedUrl(referenceVideoUrl) && isUnresolvedUrl(referenceImageUrl) && isUnresolvedUrl(req.body?.referenceUrl)) {
+          throw new Error("Reference upload is not ready yet.");
+        }
+        if (!inputVideoPath) {
+          throw new Error("locked_reference_color_match requires targetVideoUrl.");
+        }
+        if (!referencePath) {
+          throw new Error("locked_reference_color_match requires referenceVideoUrl or referenceImageUrl.");
+        }
+        if (
+          !allowsFullSceneVideoTransfer(req.body as Record<string, unknown>) &&
+          isSpecificObjectEditIntent(prompt)
+        ) {
+          return res.status(422).json({
+            error:
+              "This prompt targets a specific object. Use targeted object editing (mask detection → static mask propagation → masked edit → composite) via selectedMode=object_edit instead of full-frame reference transfer.",
+            code: "USE_TARGETED_OBJECT_EDIT",
+            hint: "POST /api/render/production with video upload, objectX/objectY (optional with selectedObject), requestedEdit, maskRadius. Set allowFullSceneVideoTransfer=true only for intentional full-scene work.",
+          });
+        }
+        const statusJobId = `locked-color-${randomUUID()}`;
+        const initialJob: LockedColorJobState = {
+          jobId: statusJobId,
+          status: "queued",
+          currentStep: "queued",
+          progressPercent: 0,
+          lastProgressAt: new Date().toISOString(),
+          targetVideoUrl,
+          referenceVideoUrl,
+          referenceImageUrl,
+          targetFileExists: false,
+          referenceFileExists: false,
+          targetDuration: null,
+          referenceDuration: null,
+          targetCodec: null,
+          referenceCodec: null,
+          ffmpegStarted: false,
+          ffmpegCommand: "",
+          ffmpegLastLog: "",
+          ffmpegProgressPercent: 0,
+          ffmpegElapsedSeconds: 0,
+          ffmpegExitCode: null,
+          framesExtracted: 0,
+          referenceFramesExtracted: 0,
+          colorStatsComputed: false,
+          colorTransferStarted: false,
+          colorTransferCompleted: false,
+          encodeStarted: false,
+          encodeCompleted: false,
+          finalOutputUrl: "",
+          outputFileExists: false,
+          outputFileSize: 0,
+          inputFileSize: 0,
+          inputFileHash: "",
+          outputFileHash: "",
+          inputOutputHashesDifferent: false,
+          inputDurationSeconds: 0,
+          outputDurationSeconds: 0,
+          warning: null,
+          realTargetUrlReady: !isUnresolvedUrl(targetVideoUrl),
+          realReferenceUrlReady:
+            !isUnresolvedUrl(referenceVideoUrl) || !isUnresolvedUrl(referenceImageUrl) || !isUnresolvedUrl(req.body?.referenceUrl),
+          startedBeforeUploadFinished:
+            isUnresolvedUrl(targetVideoUrl) ||
+            (isUnresolvedUrl(referenceVideoUrl) && isUnresolvedUrl(referenceImageUrl) && isUnresolvedUrl(req.body?.referenceUrl)),
+          usedPlaceholderUrl:
+            isUnresolvedUrl(targetVideoUrl) ||
+            (isUnresolvedUrl(referenceVideoUrl) && isUnresolvedUrl(referenceImageUrl) && isUnresolvedUrl(req.body?.referenceUrl)),
+          usedOldOutputUrl: false,
+          actualInputVideoUrl: targetVideoUrl,
+          actualReferenceUrl: referenceVideoUrl || referenceImageUrl || String(req.body?.referenceUrl ?? ""),
+          actualFinalOutputUrl: "",
+          targetFrameSampleBefore: "",
+          referenceFrameSample: "",
+          processedFrameSampleAfter: "",
+          contactSheetUrl: "",
+          beforeColorStats: null,
+          referenceColorStats: null,
+          afterColorStats: null,
+          colorDeltaBeforeToReference: null,
+          colorDeltaAfterToReference: null,
+          transformStrength: colorMatchStrength,
+          exposureMatchStrength,
+          contrastMatchStrength,
+          saturationMatchStrength,
+          whiteBalanceStrength,
+          toneCurveStrength,
+          filterGraphUsed: "",
+          processedFramesUsedInEncode: false,
+          referenceFrameExtracted: false,
+          targetFrameExtracted: false,
+          colorTransformApplied: false,
+          processedFramesCreated: false,
+          ffmpegUsedOriginalVideoCopy: false,
+          averagePixelDifferencePercent: 0,
+          sampledFrameDiffs: [],
+          visibleChangeDetected: false,
+          error: null,
+          heavyColorTransferSkipped: false,
+          analyzeReferenceComplete: false,
+          actualEngineUsed: "ffmpeg",
+          preserveTargetLuminance,
+          whiteBalanceProtection: true,
+          yellowCastReduction: 0,
+          greenCastReduction: 0,
+          brightnessShift: 0,
+          saturationShift: 0,
+          contrastShift: 0,
+          rerenderedBecauseTooStrong: false,
+        };
+        lockedColorJobs.set(statusJobId, initialJob);
+        void runLockedReferenceColorJob({
+          job: initialJob,
+          jobId: statusJobId,
+          targetPath: inputVideoPath,
+          referencePath,
+          targetVideoUrl,
+          referenceVideoUrl,
+          referenceImageUrl,
+          colorMatchStrength,
+          exposureMatchStrength,
+          contrastMatchStrength,
+          saturationMatchStrength,
+          whiteBalanceStrength,
+          toneCurveStrength,
+          preserveSkinTone,
+          preserveOriginalAudio,
+          preserveTargetLuminance,
+        });
+        return res.json({
+          jobId: statusJobId,
+          renderMode,
+          paidAiCalled,
+          creditsDeducted,
+          selectedMode,
+          selectedRoute,
+          selectedEngine: renderMode === "mock" ? "ffmpeg-mock-visible-filter" : selectedEngine,
+          targetUrlReady: initialJob.realTargetUrlReady,
+          referenceUrlReady: initialJob.realReferenceUrlReady,
+          realTargetUrlReady: initialJob.realTargetUrlReady,
+          realReferenceUrlReady: initialJob.realReferenceUrlReady,
+          inputVideoUrl: targetVideoUrl,
+          referenceVideoUrl,
+          referenceImageUrl,
+          currentStep: initialJob.currentStep,
+          progressPercent: initialJob.progressPercent,
+          finalOutputUrl: "",
+          previewUsingFinalOutputUrl: false,
+          mockOutputGenerated: false,
+          localOutputGenerated: false,
+          productionAiCalled: false,
+          error: null,
+        });
+      }
+
+      if (selectedMode === "face_swap") {
+        const targetVideoUrlBody = String(req.body?.targetVideoUrl ?? "").trim();
+        const faceSourceUrlBody = String(req.body?.faceSourceUrl ?? "").trim();
+        if (renderMode !== "production") {
+          if (targetVideoUrlBody && faceSourceUrlBody) {
+            const targetLocal = parseAssetPath(targetVideoUrlBody);
+            if (!targetLocal) throw new Error("face_swap video mode requires valid local asset URLs.");
+            const outPath = path.join(VIDEOS_DIR, `${jobId}-face-lock.mp4`);
+            await applyVisibleTestRender(
+              targetLocal,
+              outPath,
+              renderMode === "mock"
+                ? { maxInputSeconds: getMockEncodeMaxSeconds(), timeoutMs: getMockRenderTimeoutMs() }
+                : undefined,
+            );
+            await makeThumbnail(outPath, path.join(THUMBS_DIR, `${jobId}.jpg`));
+            finalOutputUrl = `/api/videos-files/${jobId}-face-lock.mp4`;
+            return res.json({
+              renderMode,
+              paidAiCalled: false,
+              creditsDeducted: false,
+              selectedMode,
+              selectedRoute,
+              selectedEngine: "ffmpeg-face-swap-test",
+              videoUrl: finalOutputUrl,
+              thumbnailUrl: `/api/thumbs/${jobId}.jpg`,
+              finalOutputUrl,
+              previewUsingFinalOutputUrl: true,
+              mockOutputGenerated: renderMode === "mock",
+              localOutputGenerated: renderMode === "local",
+              productionAiCalled: false,
+            });
+          }
+          if (!targetImage?.diskPath) {
+            throw new Error("face_swap requires swapImage and targetImage.");
+          }
+          const outPath = path.join(SWAPS_DIR, `${jobId}-result.png`);
+          const bin = resolveFfmpegBin(ffmpegPath);
+          await execFileAsync(bin, ["-y", "-i", targetImage.diskPath, "-vf", MOCK_VISIBLE_FILTER, outPath]);
+          finalOutputUrl = `/api/swaps/${jobId}-result.png`;
+          return res.json({
+            renderMode,
+            paidAiCalled: false,
+            creditsDeducted: false,
+            selectedMode,
+            selectedRoute,
+            selectedEngine: "ffmpeg-face-swap-test",
+            imageUrl: finalOutputUrl,
+            finalOutputUrl,
+            previewUsingFinalOutputUrl: true,
+            mockOutputGenerated: renderMode === "mock",
+            localOutputGenerated: renderMode === "local",
+            productionAiCalled: false,
+          });
+        }
+        if (targetVideoUrlBody && faceSourceUrlBody) {
+          selectedEngine = "arabyai-replicate/roop_face_swap";
+          const targetLocal = parseAssetPath(targetVideoUrlBody);
+          const faceSourceLocal = parseAssetPath(faceSourceUrlBody);
+          if (!targetLocal || !faceSourceLocal) {
+            throw new Error("face_swap video mode requires valid local asset URLs.");
+          }
+          const faceFramePath = path.join(UPLOADS_DIR, `${jobId}-face.jpg`);
+          await extractFaceFrame(faceSourceLocal, faceFramePath);
+          const client = ensureReplicate();
+          const targetVideoUrl = await uploadLocalFileToReplicate(client, targetLocal, `${jobId}-target.mp4`);
+          const faceImageUrl = await uploadLocalFileToReplicate(client, faceFramePath, `${jobId}-face.jpg`);
+          const out = await client.run("arabyai-replicate/roop_face_swap", {
+            input: { swap_image: faceImageUrl, target_video: targetVideoUrl },
+          });
+          realAiCalled = true;
+          const outUrl = resolveReplicateUrl(out);
+          const outPath = path.join(VIDEOS_DIR, `${jobId}-face-lock.mp4`);
+          await downloadToFile(outUrl, outPath);
+          await makeThumbnail(outPath, path.join(THUMBS_DIR, `${jobId}.jpg`));
+          finalOutputUrl = `/api/videos-files/${jobId}-face-lock.mp4`;
+          return res.json({
+            renderMode,
+            paidAiCalled: true,
+            creditsDeducted: true,
+            selectedMode,
+            selectedRoute,
+            selectedEngine,
+            realAiCalled,
+            videoUrl: finalOutputUrl,
+            thumbnailUrl: `/api/thumbs/${jobId}.jpg`,
+            finalOutputUrl,
+            previewUsingFinalOutputUrl: true,
+            mockOutputGenerated: false,
+            localOutputGenerated: false,
+            productionAiCalled: true,
+          });
+        }
+
+        selectedEngine = "lucataco/faceswap";
+        if (!swapImage?.diskPath || !targetImage?.diskPath) {
+          throw new Error("face_swap requires swapImage and targetImage.");
+        }
+        if (!domain) throw new Error("Could not determine public domain for face swap.");
+        const swapUrl = `https://${domain}${swapImage.relativeUrl}`;
+        const targetUrl = `https://${domain}${targetImage.relativeUrl}`;
+        const out = await ensureReplicate().run("lucataco/faceswap", {
+          input: { swap_image: swapUrl, target_image: targetUrl },
+        });
+        realAiCalled = true;
+        const outUrl = resolveReplicateUrl(out);
+        const outPath = path.join(SWAPS_DIR, `${jobId}-result.png`);
+        await downloadToFile(outUrl, outPath);
+        finalOutputUrl = `/api/swaps/${jobId}-result.png`;
+        return res.json({
+          renderMode,
+          paidAiCalled: true,
+          creditsDeducted: true,
+          selectedMode,
+          selectedRoute,
+          selectedEngine,
+          realAiCalled,
+          imageUrl: finalOutputUrl,
+          finalOutputUrl,
+          previewUsingFinalOutputUrl: true,
+          mockOutputGenerated: false,
+          localOutputGenerated: false,
+          productionAiCalled: true,
+        });
+      }
+
+      if (selectedMode === "image_generate") {
+        selectedEngine = "black-forest-labs/flux-schnell";
+        if (!prompt) throw new Error("image_generate requires a prompt.");
+        if (renderMode !== "production") {
+          const outPath = path.join(SWAPS_DIR, `${jobId}-image.png`);
+          const bin = resolveFfmpegBin(ffmpegPath);
+          await execFileAsync(bin, ["-y", "-f", "lavfi", "-i", "color=c=#253040:s=1024x1024:d=1", "-frames:v", "1", outPath]);
+          finalOutputUrl = `/api/swaps/${jobId}-image.png`;
+          return res.json({
+            renderMode,
+            paidAiCalled: false,
+            creditsDeducted: false,
+            selectedMode,
+            selectedRoute,
+            selectedEngine: "ffmpeg-image-generate-test",
+            imageUrl: finalOutputUrl,
+            finalOutputUrl,
+            previewUsingFinalOutputUrl: true,
+            mockOutputGenerated: renderMode === "mock",
+            localOutputGenerated: renderMode === "local",
+            productionAiCalled: false,
+          });
+        }
+        const out = await ensureReplicate().run("black-forest-labs/flux-schnell", { input: { prompt } });
+        realAiCalled = true;
+        const outUrl = resolveReplicateUrl(out);
+        const outPath = path.join(SWAPS_DIR, `${jobId}-image.png`);
+        await downloadToFile(outUrl, outPath);
+        finalOutputUrl = `/api/swaps/${jobId}-image.png`;
+        return res.json({
+          renderMode,
+          paidAiCalled: true,
+          creditsDeducted: true,
+          selectedMode,
+          selectedRoute,
+          selectedEngine,
+          realAiCalled,
+          imageUrl: finalOutputUrl,
+          finalOutputUrl,
+          previewUsingFinalOutputUrl: true,
+          mockOutputGenerated: false,
+          localOutputGenerated: false,
+          productionAiCalled: true,
+        });
+      }
+
+      if (selectedMode === "video_generate") {
+        selectedEngine = "minimax/hailuo-02";
+        if (!prompt) throw new Error("video_generate requires a prompt.");
+        if (renderMode !== "production") {
+          const outPath = path.join(VIDEOS_DIR, `${jobId}-video-generate.mp4`);
+          const durationSec = Math.max(3, Number(req.body?.duration ?? 6));
+          const bin = resolveFfmpegBin(ffmpegPath);
+          if (inputImagePath) {
+            await execFileAsync(bin, [
+              "-y",
+              "-loop", "1",
+              "-i", inputImagePath,
+              "-t", String(durationSec),
+              "-vf", `${MOCK_VISIBLE_FILTER},scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2`,
+              "-c:v", "libx264",
+              "-preset", "ultrafast",
+              "-crf", "23",
+              "-pix_fmt", "yuv420p",
+              "-movflags", "+faststart",
+              outPath,
+            ]);
+          } else {
+            await execFileAsync(bin, [
+              "-y",
+              "-f", "lavfi",
+              "-i", `testsrc=size=1280x720:rate=30:duration=${durationSec}`,
+              "-vf", MOCK_VISIBLE_FILTER,
+              "-c:v", "libx264",
+              "-preset", "ultrafast",
+              "-crf", "23",
+              "-pix_fmt", "yuv420p",
+              "-movflags", "+faststart",
+              outPath,
+            ]);
+          }
+          await makeThumbnail(outPath, path.join(THUMBS_DIR, `${jobId}.jpg`));
+          finalOutputUrl = `/api/videos-files/${jobId}-video-generate.mp4`;
+          return res.json({
+            renderMode,
+            paidAiCalled: false,
+            creditsDeducted: false,
+            selectedMode,
+            selectedRoute,
+            selectedEngine: "ffmpeg-video-generate-test",
+            videoUrl: finalOutputUrl,
+            outputUrl: finalOutputUrl,
+            thumbnailUrl: `/api/thumbs/${jobId}.jpg`,
+            finalOutputUrl,
+            previewUsingFinalOutputUrl: true,
+            mockOutputGenerated: renderMode === "mock",
+            localOutputGenerated: renderMode === "local",
+            productionAiCalled: false,
+          });
+        }
+        const imageRef = inputImagePath
+          ? await uploadLocalFileToReplicate(ensureReplicate(), inputImagePath, `${jobId}-first-frame.png`)
+          : undefined;
+        const out = await ensureReplicate().run("minimax/hailuo-02", {
+          input: {
+            prompt: `${prompt}\n${CHARACTER_LOCK_INSTRUCTION}`,
+            duration: Number(req.body?.duration ?? 6),
+            resolution: "768p",
+            ...(imageRef ? { first_frame_image: imageRef } : {}),
+          },
+        });
+        realAiCalled = true;
+        const outUrl = resolveReplicateUrl(out);
+        const outPath = path.join(VIDEOS_DIR, `${jobId}-video-generate.mp4`);
+        await downloadToFile(outUrl, outPath);
+        await makeThumbnail(outPath, path.join(THUMBS_DIR, `${jobId}.jpg`));
+        finalOutputUrl = `/api/videos-files/${jobId}-video-generate.mp4`;
+        return res.json({
+          renderMode,
+          paidAiCalled: true,
+          creditsDeducted: true,
+          selectedMode,
+          selectedRoute,
+          selectedEngine,
+          realAiCalled,
+          videoUrl: finalOutputUrl,
+          outputUrl: finalOutputUrl,
+          thumbnailUrl: `/api/thumbs/${jobId}.jpg`,
+          finalOutputUrl,
+          previewUsingFinalOutputUrl: true,
+          mockOutputGenerated: false,
+          localOutputGenerated: false,
+          productionAiCalled: true,
+        });
+      }
+
+      if (selectedMode === "audio_cleanup") {
+        if (!inputVideoPath) {
+          throw new Error("audio_cleanup requires inputVideoUrl.");
+        }
+        selectedEngine = "ffmpeg-audio-cleanup";
+        const outPath = path.join(VIDEOS_DIR, `${jobId}-audio-cleanup.mp4`);
+        const bin = resolveFfmpegBin(ffmpegPath);
+        await execFileAsync(bin, [
+          "-y",
+          "-i", inputVideoPath,
+          "-c:v", "copy",
+          "-af", "highpass=f=80,lowpass=f=12000,loudnorm",
+          "-c:a", "aac",
+          "-b:a", "128k",
+          "-movflags", "+faststart",
+          outPath,
+        ]);
+        await makeThumbnail(outPath, path.join(THUMBS_DIR, `${jobId}.jpg`));
+        finalOutputUrl = `/api/videos-files/${jobId}-audio-cleanup.mp4`;
+        return res.json({
+          renderMode,
+          paidAiCalled: false,
+          creditsDeducted: false,
+          selectedMode,
+          selectedRoute,
+          selectedEngine,
+          videoUrl: finalOutputUrl,
+          outputUrl: finalOutputUrl,
+          thumbnailUrl: `/api/thumbs/${jobId}.jpg`,
+          finalOutputUrl,
+          previewUsingFinalOutputUrl: true,
+          mockOutputGenerated: renderMode === "mock",
+          localOutputGenerated: renderMode === "local",
+          productionAiCalled: false,
+        });
+      }
+
+      if (!inputVideoPath) {
+        throw new Error("A video input is required for this production mode.");
+      }
+
+      let currentPath = inputVideoPath;
+
+      if (selectedMode === "background_replace" || selectedMode === "full_production") {
+        selectedEngine = renderMode === "production" ? "luma/modify-video" : "ffmpeg-background-test";
+        backgroundReplaceActive = true;
+        faceLockActive = lockFace;
+        if (renderMode === "production") {
+          const inputPublicUrl =
+            domain && uploadedVideo?.relativeUrl
+              ? `https://${domain}${uploadedVideo.relativeUrl}`
+              : await uploadLocalFileToReplicate(ensureReplicate(), inputVideoPath, `${jobId}-input.mp4`);
+          const referenceHint = referencePath
+            ? ` Match style from this reference asset: ${await uploadLocalFileToReplicate(ensureReplicate(), referencePath, `${jobId}-reference`)}`
+            : "";
+          const bgPrompt = (prompt || "Replace background while preserving character exactly.") + referenceHint;
+          const out = await ensureReplicate().run("luma/modify-video", {
+            input: {
+              video: inputPublicUrl,
+              prompt: `${CHARACTER_LOCK_INSTRUCTION}\nBackground replacement request: ${bgPrompt}`,
+              mode: "flex_1",
+            },
+          });
+          realAiCalled = true;
+          const outUrl = resolveReplicateUrl(out);
+          const bgPath = path.join(VIDEOS_DIR, `${jobId}-bg.mp4`);
+          await downloadToFile(outUrl, bgPath);
+          currentPath = bgPath;
+
+          if (lockFace) {
+            selectedEngine = "arabyai-replicate/roop_face_swap";
+            const faceFramePath = path.join(UPLOADS_DIR, `${jobId}-face.jpg`);
+            await extractFaceFrame(inputVideoPath, faceFramePath);
+            const client = ensureReplicate();
+            const targetVideoUrl = await uploadLocalFileToReplicate(client, currentPath, `${jobId}-bg.mp4`);
+            const faceImageUrl = await uploadLocalFileToReplicate(client, faceFramePath, `${jobId}-face.jpg`);
+            const swapped = await client.run("arabyai-replicate/roop_face_swap", {
+              input: {
+                swap_image: faceImageUrl,
+                target_video: targetVideoUrl,
+              },
+            });
+            realAiCalled = true;
+            const swappedUrl = resolveReplicateUrl(swapped);
+            const faceLockedPath = path.join(VIDEOS_DIR, `${jobId}-face-locked.mp4`);
+            await downloadToFile(swappedUrl, faceLockedPath);
+            currentPath = faceLockedPath;
+          }
+        } else {
+          const bgPath = path.join(VIDEOS_DIR, `${jobId}-bg.mp4`);
+          await applyVisibleTestRender(
+            currentPath,
+            bgPath,
+            renderMode === "mock"
+              ? { maxInputSeconds: getMockEncodeMaxSeconds(), timeoutMs: getMockRenderTimeoutMs() }
+              : undefined,
+          );
+          currentPath = bgPath;
+        }
+      }
+
+      if (selectedMode === "object_edit" || selectedMode === "full_production") {
+        const requestedEditTrim = String(req.body?.requestedEdit ?? "").trim();
+        const editInstruction =
+          selectedMode === "object_edit" ? (requestedEditTrim || prompt).trim() : requestedEditTrim;
+        const runObjectStep =
+          selectedMode === "object_edit" ||
+          (selectedMode === "full_production" &&
+            (Boolean(selectedObject) || (Number.isFinite(objectX) && Number.isFinite(objectY))));
+
+        if (runObjectStep) {
+          let ox = objectX;
+          let oy = objectY;
+          if (!Number.isFinite(ox) || !Number.isFinite(oy)) {
+            if (selectedObject || editInstruction) {
+              ox = 0.5;
+              oy = 0.55;
+            }
+          }
+          if (!Number.isFinite(ox) || !Number.isFinite(oy)) {
+            throw new Error(
+              "Object edit requires click coordinates (objectX/objectY) or an object label / edit prompt for center masking.",
+            );
+          }
+          if (selectedMode === "object_edit" && !editInstruction) {
+            throw new Error('Object edit requires an edit instruction (e.g. "change wall to white").');
+          }
+          if (selectedMode === "full_production" && !editInstruction) {
+            throw new Error(
+              'Object edit step requires requestedEdit (e.g. "make car red") so background prompts are not applied to the mask.',
+            );
+          }
+
+          objectEditActive = true;
+          selectedEngine = sam2MaskEngineRequested()
+            ? "ffmpeg-targeted-mask-composite-sam2"
+            : "ffmpeg-targeted-mask-composite";
+
+          if (sam2MaskEngineRequested()) {
+            if (!segmentTrackJobId) {
+              throw new Error(
+                "OBJECT_MASK_ENGINE=SAM2 requires segmentTrackJobId from POST /api/ai/segment-track after clicking the object.",
+              );
+            }
+            const segJob = getSegmentTrackJob(segmentTrackJobId);
+            if (!segJob) {
+              throw new Error("Invalid or expired segmentTrackJobId. Run segment-track again before rendering.");
+            }
+          }
+
+          const objectPath = path.join(VIDEOS_DIR, `${jobId}-object.mp4`);
+          targetedObjectEditMeta = await runTargetedObjectEdit({
+            inputPath: currentPath,
+            outputPath: objectPath,
+            objectX: ox,
+            objectY: oy,
+            editPrompt: editInstruction,
+            selectedObject: selectedObject || undefined,
+            maskRadiusFrac,
+            segmentTrackJobId: segmentTrackJobId || undefined,
+          });
+          currentPath = objectPath;
+        }
+      }
+
+      if (selectedMode === "color_grade" || selectedMode === "full_production") {
+        colorGradeActive = true;
+        selectedEngine = "ffmpeg-cinematic-color";
+        const gradedPath = path.join(VIDEOS_DIR, `${jobId}-graded.mp4`);
+        await applyCinematicColorGrade(currentPath, gradedPath);
+        currentPath = gradedPath;
+      }
+
+      await makeThumbnail(currentPath, path.join(THUMBS_DIR, `${jobId}.jpg`));
+      const outFileName = path.basename(currentPath);
+      finalOutputUrl = `/api/videos-files/${outFileName}`;
+
+      return res.json({
+        renderMode,
+        paidAiCalled,
+        creditsDeducted,
+        selectedMode,
+        selectedRoute,
+        selectedEngine,
+        selectedObject: selectedObject || undefined,
+        colorPromptApplied: colorPrompt || DEFAULT_COLOR_INSTRUCTION,
+        videoUrl: finalOutputUrl,
+        outputUrl: finalOutputUrl,
+        thumbnailUrl: `/api/thumbs/${jobId}.jpg`,
+        finalOutputUrl,
+        previewUsingFinalOutputUrl: Boolean(finalOutputUrl),
+        mockOutputGenerated: renderMode === "mock",
+        localOutputGenerated: renderMode === "local",
+        productionAiCalled: renderMode === "production" && paidAiCalled,
+        demoMode,
+        realAiCalled,
+        targetedObjectEdit: targetedObjectEditMeta,
+        targetedMaskEngineStatus: getPublicTargetedMaskStatus(),
+        renderProof: {
+          selectedMode,
+          selectedRoute,
+          selectedEngine,
+          demoMode,
+          realAiCalled,
+          inputVideoUrlPresent,
+          inputImageUrlPresent,
+          faceLockActive,
+          backgroundReplaceActive,
+          objectEditActive,
+          colorGradeActive,
+          finalOutputUrlPresent: Boolean(finalOutputUrl),
+          errorMessage: "",
+        },
+      });
+    } catch (err: any) {
+      errorMessage = err?.message ?? "Production render failed";
+      const debugProof =
+        selectedMode === "locked_reference_color_match"
+          ? {
+              mode: "locked_reference_color_match",
+              targetVideoUrl: String(req.body?.targetVideoUrl ?? req.body?.inputVideoUrl ?? "").trim() ? "present" : "missing",
+              referenceVideoUrl: String(req.body?.referenceVideoUrl ?? "").trim() ? "present" : "missing",
+              referenceImageUrl: String(req.body?.referenceImageUrl ?? "").trim() ? "present" : "missing",
+              progressPercent: 0,
+              currentStep: "error",
+              analyzeReferenceComplete: false,
+              colorTransferComplete: false,
+              encodeComplete: false,
+              regenerationUsed: false,
+              fullAiGenerationUsed: false,
+              referenceUsedForContent: false,
+              referenceUsedForColorOnly: true,
+              framesReplaced: false,
+              identityChanged: false,
+              audioPreserved: true,
+              durationPreserved: true,
+              resolutionPreserved: true,
+              colorMatchStrength: clamp(Number(req.body?.colorMatchStrength ?? 0.3), 0.05, 0.65),
+              outputVideoUrl: finalOutputUrl ? "present" : "missing",
+              error: errorMessage,
+            }
+          : undefined;
+      return res.status(500).json({
+        error: errorMessage,
+        renderMode,
+        paidAiCalled,
+        creditsDeducted,
+        selectedMode,
+        selectedRoute,
+        selectedEngine,
+        finalOutputUrl,
+        previewUsingFinalOutputUrl: false,
+        mockOutputGenerated: false,
+        localOutputGenerated: false,
+        productionAiCalled: renderMode === "production" && paidAiCalled,
+        demoMode,
+        realAiCalled,
+        debugProof,
+        renderProof: {
+          selectedMode,
+          selectedRoute,
+          selectedEngine,
+          demoMode,
+          realAiCalled,
+          inputVideoUrlPresent,
+          inputImageUrlPresent,
+          faceLockActive,
+          backgroundReplaceActive,
+          objectEditActive,
+          colorGradeActive,
+          finalOutputUrlPresent: Boolean(finalOutputUrl),
+          errorMessage,
+        },
+      });
+    }
+  },
+);
+
+export default router;
+
+===== artifacts/api-server/src/routes/ai-segment-track.ts =====
+/**
+ * POST /api/ai/segment-track — Meta SAM 2 Video (Replicate) click-to-track full sequence.
+ */
+
+import { Router } from "express";
+import multer from "multer";
+import path from "path";
+import { fileURLToPath } from "url";
+import { mkdir, writeFile } from "fs/promises";
+import { randomUUID } from "crypto";
+import { requireAuth } from "../middlewares/requireAuth";
+import { sam2MaskEngineRequested } from "../lib/object-mask-engine";
+import { ffprobeVideoMeta, resolveClickFrameFromUpload, runSam2VideoSegmentTrack } from "../lib/sam2-video-segment-track";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const UPLOADS_DIR = path.join(__dirname, "../public/uploads");
+const VIDEOS_DIR = path.join(__dirname, "../public/videos");
+const THUMBS_DIR = path.join(__dirname, "../public/thumbs");
+
+const VIDEO_EXTS = new Set([".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v", ".3gp"]);
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 250 * 1024 * 1024 },
+});
+
+const router = Router();
+
+function clamp01(v: number): number {
+  return Math.max(0, Math.min(1, v));
+}
+
+router.post("/ai/segment-track", requireAuth, upload.single("video"), async (req, res) => {
+  try {
+    if (!sam2MaskEngineRequested()) {
+      return res.status(400).json({
+        error: "OBJECT_MASK_ENGINE must be SAM2 for /api/ai/segment-track.",
+        code: "SAM2_DISABLED",
+      });
+    }
+    if (!process.env.REPLICATE_API_TOKEN?.trim()) {
+      return res.status(503).json({ error: "REPLICATE_API_TOKEN is not configured.", code: "REPLICATE_MISSING" });
+    }
+
+    const file = req.file;
+    if (!file?.buffer || !file.mimetype.startsWith("video/")) {
+      return res.status(400).json({ error: "Multipart field `video` (video file) is required." });
+    }
+
+    const ext = "." + (file.originalname.split(".").pop() ?? "mp4").toLowerCase();
+    const safeExt = VIDEO_EXTS.has(ext) ? ext : ".mp4";
+
+    const jobId = `seg-${randomUUID()}`;
+    await mkdir(UPLOADS_DIR, { recursive: true });
+
+    const localVideoPath = path.join(UPLOADS_DIR, `${jobId}-upload${safeExt}`);
+    await writeFile(localVideoPath, file.buffer);
+
+    const nx = clamp01(Number(req.body?.objectX ?? req.body?.clickNormX ?? NaN));
+    const ny = clamp01(Number(req.body?.objectY ?? req.body?.clickNormY ?? NaN));
+    if (!Number.isFinite(nx) || !Number.isFinite(ny)) {
+      return res.status(400).json({ error: "objectX and objectY (normalized 0–1) are required." });
+    }
+
+    const meta = await ffprobeVideoMeta(localVideoPath);
+    const clickXPx = nx * meta.width;
+    const clickYPx = ny * meta.height;
+
+    const clickFrame = await resolveClickFrameFromUpload(localVideoPath, {
+      clickFrame: Number(req.body?.clickFrame),
+      clickTimeSeconds: Number(req.body?.clickTimeSeconds),
+    });
+
+    const objectId =
+      String(req.body?.objectId ?? req.body?.click_object_ids ?? "target")
+        .trim()
+        .slice(0, 64) || "target";
+
+    const rec = await runSam2VideoSegmentTrack({
+      jobId,
+      localVideoPath,
+      clickXPx,
+      clickYPx,
+      clickFrame,
+      objectId,
+      uploadsDir: UPLOADS_DIR,
+      videosDir: VIDEOS_DIR,
+      thumbsDir: THUMBS_DIR,
+    });
+
+    return res.json({
+      jobId: rec.jobId,
+      trackedObjectIds: rec.trackedObjectIds,
+      frameCount: rec.frameCount,
+      frameMasks: rec.frameMasks,
+      confidenceScores: rec.confidenceScores,
+      maskVideoUrl: rec.maskVideoUrl,
+      rawOutputSummary: rec.rawOutputSummary,
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "segment-track failed";
+    console.error("[ai-segment-track]", msg);
+    return res.status(500).json({ error: msg });
+  }
+});
+
+export default router;
+
+===== artifacts/api-server/src/lib/sam2-video-segment-track.ts =====
+/**
+ * Meta SAM 2 Video on Replicate (`meta/sam-2-video`).
+ * @see https://replicate.com/meta/sam-2-video
+ */
+
+import { execFile } from "child_process";
+import { promisify } from "util";
+import { mkdir, readFile, writeFile } from "fs/promises";
+import path from "path";
+import Replicate from "replicate";
+import ffmpegPath from "ffmpeg-static";
+import ffprobeStatic from "ffprobe-static";
+import { resolveFfmpegBin } from "./ffmpeg";
+import type { SegmentTrackFrameMask, SegmentTrackJobRecord } from "./segment-track-jobs";
+import { saveSegmentTrackJob } from "./segment-track-jobs";
+
+const execFileAsync = promisify(execFile);
+
+async function uploadLocalFileToReplicate(replicate: Replicate, localPath: string, filename: string): Promise<string> {
+  const buf = await readFile(localPath);
+  const uploaded = await replicate.files.create(buf, { filename });
+  const getUrl = uploaded?.urls?.get;
+  if (typeof getUrl !== "string" || !getUrl.startsWith("http")) {
+    throw new Error("Replicate file upload returned an invalid URL");
+  }
+  return getUrl;
+}
+
+export function extractPrimaryMaskMediaUrl(output: unknown): { url: string; summary: Record<string, unknown> } {
+  const summary: Record<string, unknown> = {};
+  if (typeof output === "string" && /^https?:\/\//.test(output)) {
+    return { url: output, summary };
+  }
+  if (!output || typeof output !== "object") {
+    throw new Error("SAM 2 video returned empty output");
+  }
+  const o = output as Record<string, unknown>;
+  for (const [k, v] of Object.entries(o)) {
+    if (v == null || typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
+      summary[k] = v as string | number | boolean | null;
+    }
+  }
+
+  const keys = ["mask", "masks", "mask_video", "combined_masks", "output_video", "video", "result", "segmentation"];
+  for (const k of keys) {
+    const v = o[k];
+    if (typeof v === "string" && /^https?:\/\//.test(v)) return { url: v, summary };
+    if (Array.isArray(v) && v.length > 0 && typeof v[0] === "string" && /^https?:\/\//.test(v[0])) {
+      return { url: v[0], summary };
+    }
+  }
+
+  for (const v of Object.values(o)) {
+    if (typeof v === "string" && /^https?:\/\/.+\.(mp4|webm|mov)(\?|$)/i.test(v)) {
+      return { url: v, summary };
+    }
+    if (v && typeof v === "object" && typeof (v as { url?: () => { href: string } }).url === "function") {
+      try {
+        const href = (v as { url: () => { href: string } }).url().href;
+        if (href.startsWith("http")) return { url: href, summary };
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  throw new Error(`SAM 2 video output had no mask/media URL. Keys: ${Object.keys(o).join(", ")}`);
+}
+
+export async function ffprobeVideoMeta(inputPath: string): Promise<{ width: number; height: number; fpsExpr: string }> {
+  const ffprobeBin = ffprobeStatic?.path || "ffprobe";
+  const { stdout } = await execFileAsync(ffprobeBin, [
+    "-v",
+    "error",
+    "-select_streams",
+    "v:0",
+    "-show_entries",
+    "stream=width,height,avg_frame_rate",
+    "-of",
+    "csv=p=0",
+    inputPath,
+  ]);
+  const line = stdout.trim().split("\n")[0] ?? "";
+  const parts = line.split(",");
+  const width = Math.max(2, Math.round(parseInt(parts[0], 10) || 1280));
+  const height = Math.max(2, Math.round(parseInt(parts[1], 10) || 720));
+  const fpsRaw = parts[2] || "30/1";
+  const [n, d] = fpsRaw.split("/").map((x) => parseInt(x, 10));
+  const fpsNum = Number.isFinite(n) && Number.isFinite(d) && d !== 0 ? n / d : 30;
+  const fpsExpr = fpsNum > 0 && fpsNum < 120 ? String(Math.round(fpsNum * 1000) / 1000) : "30";
+  return { width, height, fpsExpr };
+}
+
+async function estimateFrameCountFromDuration(videoPath: string, fpsExpr: string): Promise<number> {
+  const ffprobeBin = ffprobeStatic?.path || "ffprobe";
+  const { stdout } = await execFileAsync(ffprobeBin, [
+    "-v",
+    "error",
+    "-show_entries",
+    "format=duration",
+    "-of",
+    "csv=p=0",
+    videoPath,
+  ]);
+  const dur = parseFloat(stdout.trim()) || 0;
+  const fps = parseFloat(fpsExpr) || 30;
+  return Math.max(1, Math.round(dur * fps));
+}
+
+/** Prefer `clickTimeSeconds` (derived from HTMLVideoElement.currentTime) for accurate frame indexing. */
+export async function resolveClickFrameFromUpload(
+  localPath: string,
+  opts: { clickFrame?: number; clickTimeSeconds?: number },
+): Promise<number> {
+  const meta = await ffprobeVideoMeta(localPath);
+  const fps = parseFloat(meta.fpsExpr) || 30;
+  if (opts.clickTimeSeconds != null && Number.isFinite(opts.clickTimeSeconds)) {
+    return Math.max(0, Math.round(opts.clickTimeSeconds * fps));
+  }
+  if (opts.clickFrame != null && Number.isFinite(opts.clickFrame)) {
+    return Math.max(0, Math.round(opts.clickFrame));
+  }
+  return 0;
+}
+
+/** Binarize / grayscale mask video to match compositor expectations. */
+export async function normalizeMaskVideoToGray(
+  rawMaskPath: string,
+  outPath: string,
+  targetW: number,
+  targetH: number,
+): Promise<void> {
+  const bin = resolveFfmpegBin(ffmpegPath);
+  await execFileAsync(bin, [
+    "-y",
+    "-i",
+    rawMaskPath,
+    "-vf",
+    `scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease,pad=${targetW}:${targetH}:(ow-iw)/2:(oh-ih)/2,format=gray`,
+    "-c:v",
+    "libx264",
+    "-preset",
+    "fast",
+    "-crf",
+    "18",
+    "-pix_fmt",
+    "yuv420p",
+    "-movflags",
+    "+faststart",
+    outPath,
+  ]);
+}
+
+async function extractPreviewMaskFrames(
+  maskVideoPath: string,
+  thumbsDir: string,
+  jobId: string,
+  frameCount: number,
+  fpsExpr: string,
+): Promise<SegmentTrackFrameMask[]> {
+  const bin = resolveFfmpegBin(ffmpegPath);
+  await mkdir(thumbsDir, { recursive: true });
+  const fps = parseFloat(fpsExpr) || 30;
+  const indices =
+    frameCount > 0
+      ? [0, Math.floor(frameCount / 2), frameCount - 1].filter((i, j, a) => a.indexOf(i) === j && i >= 0)
+      : [0];
+
+  const out: SegmentTrackFrameMask[] = [];
+  const defaultConf =
+    Number(process.env.SEGMENT_TRACK_DEFAULT_CONFIDENCE ?? "0.92") ||
+    0.92;
+
+  for (const fi of indices) {
+    const pngName = `${jobId}-mask-f${fi}.png`;
+    const pngPath = path.join(thumbsDir, pngName);
+    try {
+      const t = fi / fps;
+      await execFileAsync(bin, [
+        "-y",
+        "-ss",
+        String(Math.max(0, t)),
+        "-i",
+        maskVideoPath,
+        "-vf",
+        "format=gray",
+        "-frames:v",
+        "1",
+        pngPath,
+      ]);
+      out.push({
+        frameIndex: fi,
+        maskUrl: `/api/thumbs/${pngName}`,
+        confidence: defaultConf,
+      });
+    } catch {
+      /* skip frame */
+    }
+  }
+  return out;
+}
+
+export type RunSam2SegmentTrackParams = {
+  jobId: string;
+  localVideoPath: string;
+  /** Pixel coordinates in native video space */
+  clickXPx: number;
+  clickYPx: number;
+  clickFrame: number;
+  objectId: string;
+  uploadsDir: string;
+  videosDir: string;
+  thumbsDir: string;
+};
+
+export async function runSam2VideoSegmentTrack(p: RunSam2SegmentTrackParams): Promise<SegmentTrackJobRecord> {
+  const token = process.env.REPLICATE_API_TOKEN?.trim();
+  if (!token) throw new Error("REPLICATE_API_TOKEN is required for SAM 2 video segmentation.");
+
+  const model = String(process.env.SAM2_VIDEO_MODEL ?? "meta/sam-2-video").trim();
+  const replicate = new Replicate({ auth: token });
+
+  const meta = await ffprobeVideoMeta(p.localVideoPath);
+  const cx = Math.round(Math.max(0, Math.min(meta.width - 1, p.clickXPx)));
+  const cy = Math.round(Math.max(0, Math.min(meta.height - 1, p.clickYPx)));
+  const cf = Math.max(0, Math.round(p.clickFrame));
+
+  const videoUrl = await uploadLocalFileToReplicate(replicate, p.localVideoPath, `${p.jobId}-seg-input.mp4`);
+
+  const click_coordinates = `[${cx},${cy}]`;
+  const click_labels = "1";
+  const click_frames = String(cf);
+  const click_object_ids = p.objectId.replace(/\s+/g, "_") || "target";
+
+  const output = await replicate.run(model as `${string}/${string}`, {
+    input: {
+      video: videoUrl,
+      click_coordinates,
+      click_labels,
+      click_frames,
+      click_object_ids,
+    },
+  });
+
+  const { url: rawMaskUrl, summary } = extractPrimaryMaskMediaUrl(output);
+  const rawDl = path.join(p.uploadsDir, `${p.jobId}-sam2-mask-raw.mp4`);
+  await mkdir(path.dirname(rawDl), { recursive: true });
+  const maskResp = await fetch(rawMaskUrl);
+  if (!maskResp.ok) throw new Error(`Failed to download SAM2 mask: ${maskResp.status}`);
+  await writeFile(rawDl, Buffer.from(await maskResp.arrayBuffer()));
+
+  const outW = Math.round(meta.width / 2) * 2;
+  const outH = Math.round(meta.height / 2) * 2;
+  const maskNormPath = path.join(p.videosDir, `${p.jobId}-sam2-mask.mp4`);
+  await mkdir(p.videosDir, { recursive: true });
+  await normalizeMaskVideoToGray(rawDl, maskNormPath, outW, outH);
+
+  let frameCount = await estimateFrameCountFromDuration(maskNormPath, meta.fpsExpr);
+  if (frameCount <= 0) frameCount = 1;
+
+  const frameMasks = await extractPreviewMaskFrames(
+    maskNormPath,
+    p.thumbsDir,
+    p.jobId,
+    frameCount,
+    meta.fpsExpr,
+  );
+
+  const confidenceScores: Array<number | null> = Array.from({ length: frameCount }, (_, i) => {
+    const hit = frameMasks.find((f) => f.frameIndex === i);
+    return hit?.confidence ?? null;
+  });
+
+  const rec: SegmentTrackJobRecord = {
+    jobId: p.jobId,
+    createdAt: new Date().toISOString(),
+    sourceVideoPath: p.localVideoPath,
+    maskVideoPath: maskNormPath,
+    maskVideoUrl: `/api/videos-files/${path.basename(maskNormPath)}`,
+    trackedObjectIds: [click_object_ids],
+    frameCount,
+    confidenceScores,
+    frameMasks,
+    rawOutputSummary: summary,
+  };
+  saveSegmentTrackJob(rec);
+  return rec;
+}
+

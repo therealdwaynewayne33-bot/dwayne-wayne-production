@@ -1,5 +1,4 @@
 import { Switch, Route, Router as WouterRouter, useLocation } from "wouter";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AuthProvider, useAuth } from "@/lib/auth";
@@ -16,12 +15,10 @@ import BgReplacePage from "@/pages/bg-replace";
 import FaceSwapPage from "@/pages/face-swap";
 import VideoToVideoPage from "@/pages/video-to-video";
 import GenerateScenePage from "@/pages/generate-scene";
-
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: { retry: 1, staleTime: 30_000 },
-  },
-});
+import CreativeLibraryPage from "@/pages/creative-library";
+import SciFiBuilderPage from "@/pages/sci-fi-builder";
+import AiActorStudioPage from "@/pages/ai-actor-studio";
+import ProductionHubPage from "@/pages/production-hub";
 
 const Spinner = () => (
   <div className="min-h-screen flex items-center justify-center bg-background">
@@ -77,6 +74,10 @@ function BgReplaceRoute() { return <ProtectedRoute component={BgReplacePage} />;
 function FaceSwapRoute()  { return <ProtectedRoute component={FaceSwapPage} />; }
 function V2VRoute()       { return <ProtectedRoute component={VideoToVideoPage} />; }
 function GenerateSceneRoute() { return <ProtectedRoute component={GenerateScenePage} />; }
+function CreativeLibraryRoute() { return <ProtectedRoute component={CreativeLibraryPage} />; }
+function SciFiBuilderRoute()  { return <ProtectedRoute component={SciFiBuilderPage} />; }
+function AiActorStudioRoute() { return <ProtectedRoute component={AiActorStudioPage} />; }
+function ProductionHubRoute() { return <ProtectedRoute component={ProductionHubPage} />; }
 
 function Router() {
   return (
@@ -88,6 +89,11 @@ function Router() {
       <Route path="/face-swap" component={FaceSwapRoute} />
       <Route path="/video-to-video" component={V2VRoute} />
       <Route path="/generate-scene" component={GenerateSceneRoute} />
+      <Route path="/creative-library" component={CreativeLibraryRoute} />
+      <Route path="/library" component={CreativeLibraryRoute} />
+      <Route path="/sci-fi-builder" component={SciFiBuilderRoute} />
+      <Route path="/ai-actor-studio" component={AiActorStudioRoute} />
+      <Route path="/production" component={ProductionHubRoute} />
       <Route path="/projects" component={ProjectsRoute} />
       <Route path="/projects/:id" component={ProjectDetailRoute} />
       <Route path="/characters" component={CharactersRoute} />
@@ -100,16 +106,14 @@ function Router() {
 
 function App() {
   return (
-    <QueryClientProvider client={queryClient}>
-      <TooltipProvider>
-        <WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, "")}>
-          <AuthProvider>
-            <Router />
-          </AuthProvider>
-        </WouterRouter>
-        <Toaster />
-      </TooltipProvider>
-    </QueryClientProvider>
+    <TooltipProvider>
+      <WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, "")}>
+        <AuthProvider>
+          <Router />
+        </AuthProvider>
+      </WouterRouter>
+      <Toaster />
+    </TooltipProvider>
   );
 }
 

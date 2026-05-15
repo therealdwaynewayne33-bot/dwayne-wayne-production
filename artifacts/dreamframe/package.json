@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite --config vite.config.ts --host 0.0.0.0",
     "build": "vite build --config vite.config.ts",
+    "generate:sci-fi-svgs": "node scripts/generate-wayne-scifi-svgs.mjs",
+    "generate:dwayne-scifi-pack": "node scripts/generate-dwayne-wayne-scifi-pack.mjs",
     "serve": "vite preview --config vite.config.ts --host 0.0.0.0",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

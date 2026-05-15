@@ -1,13 +1,21 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { cn } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
 import {
   Upload, Sparkles, Layers, Play, Pause, RotateCcw, Volume2, VolumeX,
   CheckCircle2, X, ShieldCheck, Wand2,
+  AlertTriangle,
 } from "lucide-react";
+import { describeFetchFailure } from "@workspace/api-client-react";
+
+const OBJECT_MASK_ENGINE_WARNING =
+  "Object masking engine not connected. This will not change only one object until SAM/object masking is installed.";
+
+type ObjectMaskEngineMode = "GEOMETRIC" | "SAM2";
 
 function fmt(s: number) {
   return `${Math.floor(s / 60)}:${Math.floor(s % 60).toString().padStart(2, "0")}`;
@@ -84,7 +92,32 @@ type BgResult = {
   lumaUrl?: string;
   faceLocked?: boolean;
   demoMode?: boolean;
+  selectedMode?: string;
+  selectedRoute?: string;
+  selectedEngine?: string;
+  renderMode?: string;
+  selectedObject?: string;
+  requestedEdit?: string;
+  protectedMask?: string;
+  editMask?: string;
+  renderProof?: {
+    selectedMode: string;
+    selectedRoute: string;
+    selectedEngine: string;
+    demoMode: boolean;
+    realAiCalled: boolean;
+    inputVideoUrlPresent: boolean;
+    inputImageUrlPresent: boolean;
+    faceLockActive: boolean;
+    backgroundReplaceActive: boolean;
+    objectEditActive: boolean;
+    colorGradeActive: boolean;
+    finalOutputUrlPresent: boolean;
+    errorMessage: string;
+  };
 };
+
+type RenderMode = "background_replace" | "character_lock" | "clothes_change" | "color_grade" | "object_edit";
 
 const PRESETS = [
   { label: "White walls",     prompt: "Replace the background with clean white studio walls, soft natural lighting" },
@@ -102,6 +135,17 @@ export default function BgReplacePage() {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [bgPrompt, setBgPrompt] = useState("");
   const [lockFace, setLockFace] = useState(true);
+  const [lockTargets, setLockTargets] = useState<string[]>(["face"]);
+  const [mode, setMode] = useState<RenderMode>("character_lock");
+  const [selectedObject, setSelectedObject] = useState<string>("");
+  const [objectAnchor, setObjectAnchor] = useState<{ x: number; y: number } | null>(null);
+  const [maskRadius, setMaskRadius] = useState(0.16);
+  const [maskEngineWarning, setMaskEngineWarning] = useState<string | null>(OBJECT_MASK_ENGINE_WARNING);
+  const objectMaskEngineRef = useRef<ObjectMaskEngineMode>("GEOMETRIC");
+  const [objectMaskEngine, setObjectMaskEngine] = useState<ObjectMaskEngineMode>("GEOMETRIC");
+  const [segmentTrackJobId, setSegmentTrackJobId] = useState<string | null>(null);
+  const [segmentTrackBusy, setSegmentTrackBusy] = useState(false);
+  const [segmentTrackError, setSegmentTrackError] = useState<string | null>(null);
   const [stage, setStage] = useState<Stage>("idle");
   const [result, setResult] = useState<BgResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -111,13 +155,50 @@ export default function BgReplacePage() {
   const fileRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
 
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/render/targeted-mask-status")
+      .then((r) => r.json())
+      .then(
+        (data: {
+          fullyConnected?: boolean;
+          clientWarnings?: string[];
+          objectMaskEngine?: ObjectMaskEngineMode;
+          replicateConfigured?: boolean;
+        }) => {
+          if (cancelled) return;
+          const engine: ObjectMaskEngineMode = data?.objectMaskEngine === "SAM2" ? "SAM2" : "GEOMETRIC";
+          objectMaskEngineRef.current = engine;
+          setObjectMaskEngine(engine);
+          if (engine === "SAM2" && data?.replicateConfigured) {
+            setMaskEngineWarning(null);
+          } else if (data?.fullyConnected) setMaskEngineWarning(null);
+          else if (Array.isArray(data?.clientWarnings) && data.clientWarnings[0])
+            setMaskEngineWarning(data.clientWarnings[0]);
+          else setMaskEngineWarning(OBJECT_MASK_ENGINE_WARNING);
+        },
+      )
+      .catch(() => {
+        if (!cancelled) setMaskEngineWarning(OBJECT_MASK_ENGINE_WARNING);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const VIDEO_EXTS = [".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v", ".3gp"];
   const isVideoFile = (f: File) => {
     const ext = "." + f.name.split(".").pop()?.toLowerCase();
-    return f.type.startsWith("video/") || f.type === "application/octet-stream" && VIDEO_EXTS.includes(ext) || VIDEO_EXTS.includes(ext);
+    // For local Windows dev, browsers sometimes provide empty/odd MIME types.
+    // Treat these extensions as authoritative.
+    return f.type.startsWith("video/") || VIDEO_EXTS.includes(ext);
   };
 
   const handleFile = (f: File) => {
+    console.log("[BG Replace] file.name", f.name);
+    console.log("[BG Replace] file.type", f.type);
+    console.log("[BG Replace] file.size", f.size);
+
     if (!isVideoFile(f)) { toast({ title: "Please upload a video file (MP4, MOV, WebM…)", variant: "destructive" }); return; }
     if (f.size > 100 * 1024 * 1024) { toast({ title: "Video must be under 100 MB (Luma limit)", variant: "destructive" }); return; }
     const url = URL.createObjectURL(f);
@@ -127,6 +208,9 @@ export default function BgReplacePage() {
     setResult(null);
     setError(null);
     setStage("idle");
+    setSegmentTrackJobId(null);
+    setSegmentTrackBusy(false);
+    setSegmentTrackError(null);
 
     // Probe duration just so we can show a small "auto-trimmed" badge in the
     // preview. The backend trims to the first 9 s automatically.
@@ -135,6 +219,10 @@ export default function BgReplacePage() {
     probe.onloadedmetadata = () => {
       const d = probe.duration;
       if (Number.isFinite(d) && d > 0) setClipDuration(d);
+    };
+    probe.onerror = () => {
+      // Don't block uploads if metadata probing fails.
+      console.log("[BG Replace] metadata probe failed");
     };
     probe.src = url;
   };
@@ -147,30 +235,91 @@ export default function BgReplacePage() {
 
   const handleSubmit = async () => {
     if (!file) { toast({ title: "Upload a video first", variant: "destructive" }); return; }
-    if (!bgPrompt.trim()) { toast({ title: "Describe the new scene first", variant: "destructive" }); return; }
+    if ((mode === "background_replace" || mode === "clothes_change") && !bgPrompt.trim()) {
+      toast({ title: "Describe the edit first", variant: "destructive" });
+      return;
+    }
+    if (mode === "object_edit") {
+      if (!bgPrompt.trim()) {
+        toast({ title: "Describe the object edit (e.g. change wall to white)", variant: "destructive" });
+        return;
+      }
+      if (!selectedObject.trim()) {
+        toast({ title: "Pick or label the object (wall, car, couch…)", variant: "destructive" });
+        return;
+      }
+      if (objectMaskEngineRef.current === "SAM2" && !segmentTrackJobId) {
+        toast({
+          title: "Click the object on the video first",
+          description: "SAM2 tracks from your click through the whole clip before rendering.",
+          variant: "destructive",
+        });
+        return;
+      }
+    }
 
     setStage("processing");
     setError(null);
 
     const form = new FormData();
     form.append("video", file);
-    form.append("backgroundPrompt", bgPrompt.trim());
+    form.append("backgroundPrompt", bgPrompt.trim() || "keep original");
     form.append("lockFace", String(lockFace));
+    form.append("lockTargets", JSON.stringify(lockTargets));
+    const selectedModeForProduction =
+      mode === "color_grade"
+        ? "color_grade"
+        : mode === "object_edit"
+          ? "object_edit"
+          : "full_production";
+    form.append("selectedMode", selectedModeForProduction);
+    if (mode === "object_edit") {
+      form.append("selectedObject", selectedObject);
+      form.append("requestedEdit", bgPrompt.trim());
+      form.append("objectX", String(objectAnchor?.x ?? ""));
+      form.append("objectY", String(objectAnchor?.y ?? ""));
+      form.append("maskRadius", String(maskRadius));
+      if (segmentTrackJobId) form.append("segmentTrackJobId", segmentTrackJobId);
+    }
+    if (mode === "color_grade") form.append("look", "luma_style_cinematic_fast");
 
     const token = localStorage.getItem("dreamframe_token");
+    const route = "/api/render/production";
     try {
-      const resp = await fetch("/api/videos/bg-replace", {
+      const resp = await fetch(route, {
         method: "POST",
         body: form,
         credentials: "include",
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.error ?? "Unknown error");
+      const raw = await resp.text();
+      let data: any = {};
+      try { data = raw ? JSON.parse(raw) : {}; } catch (e: any) {
+        console.log("[BG Replace] response JSON parse failed:", e?.message ?? e);
+        console.log("[BG Replace] raw response:", raw);
+      }
+      if (!resp.ok) {
+        console.log("[BG Replace] backend error:", data?.error ?? raw);
+        throw new Error(data?.error ?? raw ?? "Unknown error");
+      }
+      const st = data?.targetedMaskEngineStatus as
+        | {
+            fullyConnected?: boolean;
+            clientWarnings?: string[];
+            objectMaskEngine?: ObjectMaskEngineMode;
+            replicateConfigured?: boolean;
+          }
+        | undefined;
+      if (st?.objectMaskEngine === "SAM2" && st?.replicateConfigured) setMaskEngineWarning(null);
+      else if (st?.fullyConnected) setMaskEngineWarning(null);
+      else if (Array.isArray(st?.clientWarnings) && st.clientWarnings[0]) setMaskEngineWarning(st.clientWarnings[0]);
+      else if (data?.targetedObjectEdit?.clientWarnings?.[0])
+        setMaskEngineWarning(data.targetedObjectEdit.clientWarnings[0]);
       setResult(data);
       setStage("done");
     } catch (err: any) {
-      setError(err.message ?? "Something went wrong");
+      console.log("[BG Replace] submit error:", err?.message ?? err);
+      setError(describeFetchFailure(err instanceof Error ? err : new Error(String(err?.message ?? err))));
       setStage("error");
     }
   };
@@ -184,7 +333,7 @@ export default function BgReplacePage() {
     setError(null);
     const token = localStorage.getItem("dreamframe_token");
     try {
-      const resp = await fetch("/api/videos/bg-replace/fix-face", {
+      const resp = await fetch("/api/render/production", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -192,22 +341,28 @@ export default function BgReplacePage() {
         },
         credentials: "include",
         body: JSON.stringify({
-          // Always face-swap against the clean Luma render (not a previously-swapped one)
+          selectedMode: "face_swap",
           targetVideoUrl: result.lumaUrl,
-          faceSourceUrl:  result.sourceUrl,
+          faceSourceUrl: result.sourceUrl,
         }),
       });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.error ?? "Face fix failed");
+      const rawFix = await resp.text();
+      let data: { error?: string; videoUrl?: string; thumbnailUrl?: string } = {};
+      try {
+        data = rawFix ? JSON.parse(rawFix) : {};
+      } catch {
+        throw new Error(rawFix.trim() ? rawFix.slice(0, 400) : `Face fix failed (${resp.status})`);
+      }
+      if (!resp.ok) throw new Error(typeof data?.error === "string" ? data.error : "Face fix failed");
       setResult({
         ...result,
-        videoUrl: data.videoUrl,
-        thumbnailUrl: data.thumbnailUrl,
+        videoUrl: data.videoUrl ?? result.videoUrl,
+        thumbnailUrl: data.thumbnailUrl ?? result.thumbnailUrl,
         faceLocked: true,
       });
       toast({ title: "Face locked back on", description: "Your original face is now stamped on the render." });
     } catch (err: any) {
-      setError(err.message ?? "Face fix failed");
+      setError(describeFetchFailure(err instanceof Error ? err : new Error(String(err?.message ?? err))));
     } finally {
       setFixing(false);
     }
@@ -216,6 +371,72 @@ export default function BgReplacePage() {
   const reset = () => {
     setFile(null); setPreviewUrl(null); setResult(null); setError(null);
     setStage("idle"); setBgPrompt(""); setClipDuration(null);
+    setLockTargets(["face"]);
+    setSelectedObject("");
+    setObjectAnchor(null);
+    setMaskRadius(0.16);
+    setSegmentTrackJobId(null);
+    setSegmentTrackBusy(false);
+    setSegmentTrackError(null);
+  };
+
+  const runSegmentTrack = async (vid: HTMLVideoElement, nx: number, ny: number) => {
+    if (!file || objectMaskEngineRef.current !== "SAM2") return;
+    setSegmentTrackBusy(true);
+    setSegmentTrackError(null);
+    setSegmentTrackJobId(null);
+    const token = localStorage.getItem("dreamframe_token");
+    const fd = new FormData();
+    fd.append("video", file);
+    fd.append("objectX", String(nx));
+    fd.append("objectY", String(ny));
+    fd.append("clickTimeSeconds", String(vid.currentTime));
+    try {
+      const resp = await fetch("/api/ai/segment-track", {
+        method: "POST",
+        body: fd,
+        credentials: "include",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      const raw = await resp.text();
+      let data: { jobId?: string; error?: string; code?: string } = {};
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch {
+        throw new Error(raw.trim().slice(0, 200) || `segment-track failed (${resp.status})`);
+      }
+      if (!resp.ok) {
+        if (data?.code === "SAM2_DISABLED") return;
+        throw new Error(typeof data?.error === "string" ? data.error : `segment-track failed (${resp.status})`);
+      }
+      if (typeof data.jobId === "string") {
+        setSegmentTrackJobId(data.jobId);
+        toast({ title: "Object tracked", description: "SAM2 mask spans the full video for your edit." });
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setSegmentTrackError(msg);
+      toast({ title: "Tracking failed", description: msg, variant: "destructive" });
+    } finally {
+      setSegmentTrackBusy(false);
+    }
+  };
+
+  const pickObjectAnchor = (e: React.MouseEvent<HTMLVideoElement>) => {
+    if (mode !== "object_edit") return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width;
+    const y = (e.clientY - rect.top) / rect.height;
+    const nx = Math.max(0, Math.min(1, x));
+    const ny = Math.max(0, Math.min(1, y));
+    setObjectAnchor({ x: nx, y: ny });
+    void runSegmentTrack(e.currentTarget, nx, ny);
+  };
+
+  const toggleLockTarget = (target: string) => {
+    setLockTargets((prev) =>
+      prev.includes(target) ? prev.filter((t) => t !== target) : [...prev, target]
+    );
   };
 
   return (
@@ -228,7 +449,24 @@ export default function BgReplacePage() {
           <p className="text-sm text-white/30 mt-2">
             Drop a video — Luma re-renders the entire scene from your prompt while keeping the motion. Optional face-lock stamps your original face back on.
           </p>
+          <p className="text-xs text-white/45 mt-3">
+            {result?.renderMode === "production"
+              ? "PRODUCTION MODE — real AI rendering may cost credits."
+              : result?.renderMode === "local"
+                ? "LOCAL MODE — free local processing, no paid AI called."
+                : "MOCK TEST MODE — free testing, no paid AI called."}
+          </p>
         </div>
+
+        {mode === "object_edit" && objectMaskEngine === "GEOMETRIC" && maskEngineWarning ? (
+          <Alert
+            className="mb-8 border-amber-500/45 bg-amber-950/35 text-amber-50 [&>svg]:text-amber-400"
+            variant="default"
+          >
+            <AlertTriangle className="h-4 w-4" />
+            <AlertDescription className="text-amber-50/95">{maskEngineWarning}</AlertDescription>
+          </Alert>
+        ) : null}
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-10">
           {/* Left: inputs */}
@@ -248,7 +486,7 @@ export default function BgReplacePage() {
                 )}>
                 {file && previewUrl ? (
                   <>
-                    <video src={previewUrl} className="w-full h-full object-contain bg-black" muted />
+                    <video src={previewUrl} className="w-full h-full object-contain bg-black" muted onClick={pickObjectAnchor} />
                     <button onClick={(e) => { e.stopPropagation(); reset(); }}
                       className="absolute top-3 right-3 w-7 h-7 rounded-full bg-black/80 hover:bg-black flex items-center justify-center text-white transition-colors">
                       <X className="w-3.5 h-3.5" />
@@ -257,6 +495,29 @@ export default function BgReplacePage() {
                       {file.name} · {(file.size / 1024 / 1024).toFixed(1)} MB
                       {clipDuration ? ` · ${clipDuration.toFixed(1)}s` : ""}
                     </div>
+                    {mode === "object_edit" && objectMaskEngine === "SAM2" && (
+                      <div className="absolute top-14 left-3 max-w-[70%] px-2.5 py-1 rounded-full bg-cyan-950/85 border border-cyan-500/35 text-cyan-100 text-[10px] font-medium leading-snug">
+                        {segmentTrackBusy
+                          ? "SAM2 tracking…"
+                          : segmentTrackJobId
+                            ? "SAM2 mask ready — you can render."
+                            : "SAM2: click the object to track the full video."}
+                      </div>
+                    )}
+                    {mode === "object_edit" && objectMaskEngine === "SAM2" && segmentTrackError ? (
+                      <div className="absolute bottom-14 left-3 right-3 px-2 py-1 rounded-md bg-red-950/80 border border-red-500/40 text-red-100 text-[10px]">
+                        {segmentTrackError}
+                      </div>
+                    ) : null}
+                    {mode === "object_edit" && objectAnchor && (
+                      <div
+                        className="absolute w-4 h-4 rounded-full border border-cyan-300 bg-cyan-300/30 pointer-events-none"
+                        style={{
+                          left: `calc(${(objectAnchor.x * 100).toFixed(2)}% - 8px)`,
+                          top: `calc(${(objectAnchor.y * 100).toFixed(2)}% - 8px)`,
+                        }}
+                      />
+                    )}
                     {clipDuration && clipDuration > 9.5 ? (
                       <div className="absolute top-3 left-3 px-2.5 py-1 rounded-full bg-amber-500/90 text-black text-[10px] font-semibold">
                         Will trim to first 9s
@@ -283,14 +544,82 @@ export default function BgReplacePage() {
 
             {/* Background prompt */}
             <div>
+              <p className="text-[11px] text-white/30 uppercase tracking-widest mb-3">Mode</p>
+              <div className="grid grid-cols-1 gap-2 mb-4">
+                {[
+                  { id: "character_lock" as const, title: "Character Lock", desc: "Protect full person. Only requested non-character areas should change." },
+                  { id: "object_edit" as const, title: "Object Edit", desc: "Mask + composite: only the anchored region changes; video is not fully regenerated." },
+                  { id: "clothes_change" as const, title: "Clothes Change", desc: "Modify clothing area only while preserving face/body/background." },
+                  { id: "background_replace" as const, title: "Background Replace", desc: "Modify background scene while preserving subject motion." },
+                  { id: "color_grade" as const, title: "Color Grade", desc: "Apply color/lighting grade without changing person or scene layout." },
+                ].map((m) => (
+                  <button
+                    key={m.id}
+                    onClick={() => setMode(m.id)}
+                    className={cn(
+                      "w-full rounded-xl border px-3 py-2.5 text-left transition-all",
+                      mode === m.id ? "border-white/40 bg-white/10" : "border-white/8 hover:border-white/20",
+                    )}
+                  >
+                    <p className={cn("text-xs font-medium", mode === m.id ? "text-white" : "text-white/45")}>{m.title}</p>
+                    <p className="text-[10px] text-white/25 mt-1">{m.desc}</p>
+                  </button>
+                ))}
+              </div>
+
               <p className="text-[11px] text-white/30 uppercase tracking-widest mb-3">Describe the new scene</p>
               <Input data-testid="input-bg-prompt"
                 placeholder='e.g. "Place the subject on a tropical beach at sunset"'
                 value={bgPrompt} onChange={(e) => setBgPrompt(e.target.value)}
                 className="bg-white/5 border-white/10 text-white placeholder:text-white/25 focus-visible:ring-white/20 mb-2" />
               <p className="text-[11px] text-white/20 mb-3">
-                Luma re-renders the whole scene from this prompt while keeping your motion intact
+                {mode === "character_lock"
+                  ? "Character protected. No full-scene regeneration."
+                  : mode === "object_edit"
+                  ? "Uses FFmpeg masked composite — click optional (defaults to center). Describe color/remove/replace in the prompt."
+                  : mode === "clothes_change"
+                    ? "Only clothing region should be changed from your prompt."
+                    : mode === "color_grade"
+                      ? "Color/lighting grade only. Person and scene geometry are preserved."
+                    : "Luma re-renders the whole scene from this prompt while keeping your motion intact"}
               </p>
+              {mode === "object_edit" && (
+                <div className="mb-3 space-y-2">
+                  <p className="text-[10px] text-white/30 uppercase tracking-widest">Select object</p>
+                  <div className="flex flex-wrap gap-2">
+                    {["couch", "chair", "table", "lamp", "wall"].map((obj) => (
+                      <button
+                        key={obj}
+                        type="button"
+                        onClick={() => setSelectedObject(obj)}
+                        className={cn(
+                          "text-xs px-3 py-1.5 rounded-full border transition-all",
+                          selectedObject === obj
+                            ? "border-cyan-300/70 bg-cyan-300/15 text-cyan-200"
+                            : "border-white/10 text-white/45 hover:border-white/25 hover:text-white/70",
+                        )}
+                      >
+                        {obj}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-[11px] text-white/30">
+                    Optional: click the video to anchor the mask. Otherwise the edit centers on frame — adjust radius below.
+                  </p>
+                  <label className="flex flex-col gap-1 text-[11px] text-white/40 pt-2">
+                    <span className="text-white/50">Mask radius ({maskRadius.toFixed(2)})</span>
+                    <input
+                      type="range"
+                      min={0.08}
+                      max={0.4}
+                      step={0.01}
+                      value={maskRadius}
+                      onChange={(e) => setMaskRadius(Number(e.target.value))}
+                      className="w-full accent-cyan-400"
+                    />
+                  </label>
+                </div>
+              )}
               <div className="flex flex-wrap gap-2">
                 {PRESETS.map((p) => (
                   <button key={p.label} onClick={() => setBgPrompt(p.prompt)}
@@ -328,10 +657,47 @@ export default function BgReplacePage() {
                   <p className={cn("text-sm font-medium", lockFace ? "text-white" : "text-white/50")}>Lock my face</p>
                 </div>
                 <p className="text-[11px] text-white/30 leading-relaxed">
-                  After Luma re-renders the scene, we stamp your original face back on every frame so your character stays recognizable. Adds about a minute and a small extra cost — recommended for anything with people.
+                  After render, we stamp your original face back on every frame so your character stays recognizable. Adds about a minute and a small extra cost.
                 </p>
+                <div className="mt-3">
+                  <p className="text-[10px] text-white/30 uppercase tracking-widest mb-2">Face lock options</p>
+                  <div className="grid grid-cols-2 gap-2">
+                    {[
+                      { id: "face", label: "Face" },
+                      { id: "hair", label: "Hair" },
+                      { id: "skin_tone", label: "Skin tone" },
+                      { id: "accessories", label: "Accessories" },
+                    ].map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => toggleLockTarget(opt.id)}
+                        className={cn(
+                          "flex items-center gap-2 rounded-lg border px-2.5 py-2 text-xs text-left transition-all",
+                          lockTargets.includes(opt.id)
+                            ? "border-white/40 bg-white/10 text-white"
+                            : "border-white/10 text-white/45 hover:border-white/25"
+                        )}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={lockTargets.includes(opt.id)}
+                          readOnly
+                          className="accent-white"
+                        />
+                        <span>{opt.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
               </div>
             </div>
+
+            {mode === "character_lock" && (
+              <div className="rounded-2xl border border-emerald-400/20 bg-emerald-400/5 p-4">
+                <p className="text-xs text-emerald-200">Character protected. No full-scene regeneration.</p>
+              </div>
+            )}
 
             {/* Submit */}
             <Button data-testid="button-replace-bg" onClick={handleSubmit}
@@ -340,12 +706,20 @@ export default function BgReplacePage() {
               {stage === "processing" ? (
                 <>
                   <div className="w-4 h-4 rounded-full border-2 border-black/20 border-t-black animate-spin" />
-                  Rendering with Luma...
+                  {mode === "character_lock" ? "Protecting character..." : mode === "object_edit" ? "Editing selected object..." : "Rendering..."}
                 </>
               ) : (
                 <>
                   <Sparkles className="w-4 h-4" />
-                  Replace background
+                  {mode === "character_lock"
+                    ? "Apply character lock"
+                    : mode === "object_edit"
+                      ? "Apply object edit"
+                    : mode === "clothes_change"
+                      ? "Apply clothes change"
+                      : mode === "color_grade"
+                        ? "Apply color grade"
+                        : "Replace background"}
                 </>
               )}
             </Button>
@@ -384,7 +758,7 @@ export default function BgReplacePage() {
                 <div className="flex items-center justify-between mb-2 gap-2">
                   <div className="flex items-center gap-2 text-sm font-medium text-white/60">
                     <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                    <span>{result.demoMode ? "Demo render ready" : "Scene re-rendered"}</span>
+                    <span>{result.demoMode ? "DEMO ONLY render" : "Scene re-rendered"}</span>
                   </div>
                   <div className="flex items-center gap-2">
                     {result.demoMode && (
@@ -400,10 +774,27 @@ export default function BgReplacePage() {
                     )}
                   </div>
                 </div>
-                {result.demoMode && (
-                  <p className="text-[11px] text-white/30 -mt-3 mb-1">
-                    No AI was called. This is a stylized preview so you can demo the flow without using Replicate credits. Set <code className="text-white/50">BG_REPLACE_DEMO_MODE=false</code> to enable real Luma Ray-2.
-                  </p>
+                {(result.selectedMode || result.renderProof) && (
+                  <div className="border border-amber-400/15 bg-amber-400/5 rounded-2xl p-4 space-y-1.5">
+                    <p className="text-[11px] text-amber-200/80 uppercase tracking-widest">Render debug proof</p>
+                    <p className="text-[10px] text-white/35 break-all">selectedMode: {result.renderProof?.selectedMode ?? result.selectedMode}</p>
+                    <p className="text-[10px] text-white/35 break-all">selectedRoute: {result.renderProof?.selectedRoute ?? result.selectedRoute}</p>
+                    <p className="text-[10px] text-white/35 break-all">selectedEngine: {result.renderProof?.selectedEngine ?? result.selectedEngine}</p>
+                    <p className="text-[10px] text-white/35 break-all">demoMode: {String(result.renderProof?.demoMode ?? result.demoMode ?? false)}</p>
+                    <p className="text-[10px] text-white/35 break-all">realAiCalled: {String(result.renderProof?.realAiCalled ?? !result.demoMode)}</p>
+                    <p className="text-[10px] text-white/35 break-all">inputVideoUrl present: {String(result.renderProof?.inputVideoUrlPresent ?? Boolean(previewUrl))}</p>
+                    <p className="text-[10px] text-white/35 break-all">inputImageUrl present: {String(result.renderProof?.inputImageUrlPresent ?? false)}</p>
+                    <p className="text-[10px] text-white/35 break-all">faceLock active: {String(result.renderProof?.faceLockActive ?? result.faceLocked ?? false)}</p>
+                    <p className="text-[10px] text-white/35 break-all">backgroundReplace active: {String(result.renderProof?.backgroundReplaceActive ?? (mode === "background_replace" || mode === "character_lock"))}</p>
+                    <p className="text-[10px] text-white/35 break-all">objectEdit active: {String(result.renderProof?.objectEditActive ?? mode === "object_edit")}</p>
+                    <p className="text-[10px] text-white/35 break-all">colorGrade active: {String(result.renderProof?.colorGradeActive ?? mode === "color_grade")}</p>
+                    <p className="text-[10px] text-white/35 break-all">finalOutputUrl present: {String(result.renderProof?.finalOutputUrlPresent ?? Boolean(result.videoUrl))}</p>
+                    <p className="text-[10px] text-white/35 break-all">errorMessage: {result.renderProof?.errorMessage || ""}</p>
+                    {result.selectedObject && <p className="text-[10px] text-white/35 break-all">selectedObject: {result.selectedObject}</p>}
+                    {result.requestedEdit && <p className="text-[10px] text-white/35 break-all">requestedEdit: {result.requestedEdit}</p>}
+                    {result.protectedMask && <p className="text-[10px] text-white/35 break-all">protectedMask: {result.protectedMask}</p>}
+                    {result.editMask && <p className="text-[10px] text-white/35 break-all">editMask: {result.editMask}</p>}
+                  </div>
                 )}
                 <VideoPlayer src={result.videoUrl} thumbnail={result.thumbnailUrl} />
 

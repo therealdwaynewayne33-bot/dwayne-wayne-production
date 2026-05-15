@@ -35,6 +35,8 @@ export default function DashboardPage() {
   const { data: styleBreakdown } = useGetStyleBreakdown({ query: { queryKey: getGetStyleBreakdownQueryKey() } });
 
   const usagePercent = summary ? Math.min(100, Math.round((summary.planUsed / summary.planLimit) * 100)) : 0;
+  const activityList = Array.isArray(activity) ? activity : [];
+  const styleList = Array.isArray(styleBreakdown) ? styleBreakdown : [];
 
   return (
     <AppLayout>
@@ -80,13 +82,13 @@ export default function DashboardPage() {
               <h2 className="text-xs font-semibold text-white/30 uppercase tracking-widest">Recent Activity</h2>
               <Clock className="w-3.5 h-3.5 text-white/20" />
             </div>
-            {!activity || activity.length === 0 ? (
+            {activityList.length === 0 ? (
               <div className="text-center py-16 text-white/20 text-sm">
                 No activity yet. Create your first video to get started.
               </div>
             ) : (
               <div className="divide-y divide-white/[0.05]">
-                {activity.slice(0, 8).map((item) => (
+                {activityList.slice(0, 8).map((item) => (
                   <div key={item.id} data-testid={`activity-item-${item.id}`}
                     className="flex items-center gap-4 py-3.5">
                     <span className="text-base opacity-60">{ACTIVITY_ICONS[item.type] ?? "•"}</span>
@@ -133,12 +135,12 @@ export default function DashboardPage() {
             {/* Style breakdown */}
             <div>
               <h2 className="text-xs font-semibold text-white/30 uppercase tracking-widest mb-5">Styles</h2>
-              {!styleBreakdown || styleBreakdown.length === 0 ? (
+              {styleList.length === 0 ? (
                 <p className="text-xs text-white/20 py-2">Generate videos to see style stats</p>
               ) : (
                 <div className="space-y-3">
-                  {styleBreakdown.map((s) => {
-                    const total = styleBreakdown.reduce((sum, d) => sum + d.count, 0);
+                  {styleList.map((s) => {
+                    const total = styleList.reduce((sum, d) => sum + d.count, 0);
                     const pct = total > 0 ? Math.round((s.count / total) * 100) : 0;
                     return (
                       <div key={s.style}>

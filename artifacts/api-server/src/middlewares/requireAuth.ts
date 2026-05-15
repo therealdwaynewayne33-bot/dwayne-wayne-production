@@ -11,7 +11,23 @@ export function signToken(userId: number): string {
   return jwt.sign({ userId }, JWT_SECRET, { expiresIn: "7d" });
 }
 
+function isLocalDevRequest(req: Request): boolean {
+  if (process.env.DISABLE_AUTH === "true") return true;
+  if (process.env.NODE_ENV === "production") return false;
+  // If running locally (no Replit env) we want a zero-friction demo experience.
+  if (!process.env.REPL_ID) return true;
+
+  const host = (req.headers.host ?? "").toLowerCase();
+  return host.startsWith("localhost") || host.startsWith("127.0.0.1");
+}
+
 export function requireAuth(req: Request, res: Response, next: NextFunction) {
+  // Local development: bypass auth and inject a demo user id.
+  if (isLocalDevRequest(req)) {
+    req.session.userId = req.session.userId ?? 1;
+    return next();
+  }
+
   // 1. Check Authorization: Bearer <token> header first (works in iframe)
   const authHeader = req.headers.authorization;
   if (authHeader?.startsWith("Bearer ")) {

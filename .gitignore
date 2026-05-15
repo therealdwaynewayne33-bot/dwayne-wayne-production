@@ -27,6 +27,9 @@ node_modules
 !.vscode/launch.json
 !.vscode/extensions.json
 
+# Local PGlite / dev DB files (embedded Postgres fallback)
+.data/
+
 # misc
 /.sass-cache
 /connect.lock
@@ -47,3 +50,20 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+node_modules/
+.next/
+dist/
+build/
+artifacts/
+uploads/
+public/uploads/
+*.mp4
+*.mov
+*.webm
+*.avi
+*.mkv
+*.ppm
+*.jpg
+*.png
+.env
+.env.local

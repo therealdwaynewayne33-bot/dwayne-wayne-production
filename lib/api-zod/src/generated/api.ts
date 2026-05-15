@@ -230,6 +230,19 @@ export const GenerateVideoBody = zod.object({
   generationType: zod.enum(["text-to-video", "image-to-video"]),
   style: zod.enum(["realistic", "cartoon", "animated-3d", "cinematic"]),
   aiModel: zod.enum(["wan-2.1", "hunyuan", "minimax-live"]).optional(),
+  cinematicQuality: zod.enum(["standard", "high", "cinematic", "premium"]).optional(),
+  videoEngine: zod
+    .enum([
+      "auto",
+      "minimax-video-01",
+      "kling-v1.6-standard",
+      "luma-ray-2-540p",
+      "luma-ray-2-720p",
+      "runway-gen-4.5",
+      "genmoai-mochi-1",
+    ])
+    .optional(),
+  outputResolution: zod.enum(["native", "1080p", "4k"]).optional(),
   characterId: zod.number().optional(),
   sourceImageUrl: zod.string().optional(),
   backgroundReplaced: zod.boolean().optional(),

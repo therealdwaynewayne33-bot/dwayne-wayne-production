@@ -5,7 +5,7 @@ export function SplitHero() {
       <div className="relative overflow-hidden border-r border-white/10">
         <img
           src="/__mockup/images/dw-logo-bg.jpg"
-          alt="DwayneWayne"
+          alt="Dwayne Wayne Production"
           className="absolute inset-0 h-full w-full object-cover"
         />
         <div className="absolute inset-0 bg-gradient-to-tr from-black/70 via-black/20 to-transparent" />
@@ -47,7 +47,7 @@ export function SplitHero() {
         <div className="w-full max-w-sm">
           <p className="text-[11px] uppercase tracking-[0.4em] text-white/40">Welcome back</p>
           <h1 className="mt-3 text-2xl font-light tracking-tight text-white">Sign in</h1>
-          <p className="mt-2 text-sm text-white/50">to your DwayneWayne workspace</p>
+          <p className="mt-2 text-sm text-white/50">to your Dwayne Wayne Production workspace</p>
 
           <div className="mt-8 space-y-3">
             <input

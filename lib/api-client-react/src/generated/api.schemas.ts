@@ -180,6 +180,38 @@ export const GenerateVideoBodyAiModel = {
   "minimax-live": "minimax-live",
 } as const;
 
+export type GenerateVideoBodyCinematicQuality =
+  (typeof GenerateVideoBodyCinematicQuality)[keyof typeof GenerateVideoBodyCinematicQuality];
+
+export const GenerateVideoBodyCinematicQuality = {
+  standard: "standard",
+  high: "high",
+  cinematic: "cinematic",
+  premium: "premium",
+} as const;
+
+export type GenerateVideoBodyVideoEngine =
+  (typeof GenerateVideoBodyVideoEngine)[keyof typeof GenerateVideoBodyVideoEngine];
+
+export const GenerateVideoBodyVideoEngine = {
+  auto: "auto",
+  "minimax-video-01": "minimax-video-01",
+  "kling-v1.6-standard": "kling-v1.6-standard",
+  "luma-ray-2-540p": "luma-ray-2-540p",
+  "luma-ray-2-720p": "luma-ray-2-720p",
+  "runway-gen-4.5": "runway-gen-4.5",
+  "genmoai-mochi-1": "genmoai-mochi-1",
+} as const;
+
+export type GenerateVideoBodyOutputResolution =
+  (typeof GenerateVideoBodyOutputResolution)[keyof typeof GenerateVideoBodyOutputResolution];
+
+export const GenerateVideoBodyOutputResolution = {
+  native: "native",
+  "1080p": "1080p",
+  "4k": "4k",
+} as const;
+
 export interface GenerateVideoBody {
   projectId: number;
   title: string;
@@ -187,6 +219,9 @@ export interface GenerateVideoBody {
   generationType: GenerateVideoBodyGenerationType;
   style: GenerateVideoBodyStyle;
   aiModel?: GenerateVideoBodyAiModel;
+  cinematicQuality?: GenerateVideoBodyCinematicQuality;
+  videoEngine?: GenerateVideoBodyVideoEngine;
+  outputResolution?: GenerateVideoBodyOutputResolution;
   characterId?: number;
   sourceImageUrl?: string;
   backgroundReplaced?: boolean;

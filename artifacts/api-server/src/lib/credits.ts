@@ -7,17 +7,17 @@ import type { Logger } from "pino";
 // These are deliberately a little higher than raw cost so that a small markup
 // covers ffmpeg time, bandwidth, and the occasional retry.
 //
-// If you change a price, also update the matching label in
-// `artifacts/dreamframe/src/lib/credit-costs.ts` so the UI stays honest.
+// If you change a price, update the hints in `artifacts/dreamframe/src/lib/credits.tsx`.
 // ---------------------------------------------------------------------------
 
 export const COST_BG_REPLACE          = 50; // Luma modify-video (+ optional Roop)
 export const COST_BG_REPLACE_FIX_FACE = 15; // Roop only, against existing render
 
-export type SceneEngineId = "kling-2.1" | "hailuo-02" | "pixverse-4.5" | "wan-2.2-i2v";
+export type SceneEngineId = "runway-gen-4.5" | "kling-2.1" | "hailuo-02" | "pixverse-4.5" | "wan-2.2-i2v";
 
 export function costForSceneEngine(engine: SceneEngineId, durationSec?: number): number {
   switch (engine) {
+    case "runway-gen-4.5": return (durationSec ?? 5) >= 10 ? 95 : (durationSec ?? 5) >= 8 ? 72 : 55;
     case "kling-2.1":    return (durationSec ?? 5) >= 10 ? 120 : 60;
     case "hailuo-02":    return (durationSec ?? 6) >= 10 ? 55  : 35;
     case "pixverse-4.5": return 40;

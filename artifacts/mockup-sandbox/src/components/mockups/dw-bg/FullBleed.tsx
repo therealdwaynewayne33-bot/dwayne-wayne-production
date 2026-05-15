@@ -15,7 +15,7 @@ export function FullBleed() {
       <div className="relative z-10 flex min-h-screen items-center justify-center px-6 py-12">
         <div className="w-full max-w-md">
           <div className="mb-8 text-center">
-            <p className="text-[11px] uppercase tracking-[0.45em] text-white/50">DwayneWayne</p>
+            <p className="text-[11px] uppercase tracking-[0.45em] text-white/50">Dwayne Wayne Production</p>
             <h1 className="mt-3 text-2xl font-light tracking-tight text-white">
               Production AI System
             </h1>
