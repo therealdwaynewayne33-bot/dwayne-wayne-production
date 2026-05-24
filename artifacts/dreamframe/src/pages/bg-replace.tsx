@@ -91,7 +91,6 @@ type BgResult = {
   sourceUrl?: string;
   lumaUrl?: string;
   faceLocked?: boolean;
-  demoMode?: boolean;
   selectedMode?: string;
   selectedRoute?: string;
   selectedEngine?: string;
@@ -104,7 +103,6 @@ type BgResult = {
     selectedMode: string;
     selectedRoute: string;
     selectedEngine: string;
-    demoMode: boolean;
     realAiCalled: boolean;
     inputVideoUrlPresent: boolean;
     inputImageUrlPresent: boolean;
@@ -115,6 +113,10 @@ type BgResult = {
     finalOutputUrlPresent: boolean;
     errorMessage: string;
   };
+  kontextColorUrl?: string;
+  kontextError?: string;
+  kontextCreditsCharged?: number;
+  kontextCreditsRemaining?: number;
 };
 
 type RenderMode = "background_replace" | "character_lock" | "clothes_change" | "color_grade" | "object_edit";
@@ -136,7 +138,7 @@ export default function BgReplacePage() {
   const [bgPrompt, setBgPrompt] = useState("");
   const [lockFace, setLockFace] = useState(true);
   const [lockTargets, setLockTargets] = useState<string[]>(["face"]);
-  const [mode, setMode] = useState<RenderMode>("character_lock");
+  const [mode, setMode] = useState<RenderMode>("color_grade");
   const [selectedObject, setSelectedObject] = useState<string>("");
   const [objectAnchor, setObjectAnchor] = useState<{ x: number; y: number } | null>(null);
   const [maskRadius, setMaskRadius] = useState(0.16);
@@ -149,6 +151,10 @@ export default function BgReplacePage() {
   const [stage, setStage] = useState<Stage>("idle");
   const [result, setResult] = useState<BgResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [falKeyMissing, setFalKeyMissing] = useState(false);
+  // BASELINE: Real AI toggle disconnected — always local.
+  const realAiMode = false;
+  const setRealAiMode = (_value: boolean | ((prev: boolean) => boolean)) => {};
   const [dragging, setDragging] = useState(false);
   const [fixing, setFixing] = useState(false);
   const [clipDuration, setClipDuration] = useState<number | null>(null);
@@ -200,7 +206,7 @@ export default function BgReplacePage() {
     console.log("[BG Replace] file.size", f.size);
 
     if (!isVideoFile(f)) { toast({ title: "Please upload a video file (MP4, MOV, WebM…)", variant: "destructive" }); return; }
-    if (f.size > 100 * 1024 * 1024) { toast({ title: "Video must be under 100 MB (Luma limit)", variant: "destructive" }); return; }
+    if (f.size > 100 * 1024 * 1024) { toast({ title: "Video must be under 100 MB (Wayne Cinema limit)", variant: "destructive" }); return; }
     const url = URL.createObjectURL(f);
     setFile(f);
     setPreviewUrl(url);
@@ -235,56 +241,25 @@ export default function BgReplacePage() {
 
   const handleSubmit = async () => {
     if (!file) { toast({ title: "Upload a video first", variant: "destructive" }); return; }
-    if ((mode === "background_replace" || mode === "clothes_change") && !bgPrompt.trim()) {
-      toast({ title: "Describe the edit first", variant: "destructive" });
+
+    if (mode !== "color_grade") {
+      toast({
+        title: "This mode is disabled during rebuild",
+        description: "Only Cinematic Color Grade is active right now.",
+        variant: "destructive",
+      });
       return;
-    }
-    if (mode === "object_edit") {
-      if (!bgPrompt.trim()) {
-        toast({ title: "Describe the object edit (e.g. change wall to white)", variant: "destructive" });
-        return;
-      }
-      if (!selectedObject.trim()) {
-        toast({ title: "Pick or label the object (wall, car, couch…)", variant: "destructive" });
-        return;
-      }
-      if (objectMaskEngineRef.current === "SAM2" && !segmentTrackJobId) {
-        toast({
-          title: "Click the object on the video first",
-          description: "SAM2 tracks from your click through the whole clip before rendering.",
-          variant: "destructive",
-        });
-        return;
-      }
     }
 
     setStage("processing");
     setError(null);
+    setFalKeyMissing(false);
 
     const form = new FormData();
     form.append("video", file);
-    form.append("backgroundPrompt", bgPrompt.trim() || "keep original");
-    form.append("lockFace", String(lockFace));
-    form.append("lockTargets", JSON.stringify(lockTargets));
-    const selectedModeForProduction =
-      mode === "color_grade"
-        ? "color_grade"
-        : mode === "object_edit"
-          ? "object_edit"
-          : "full_production";
-    form.append("selectedMode", selectedModeForProduction);
-    if (mode === "object_edit") {
-      form.append("selectedObject", selectedObject);
-      form.append("requestedEdit", bgPrompt.trim());
-      form.append("objectX", String(objectAnchor?.x ?? ""));
-      form.append("objectY", String(objectAnchor?.y ?? ""));
-      form.append("maskRadius", String(maskRadius));
-      if (segmentTrackJobId) form.append("segmentTrackJobId", segmentTrackJobId);
-    }
-    if (mode === "color_grade") form.append("look", "luma_style_cinematic_fast");
 
     const token = localStorage.getItem("dreamframe_token");
-    const route = "/api/render/production";
+    const route = "/api/render/kontext-cinematic-color";
     try {
       const resp = await fetch(route, {
         method: "POST",
@@ -300,27 +275,21 @@ export default function BgReplacePage() {
       }
       if (!resp.ok) {
         console.log("[BG Replace] backend error:", data?.error ?? raw);
+        if (data?.falKeyMissing || (typeof data?.error === "string" && data.error.includes("FAL_KEY"))) {
+          setFalKeyMissing(true);
+        }
         throw new Error(data?.error ?? raw ?? "Unknown error");
       }
-      const st = data?.targetedMaskEngineStatus as
-        | {
-            fullyConnected?: boolean;
-            clientWarnings?: string[];
-            objectMaskEngine?: ObjectMaskEngineMode;
-            replicateConfigured?: boolean;
-          }
-        | undefined;
-      if (st?.objectMaskEngine === "SAM2" && st?.replicateConfigured) setMaskEngineWarning(null);
-      else if (st?.fullyConnected) setMaskEngineWarning(null);
-      else if (Array.isArray(st?.clientWarnings) && st.clientWarnings[0]) setMaskEngineWarning(st.clientWarnings[0]);
-      else if (data?.targetedObjectEdit?.clientWarnings?.[0])
-        setMaskEngineWarning(data.targetedObjectEdit.clientWarnings[0]);
       setResult(data);
       setStage("done");
+      setFalKeyMissing(false);
     } catch (err: any) {
-      console.log("[BG Replace] submit error:", err?.message ?? err);
-      setError(describeFetchFailure(err instanceof Error ? err : new Error(String(err?.message ?? err))));
-      setStage("error");
+    console.log("[BG Replace] submit error:", err?.message ?? err);
+    if (err instanceof Error && err.message.includes("FAL_KEY")) {
+      setFalKeyMissing(true);
+    }
+    setError(describeFetchFailure(err instanceof Error ? err : new Error(String(err?.message ?? err))));
+    setStage("error");
     }
   };
 
@@ -444,18 +413,19 @@ export default function BgReplacePage() {
       <div className="max-w-5xl mx-auto px-8 py-14">
         {/* Header */}
         <div className="mb-12">
-          <p className="text-xs text-white/30 uppercase tracking-widest mb-2">Luma Ray-2 · video to video</p>
+          <p className="text-xs text-white/30 uppercase tracking-widest mb-2">Wayne Cinema Ray-2 · video to video</p>
           <h1 className="text-4xl font-semibold text-white tracking-tight">Background Replace</h1>
           <p className="text-sm text-white/30 mt-2">
-            Drop a video — Luma re-renders the entire scene from your prompt while keeping the motion. Optional face-lock stamps your original face back on.
+            Drop a video — Wayne Cinema re-renders the entire scene from your prompt while keeping the motion. Optional face-lock stamps your original face back on.
           </p>
           <p className="text-xs text-white/45 mt-3">
-            {result?.renderMode === "production"
-              ? "PRODUCTION MODE — real AI rendering may cost credits."
-              : result?.renderMode === "local"
-                ? "LOCAL MODE — free local processing, no paid AI called."
-                : "MOCK TEST MODE — free testing, no paid AI called."}
+            Upload a video — Flux Kontext applies a cinematic color grade automatically. No toggles required.
           </p>
+          {mode !== "color_grade" && (
+            <p className="text-xs text-amber-300/80 mt-1">
+              Other modes are disabled during rebuild. Switch to Color Grade.
+            </p>
+          )}
         </div>
 
         {mode === "object_edit" && objectMaskEngine === "GEOMETRIC" && maskEngineWarning ? (
@@ -542,7 +512,16 @@ export default function BgReplacePage() {
               </div>
             </div>
 
-            {/* Background prompt */}
+            {/* Cinematic color grade — automatic Flux Kontext */}
+            <div className="rounded-2xl border border-emerald-500/25 bg-emerald-950/20 px-4 py-3">
+              <p className="text-[9px] uppercase tracking-[0.5em] text-emerald-300/70">Cinematic Color Grade</p>
+              <p className="text-xs font-semibold uppercase tracking-[0.3em] text-emerald-200 mt-1">
+                Flux Kontext — automatic
+              </p>
+              <p className="text-[11px] text-white/45 mt-1">
+                Upload your video and click Render. Fal.ai applies a cinematic look — no background or face changes.
+              </p>
+            </div>
             <div>
               <p className="text-[11px] text-white/30 uppercase tracking-widest mb-3">Mode</p>
               <div className="grid grid-cols-1 gap-2 mb-4">
@@ -555,10 +534,21 @@ export default function BgReplacePage() {
                 ].map((m) => (
                   <button
                     key={m.id}
-                    onClick={() => setMode(m.id)}
+                    onClick={() => {
+                      if (m.id !== "color_grade") {
+                        toast({
+                          title: "Mode disabled during rebuild",
+                          description: "Only Color Grade is active right now.",
+                          variant: "destructive",
+                        });
+                        return;
+                      }
+                      setMode(m.id);
+                    }}
                     className={cn(
                       "w-full rounded-xl border px-3 py-2.5 text-left transition-all",
                       mode === m.id ? "border-white/40 bg-white/10" : "border-white/8 hover:border-white/20",
+                      m.id !== "color_grade" && "opacity-40 cursor-not-allowed",
                     )}
                   >
                     <p className={cn("text-xs font-medium", mode === m.id ? "text-white" : "text-white/45")}>{m.title}</p>
@@ -581,7 +571,7 @@ export default function BgReplacePage() {
                     ? "Only clothing region should be changed from your prompt."
                     : mode === "color_grade"
                       ? "Color/lighting grade only. Person and scene geometry are preserved."
-                    : "Luma re-renders the whole scene from this prompt while keeping your motion intact"}
+                    : "Wayne Cinema re-renders the whole scene from this prompt while keeping your motion intact"}
               </p>
               {mode === "object_edit" && (
                 <div className="mb-3 space-y-2">
@@ -701,12 +691,12 @@ export default function BgReplacePage() {
 
             {/* Submit */}
             <Button data-testid="button-replace-bg" onClick={handleSubmit}
-              disabled={!file || !bgPrompt.trim() || stage === "processing"}
+              disabled={!file || (mode !== "color_grade" && !bgPrompt.trim()) || stage === "processing"}
               className="w-full bg-white text-black hover:bg-white/90 font-semibold gap-2 h-11 rounded-full">
               {stage === "processing" ? (
                 <>
                   <div className="w-4 h-4 rounded-full border-2 border-black/20 border-t-black animate-spin" />
-                  {mode === "character_lock" ? "Protecting character..." : mode === "object_edit" ? "Editing selected object..." : "Rendering..."}
+                  {mode === "color_grade" ? "Applying cinematic color grade..." : mode === "character_lock" ? "Protecting character..." : mode === "object_edit" ? "Editing selected object..." : "Rendering..."}
                 </>
               ) : (
                 <>
@@ -718,7 +708,7 @@ export default function BgReplacePage() {
                     : mode === "clothes_change"
                       ? "Apply clothes change"
                       : mode === "color_grade"
-                        ? "Apply color grade"
+                        ? "Apply cinematic color grade"
                         : "Replace background"}
                 </>
               )}
@@ -729,7 +719,7 @@ export default function BgReplacePage() {
                 <p className="text-xs font-semibold text-white/50 uppercase tracking-widest">Pipeline</p>
                 {[
                   "Uploading your video",
-                  "Luma Ray-2 re-rendering scene",
+                  "Wayne Cinema Ray-2 re-rendering the scene",
                   ...(lockFace ? ["Locking your face back on every frame"] : []),
                   "Encoding final video",
                 ].map((step, i) => (
@@ -739,7 +729,7 @@ export default function BgReplacePage() {
                   </div>
                 ))}
                 <p className="text-[11px] text-white/20 pt-1">
-                  Takes about {lockFace ? "4–6" : "3–4"} minutes — Luma renders in the cloud
+                  Takes about {lockFace ? "4–6" : "3–4"} minutes — Wayne Cinema renders in the cloud
                 </p>
               </div>
             )}
@@ -753,19 +743,23 @@ export default function BgReplacePage() {
 
           {/* Right: result */}
           <div>
-            {stage === "done" && result ? (
-              <div className="space-y-5">
+          {stage === "done" && result ? (
+            <div className="space-y-5">
+              {/* BASELINE: Flux Kontext alerts hidden while disconnected */}
+              {falKeyMissing && (
+                <Alert variant="destructive" className="px-4 py-3 text-xs">
+                  <AlertDescription>
+                    Flux Kontext requires <span className="font-bold">FAL_KEY</span> in{" "}
+                    <span className="font-bold">.env.local</span>. Add your key and restart the API server.
+                  </AlertDescription>
+                </Alert>
+              )}
                 <div className="flex items-center justify-between mb-2 gap-2">
                   <div className="flex items-center gap-2 text-sm font-medium text-white/60">
                     <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                    <span>{result.demoMode ? "DEMO ONLY render" : "Scene re-rendered"}</span>
+                    <span>{mode === "color_grade" ? "Cinematic color grade complete" : "Scene re-rendered"}</span>
                   </div>
                   <div className="flex items-center gap-2">
-                    {result.demoMode && (
-                      <div className="flex items-center gap-1.5 text-[11px] text-amber-300 bg-amber-400/10 px-2.5 py-1 rounded-full border border-amber-400/20">
-                        <span>DEMO</span>
-                      </div>
-                    )}
                     {result.faceLocked && (
                       <div className="flex items-center gap-1.5 text-[11px] text-emerald-400/80 bg-emerald-400/5 px-2.5 py-1 rounded-full border border-emerald-400/15">
                         <ShieldCheck className="w-3 h-3" />
@@ -780,8 +774,7 @@ export default function BgReplacePage() {
                     <p className="text-[10px] text-white/35 break-all">selectedMode: {result.renderProof?.selectedMode ?? result.selectedMode}</p>
                     <p className="text-[10px] text-white/35 break-all">selectedRoute: {result.renderProof?.selectedRoute ?? result.selectedRoute}</p>
                     <p className="text-[10px] text-white/35 break-all">selectedEngine: {result.renderProof?.selectedEngine ?? result.selectedEngine}</p>
-                    <p className="text-[10px] text-white/35 break-all">demoMode: {String(result.renderProof?.demoMode ?? result.demoMode ?? false)}</p>
-                    <p className="text-[10px] text-white/35 break-all">realAiCalled: {String(result.renderProof?.realAiCalled ?? !result.demoMode)}</p>
+                    <p className="text-[10px] text-white/35 break-all">realAiCalled: {String(result.renderProof?.realAiCalled ?? true)}</p>
                     <p className="text-[10px] text-white/35 break-all">inputVideoUrl present: {String(result.renderProof?.inputVideoUrlPresent ?? Boolean(previewUrl))}</p>
                     <p className="text-[10px] text-white/35 break-all">inputImageUrl present: {String(result.renderProof?.inputImageUrlPresent ?? false)}</p>
                     <p className="text-[10px] text-white/35 break-all">faceLock active: {String(result.renderProof?.faceLockActive ?? result.faceLocked ?? false)}</p>
@@ -797,6 +790,31 @@ export default function BgReplacePage() {
                   </div>
                 )}
                 <VideoPlayer src={result.videoUrl} thumbnail={result.thumbnailUrl} />
+                {result.kontextError && (
+                  <Alert variant="destructive" className="pt-2 px-3">
+                    <AlertDescription>{result.kontextError}</AlertDescription>
+                  </Alert>
+                )}
+                {result.kontextColorUrl && (
+                  <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <p className="text-[11px] uppercase tracking-widest text-white/40">Flux Kontext color grade</p>
+                      {typeof result.kontextCreditsCharged === "number" && (
+                        <span className="text-[11px] text-white/50">
+                          -{result.kontextCreditsCharged} credits
+                        </span>
+                      )}
+                    </div>
+                    <img
+                      src={result.kontextColorUrl}
+                      alt="Flux Kontext color grade"
+                      className="w-full rounded-2xl border border-white/10"
+                    />
+                    <a href={result.kontextColorUrl} download className="text-[11px] text-white/50 hover:text-white underline">
+                      Download color grade still
+                    </a>
+                  </div>
+                )}
 
                 {/* Fix face button */}
                 {result.lumaUrl && result.sourceUrl && (
@@ -841,7 +859,7 @@ export default function BgReplacePage() {
                 </div>
                 <div className="text-[11px] text-white/15 space-y-1.5 text-left w-full max-w-xs">
                   <p className="text-white/25 font-medium mb-2">How it works</p>
-                  <p>1. Luma Ray-2 re-renders the entire scene from your prompt</p>
+                  <p>1. Wayne Cinema Ray-2 re-renders the entire scene from your prompt</p>
                   <p>2. Your motion and framing are preserved</p>
                   <p>3. Optional face lock stamps your original face back on</p>
                 </div>
