@@ -18,14 +18,32 @@ import { getPublicTargetedMaskStatus } from "../lib/targeted-mask-status";
 import { getSegmentTrackJob } from "../lib/segment-track-jobs";
 import { sam2MaskEngineRequested } from "../lib/object-mask-engine";
 import { generateRunwayVideoFromOptions, resolveRunwayVideoOutput } from "../lib/replicate-video";
-import { applyFluxKontextColor } from "../lib/kontext-color";
-import { isFalConfigured } from "../lib/fal-kontext";
+// BASELINE: Fal/Kontext color grade — kept for possible re-enable.
+// import { applyFluxKontextColor } from "../lib/kontext-color";
+// import { isFalConfigured } from "../lib/fal-kontext";
+import {
+  applyRunwayAlephVideoEdit,
+  applyRunwayAlephVideoStyle,
+  RUNWAY_ALEPH_MODEL,
+  resolveAlephImageInputUrl,
+  resolveCinematicStylePreset,
+  resolveRunwayAlephPrompt,
+} from "../lib/runway-aleph-video";
+// Legacy LUT color grade — kept for reference, no longer used by color_grade.
+// import { applyReplicateVideoColorGrade, ... } from "../lib/replicate-video-color";
 import { isBaselineMode } from "../lib/baseline-mode";
 import { baselineProductionPassthrough } from "../lib/baseline-passthrough";
+import {
+  getBgReplaceJob,
+  requestCancelBgReplaceJob,
+} from "../lib/bg-replace-jobs";
+import { ROOP_FACE_SWAP_ENGINE, runRoopFaceSwap } from "../lib/replicate-face-swap";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOADS_DIR = path.join(__dirname, "../public/uploads");
 const VIDEOS_DIR = path.join(__dirname, "../public/videos");
+const TEMP_DIR = path.join(__dirname, "../../../temp");
+const BG_PRESETS_DIR = path.join(__dirname, "../public/bg-presets");
 const THUMBS_DIR = path.join(__dirname, "../public/thumbs");
 const SWAPS_DIR = path.join(__dirname, "../public/swaps");
 const execFileAsync = promisify(execFile);
@@ -302,6 +320,7 @@ function missingKeysForMode(mode: ProductionMode): string[] {
     "background_replace",
     "image_generate",
     "video_generate",
+    "color_grade",
     "full_production",
   ].includes(mode);
   if (needsReplicate && !replicateToken) {
@@ -310,7 +329,7 @@ function missingKeysForMode(mode: ProductionMode): string[] {
 
   // Luma operations are currently executed through Replicate models in this app.
   // Accept either LUMA_API_KEY (direct) OR REPLICATE_API_TOKEN (proxy path).
-  const needsLuma = ["background_replace", "full_production"].includes(mode);
+  const needsLuma = mode === "full_production";
   if (needsLuma && !lumaKey && !replicateToken) {
     missing.push("LUMA_API_KEY");
   }
@@ -2084,6 +2103,22 @@ router.get("/render/targeted-mask-status", (_req, res) => {
 router.get("/render/status", requireAuth, async (req, res) => {
   const jobId = String(req.query?.jobId ?? "").trim();
   if (!jobId) return res.status(400).json({ error: "jobId is required" });
+
+  const bgJob = getBgReplaceJob(jobId);
+  if (bgJob) {
+    return res.json({
+      jobId: bgJob.jobId,
+      status: bgJob.status,
+      progressMessage: bgJob.progressMessage,
+      currentStep: bgJob.currentStep,
+      totalSteps: bgJob.totalSteps,
+      error: bgJob.error,
+      selectedMode: bgJob.selectedMode,
+      ...(bgJob.status === "done" && bgJob.result ? bgJob.result : {}),
+      result: bgJob.result ?? null,
+    });
+  }
+
   const job = lockedColorJobs.get(jobId);
   if (!job) return res.status(404).json({ error: "Render job not found" });
   const renderMode = getRenderMode();
@@ -2114,6 +2149,14 @@ router.get("/render/status", requireAuth, async (req, res) => {
   });
 });
 
+router.post("/render/cancel", requireAuth, async (req, res) => {
+  const jobId = String(req.body?.jobId ?? req.query?.jobId ?? "").trim();
+  if (!jobId) return res.status(400).json({ error: "jobId is required" });
+  const ok = requestCancelBgReplaceJob(jobId);
+  if (!ok) return res.status(404).json({ error: "Job not found or already finished" });
+  return res.json({ jobId, cancelled: true });
+});
+
 router.post(
   "/render/production",
   requireAuth,
@@ -2129,7 +2172,14 @@ router.post(
     const files = req.files as Record<string, Express.Multer.File[]> | undefined;
     const jobId = `prod-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
-    if (isBaselineMode()) {
+    let selectedModeEarly: ProductionMode = "full_production";
+    try {
+      selectedModeEarly = parseMode(req.body?.selectedMode ?? req.body?.mode);
+    } catch {
+      // validated again below
+    }
+
+    if (isBaselineMode() && selectedModeEarly !== "background_replace") {
       return baselineProductionPassthrough(req, res, jobId, files);
     }
 
@@ -2146,6 +2196,7 @@ router.post(
     let creditsDeducted = false;
     let demoMode = isDemoModeEnabled() && !realAiRequested;
     let faceLockActive = false;
+    let pipelineWarnings: string[] = [];
     let backgroundReplaceActive = false;
     let objectEditActive = false;
     let targetedObjectEditMeta: TargetedEditRunMeta | undefined;
@@ -2158,6 +2209,8 @@ router.post(
       await mkdir(VIDEOS_DIR, { recursive: true });
       await mkdir(THUMBS_DIR, { recursive: true });
       await mkdir(SWAPS_DIR, { recursive: true });
+      await mkdir(TEMP_DIR, { recursive: true });
+      await mkdir(BG_PRESETS_DIR, { recursive: true });
 
       selectedMode = parseMode(req.body?.selectedMode ?? req.body?.mode);
       const requiresPaidAi = !["locked_reference_color_match", "color_grade", "object_edit", "audio_cleanup"].includes(selectedMode);
@@ -2184,7 +2237,7 @@ router.post(
         return replicate;
       };
       const domain = getDomain();
-      const needsLuma = ["background_replace", "full_production"].includes(selectedMode);
+      const needsLuma = selectedMode === "full_production";
       if (!demoMode && needsLuma && !domain) return res.status(500).json({ error: "Could not determine public domain" });
 
       const prompt = String(
@@ -2464,7 +2517,7 @@ router.post(
           });
         }
         if (targetVideoUrlBody && faceSourceUrlBody) {
-          selectedEngine = "arabyai-replicate/roop_face_swap";
+          selectedEngine = ROOP_FACE_SWAP_ENGINE;
           const targetLocal = parseAssetPath(targetVideoUrlBody);
           const faceSourceLocal = parseAssetPath(faceSourceUrlBody);
           if (!targetLocal || !faceSourceLocal) {
@@ -2475,8 +2528,9 @@ router.post(
           const client = ensureReplicate();
           const targetVideoUrl = await uploadLocalFileToReplicate(client, targetLocal, `${jobId}-target.mp4`);
           const faceImageUrl = await uploadLocalFileToReplicate(client, faceFramePath, `${jobId}-face.jpg`);
-          const out = await client.run("arabyai-replicate/roop_face_swap", {
-            input: { swap_image: faceImageUrl, target_video: targetVideoUrl },
+          const out = await runRoopFaceSwap(client, {
+            targetVideoUrl,
+            swapImageUrl: faceImageUrl,
           });
           realAiCalled = true;
           const outUrl = resolveReplicateUrl(out);
@@ -2763,6 +2817,8 @@ router.post(
       let maskedEditedVideoPath: string | null = null;
       let colorGradedVideoPath: string | null = null;
       let currentVideoPath = originalVideoPath;
+      let inputVideoUrlForCompare: string | null = uploadedVideo?.relativeUrl ?? null;
+      let replicateColorDebug: Record<string, unknown> | null = null;
 
       let parsedProductionState: unknown = null;
       try {
@@ -2783,10 +2839,87 @@ router.post(
       });
 
       if (selectedMode === "background_replace" || selectedMode === "full_production") {
-        selectedEngine = renderMode === "production" ? "luma/modify-video" : "ffmpeg-background-test";
         backgroundReplaceActive = true;
         faceLockActive = lockFace;
-        if (renderMode === "production") {
+
+        if (selectedMode === "background_replace") {
+          if (!token) {
+            throw new Error("Background replace requires REPLICATE_API_TOKEN.");
+          }
+          selectedEngine = RUNWAY_ALEPH_MODEL;
+          realAiCalled = true;
+          paidAiCalled = true;
+          faceLockActive = false;
+
+          const bgPromptText = String(req.body?.backgroundPrompt ?? req.body?.prompt ?? "").trim();
+          if (!bgPromptText) {
+            throw new Error(
+              "Background prompt is required. Pick a preset, enter a custom prompt, or upload a reference image.",
+            );
+          }
+          const bgInputMethod = String(req.body?.bgInputMethod ?? "custom").trim();
+          const bgPresetId = String(req.body?.bgPresetId ?? "").trim() || undefined;
+
+          if (bgInputMethod === "preset" && !bgPresetId) {
+            throw new Error("Pick a preset background.");
+          }
+          if (bgInputMethod === "reference" && !referencePath) {
+            throw new Error("Upload a reference background image.");
+          }
+
+          let referenceImageUrl: string | undefined;
+          if (referencePath && bgInputMethod === "reference") {
+            const refResolved = await resolveAlephImageInputUrl({
+              localPath: referencePath,
+              jobId,
+              label: "bg-reference",
+              uploadsDir: UPLOADS_DIR,
+            });
+            referenceImageUrl = refResolved.url;
+          }
+
+          prodPipelineLog("step_enter_background_replace_aleph", {
+            bgInputMethod,
+            bgPresetId: bgPresetId ?? null,
+            promptPreview: bgPromptText.slice(0, 240),
+            hasReferenceImage: Boolean(referenceImageUrl),
+          });
+
+          const alephInputPath = path.join(UPLOADS_DIR, `${jobId}-aleph-input.mp4`);
+          const bgPath = path.join(VIDEOS_DIR, `${jobId}-runway-aleph-bg.mp4`);
+          const editResult = await applyRunwayAlephVideoEdit({
+            replicate: new Replicate({ auth: token }),
+            videoPath: currentVideoPath,
+            jobId,
+            outputPath: bgPath,
+            preparedInputPath: alephInputPath,
+            uploadsDir: UPLOADS_DIR,
+            prompt: bgPromptText,
+            referenceImageUrl,
+          });
+
+          inputVideoUrlForCompare = `/api/uploads/${path.basename(alephInputPath)}`;
+          replicateColorDebug = {
+            model: editResult.model,
+            bgInputMethod,
+            bgPresetId,
+            prompt: editResult.prompt,
+            referenceImageUrl: editResult.referenceImageUrl ?? referenceImageUrl ?? null,
+            aspectRatio: editResult.aspectRatio,
+            seed: editResult.seed,
+            replicateInput: editResult.replicateInput,
+            replicateOutputUrl: editResult.replicateOutputUrl,
+          };
+
+          currentVideoPath = bgPath;
+          generatedVideoPath = bgPath;
+          prodPipelineLog("step_ai_background_aleph_complete", {
+            outputPath: bgPath,
+            currentVideoPath,
+            replicateColorDebug,
+          });
+        } else if (renderMode === "production") {
+          selectedEngine = "luma/modify-video";
           const inputPublicUrl =
             domain && uploadedVideo?.relativeUrl
               ? `https://${domain}${uploadedVideo.relativeUrl}`
@@ -2814,17 +2947,15 @@ router.post(
           });
 
           if (lockFace) {
-            selectedEngine = "arabyai-replicate/roop_face_swap";
+            selectedEngine = ROOP_FACE_SWAP_ENGINE;
             const faceFramePath = path.join(UPLOADS_DIR, `${jobId}-face.jpg`);
             await extractFaceFrame(inputVideoPath, faceFramePath);
             const client = ensureReplicate();
             const targetVideoUrl = await uploadLocalFileToReplicate(client, currentVideoPath, `${jobId}-bg.mp4`);
             const faceImageUrl = await uploadLocalFileToReplicate(client, faceFramePath, `${jobId}-face.jpg`);
-            const swapped = await client.run("arabyai-replicate/roop_face_swap", {
-              input: {
-                swap_image: faceImageUrl,
-                target_video: targetVideoUrl,
-              },
+            const swapped = await runRoopFaceSwap(client, {
+              targetVideoUrl,
+              swapImageUrl: faceImageUrl,
             });
             realAiCalled = true;
             const swappedUrl = resolveReplicateUrl(swapped);
@@ -2835,6 +2966,7 @@ router.post(
             prodPipelineLog("step_face_swap_after_bg_complete", { outputPath: faceLockedPath, currentVideoPath });
           }
         } else {
+          selectedEngine = "ffmpeg-background-test";
           const bgPath = path.join(VIDEOS_DIR, `${jobId}-bg.mp4`);
           await applyVisibleTestRender(
             currentVideoPath,
@@ -2925,31 +3057,89 @@ router.post(
         }
       }
 
-      let kontextColorUrl: string | null = null;
-      const runFluxKontext =
-        realAiRequested && (selectedMode === "color_grade" || selectedMode === "full_production");
-      if (runFluxKontext) {
-        const falConfigured = isFalConfigured();
+      let colorGradeImageUrl: string | null = null;
+      const cinematicStylePreset = resolveCinematicStylePreset(
+        req.body?.cinematicStyle ?? req.body?.cinematicLut ?? req.body?.lutPreset,
+      );
+      const customStylePrompt = String(req.body?.customStylePrompt ?? req.body?.customPrompt ?? "").trim();
+      const { prompt: colorPromptApplied } = resolveRunwayAlephPrompt({
+        presetId: cinematicStylePreset.id,
+        customPrompt: customStylePrompt,
+      });
+      if (selectedMode === "color_grade") {
+        throw new Error("Color grade is paused during rebuild. Use Background Replace on /bg-replace.");
+      }
+      const runReplicateColorGrade =
+        selectedMode === "color_grade" ||
+        (realAiRequested && selectedMode === "full_production");
+      if (runReplicateColorGrade) {
         console.log(
-          `[production] evaluating color grade branch (mode=${selectedMode}, renderMode=${renderMode}, falConfigured=${falConfigured})`,
+          `[production] evaluating color grade branch (mode=${selectedMode}, renderMode=${renderMode}, replicateConfigured=${Boolean(token)}, style=${cinematicStylePreset.id})`,
         );
         colorGradeActive = true;
+        prodPipelineLog("step_enter_color_grade", {
+          currentVideoPathBeforeStep: currentVideoPath,
+          cinematicStylePreset: cinematicStylePreset.id,
+          usedCustomPrompt: Boolean(customStylePrompt),
+        });
+        if (!token) {
+          console.log("[production] skipping Runway Aleph: REPLICATE_API_TOKEN is missing.");
+          throw new Error("Cinematic color grade requires REPLICATE_API_TOKEN.");
+        }
+        selectedEngine = RUNWAY_ALEPH_MODEL;
+        realAiCalled = true;
+        paidAiCalled = true;
+        console.log("[production] calling applyRunwayAlephVideoStyle ...");
+        const alephInputPath = path.join(UPLOADS_DIR, `${jobId}-aleph-input.mp4`);
+        const colorGradedPath = path.join(VIDEOS_DIR, `${jobId}-runway-aleph.mp4`);
+        const gradeResult = await applyRunwayAlephVideoStyle({
+          replicate: new Replicate({ auth: token }),
+          videoPath: currentVideoPath,
+          jobId,
+          outputPath: colorGradedPath,
+          preparedInputPath: alephInputPath,
+          uploadsDir: UPLOADS_DIR,
+          presetId: cinematicStylePreset.id,
+          customPrompt: customStylePrompt,
+        });
+        inputVideoUrlForCompare = `/api/uploads/${path.basename(alephInputPath)}`;
+        replicateColorDebug = {
+          model: gradeResult.model,
+          presetId: gradeResult.preset.id,
+          presetLabel: gradeResult.preset.label,
+          prompt: gradeResult.prompt,
+          usedCustomPrompt: gradeResult.usedCustomPrompt,
+          aspectRatio: gradeResult.aspectRatio,
+          seed: gradeResult.seed,
+          replicateInput: gradeResult.replicateInput,
+          replicateOutputUrl: gradeResult.replicateOutputUrl,
+        };
+        currentVideoPath = colorGradedPath;
+        colorGradedVideoPath = colorGradedPath;
+        const previewStill = path.join(UPLOADS_DIR, `${jobId}-color-preview.jpg`);
+        await makeThumbnail(colorGradedPath, previewStill);
+        colorGradeImageUrl = `/api/uploads/${jobId}-color-preview.jpg`;
+        console.log("[production] applyRunwayAlephVideoStyle completed.", replicateColorDebug);
+        prodPipelineLog("step_color_grade_complete", {
+          colorGradedVideoPath,
+          colorGradeImageUrl,
+          engine: selectedEngine,
+          replicateColorDebug,
+        });
+
+        /* BASELINE: Fal/Kontext color grade — kept for possible re-enable.
+        const falConfigured = isFalConfigured();
         const kontextPrompt = colorPrompt || DEFAULT_COLOR_INSTRUCTION;
-        prodPipelineLog("step_enter_color_grade", { currentVideoPathBeforeStep: currentVideoPath });
         if (!falConfigured) {
-          console.log("[production] skipping Flux Kontext: FAL_KEY is missing.");
           throw new Error("Flux Kontext color grade requires FAL_KEY.");
         }
         selectedEngine = "flux-kontext";
-        realAiCalled = true;
-        console.log("[production] calling applyFluxKontextColor ...");
         kontextColorUrl = await applyFluxKontextColor({
           videoPath: currentVideoPath,
           prompt: kontextPrompt,
           jobId: `${jobId}-kontext`,
         });
-        console.log("[production] applyFluxKontextColor completed — skipping FFmpeg color polish (passthrough).");
-        prodPipelineLog("step_color_grade_complete", { kontextColorUrl, ffmpegPolish: false });
+        */
       } else {
         console.log(`[production] color grade branch skipped (mode=${selectedMode}) — FFmpeg passthrough, no yellow filter.`);
         if (selectedMode === "color_grade") {
@@ -2967,7 +3157,8 @@ router.post(
       });
       await makeThumbnail(currentVideoPath, path.join(THUMBS_DIR, `${jobId}.jpg`));
       const outFileName = path.basename(currentVideoPath);
-      finalOutputUrl = `/api/videos-files/${outFileName}`;
+      const cacheBuster = Date.now();
+      finalOutputUrl = `/api/videos-files/${outFileName}?v=${cacheBuster}`;
 
       return res.json({
         renderMode,
@@ -2977,11 +3168,20 @@ router.post(
         selectedRoute,
         selectedEngine,
         selectedObject: selectedObject || undefined,
-        colorPromptApplied: colorPrompt || DEFAULT_COLOR_INSTRUCTION,
-        colorGradeImageUrl: kontextColorUrl,
+        cinematicStylePreset: cinematicStylePreset.id,
+        cinematicStyleLabel: cinematicStylePreset.label,
+        cinematicLutPreset: cinematicStylePreset.id,
+        cinematicLutLabel: cinematicStylePreset.label,
+        colorPromptApplied,
+        inputVideoUrl: inputVideoUrlForCompare ? `${inputVideoUrlForCompare}?v=${cacheBuster}` : null,
+        replicateColorDebug,
+        pipelineWarnings,
+        faceLocked: faceLockActive,
+        colorGradeImageUrl,
+        kontextColorUrl: colorGradeImageUrl,
         videoUrl: finalOutputUrl,
         outputUrl: finalOutputUrl,
-        thumbnailUrl: `/api/thumbs/${jobId}.jpg`,
+        thumbnailUrl: `/api/thumbs/${jobId}.jpg?v=${cacheBuster}`,
         finalOutputUrl,
         previewUsingFinalOutputUrl: Boolean(finalOutputUrl),
         mockOutputGenerated: renderMode === "mock",
@@ -3004,7 +3204,7 @@ router.post(
           objectEditActive,
           colorGradeActive,
           finalOutputUrlPresent: Boolean(finalOutputUrl),
-          errorMessage: "",
+          errorMessage: String(replicateColorDebug?.errorMessage ?? errorMessage ?? ""),
           pipelinePaths: {
             originalVideoPath,
             generatedVideoPath,
