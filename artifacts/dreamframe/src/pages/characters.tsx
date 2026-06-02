@@ -9,7 +9,7 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { Form, FormField, FormItem, FormLabel, FormControl, FormMessage } from "@/components/ui/form";
-import { Plus, Users, Trash2, Video, Upload, ImageIcon } from "lucide-react";
+import { Plus, Users, Trash2, Video, Upload, ImageIcon, Sparkles, Loader2Icon } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 
 const createSchema = z.object({
@@ -29,6 +29,54 @@ export default function CharactersPage() {
   const deleteCharacter = useDeleteCharacter();
   const queryClient = useQueryClient();
   const { toast } = useToast();
+
+  const [videoChar, setVideoChar] = useState<{ id: number; name: string; imageUrl: string | null } | null>(null);
+  const [videoLoading, setVideoLoading] = useState(false);
+  const [videoResult, setVideoResult] = useState<string | null>(null);
+  const [podAvailable, setPodAvailable] = useState<boolean | null>(null);
+
+  const checkPodStatus = async () => {
+    try {
+      const res = await fetch("/api/video/consistent/status");
+      const data = await res.json();
+      setPodAvailable(data.available === true);
+    } catch {
+      setPodAvailable(false);
+    }
+  };
+
+  const openVideoDialog = (char: { id: number; name: string; imageUrl: string | null }) => {
+    setVideoChar(char);
+    setVideoResult(null);
+    setPodAvailable(null);
+    checkPodStatus();
+  };
+
+  const generateVideo = async (mode: "background" | "clothes") => {
+    if (!videoChar?.imageUrl) return;
+    setVideoLoading(true);
+    setVideoResult(null);
+    try {
+      const res = await fetch("/api/video/consistent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageBase64: videoChar.imageUrl, mode }),
+      });
+      const data = await res.json();
+      if (data.code === "RUNPOD_UNAVAILABLE") {
+        setPodAvailable(false);
+        toast({ title: data.error, variant: "destructive" });
+      } else if (data.success && data.video) {
+        setVideoResult(data.video);
+      } else {
+        toast({ title: data.error ?? "Generation failed", variant: "destructive" });
+      }
+    } catch {
+      toast({ title: "Failed to reach server", variant: "destructive" });
+    } finally {
+      setVideoLoading(false);
+    }
+  };
 
   const characterList = Array.isArray(characters) ? characters : [];
 
@@ -128,6 +176,15 @@ export default function CharactersPage() {
                   >
                     <Trash2 className="w-3.5 h-3.5" />
                   </button>
+                  {char.imageUrl && (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); openVideoDialog(char); }}
+                      className="absolute bottom-2 right-2 p-1.5 rounded-lg bg-black/70 hover:bg-white/20 text-white opacity-0 group-hover:opacity-100 transition-all"
+                      title="Generate consistent video"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                    </button>
+                  )}
                 </div>
                 <div className="p-4">
                   <h3 data-testid={`text-character-name-${char.id}`}
@@ -207,6 +264,49 @@ export default function CharactersPage() {
                 </div>
               </form>
             </Form>
+          </DialogContent>
+        </Dialog>
+
+        <Dialog open={!!videoChar} onOpenChange={(v) => { if (!v) { setVideoChar(null); setVideoResult(null); setVideoLoading(false); } }}>
+          <DialogContent className="bg-[#0a0a0a] border-white/10 max-w-lg">
+            <DialogHeader>
+              <DialogTitle className="text-white">Consistent character video</DialogTitle>
+            </DialogHeader>
+            <div className="space-y-4">
+              {videoChar?.imageUrl && (
+                <div className="flex items-center gap-3 mb-2">
+                  <img src={videoChar.imageUrl} alt="" className="w-10 h-10 rounded-full object-cover border border-white/10" />
+                  <span className="text-sm text-white/60">{videoChar.name}</span>
+                </div>
+              )}
+              {podAvailable === false ? (
+                <div className="p-4 rounded-xl bg-white/5 border border-white/10 text-center">
+                  <p className="text-sm text-white/50">RunPod video generation is currently unavailable.</p>
+                </div>
+              ) : (
+                <div className="flex gap-3">
+                  <Button onClick={() => generateVideo("background")}
+                    disabled={videoLoading || podAvailable === null}
+                    className="flex-1 bg-white/10 text-white hover:bg-white/20 border border-white/10 rounded-xl py-6">
+                    {videoLoading ? <Loader2Icon className="w-4 h-4 animate-spin" /> : null}
+                    Animate Background Only
+                  </Button>
+                  <Button onClick={() => generateVideo("clothes")}
+                    disabled={videoLoading || podAvailable === null}
+                    className="flex-1 bg-white/10 text-white hover:bg-white/20 border border-white/10 rounded-xl py-6">
+                    {videoLoading ? <Loader2Icon className="w-4 h-4 animate-spin" /> : null}
+                    Animate Clothes Only
+                  </Button>
+                </div>
+              )}
+              {videoLoading && (
+                <p className="text-xs text-white/30 text-center">AI is locking character coordinates and animating frames...</p>
+              )}
+              {videoResult && (
+                <video src={videoResult} autoPlay loop muted controls
+                  className="w-full rounded-xl border border-white/10 mt-2" />
+              )}
+            </div>
           </DialogContent>
         </Dialog>
       </div>

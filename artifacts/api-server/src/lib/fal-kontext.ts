@@ -37,7 +37,7 @@ export async function runFalKontextEdit(opts: RunFalKontextOpts): Promise<FalKon
   }
   const key = resolveFalKey();
   if (!key) {
-    throw new Error("Missing FAL_KEY");
+    throw new Error("FAL_KEY is not configured. Set FAL_KEY or FAL_AI_KEY in .env.local to use Flux Kontext. Example: FAL_KEY=your-fal-api-key");
   }
 
   const body = {

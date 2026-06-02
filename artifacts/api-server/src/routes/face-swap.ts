@@ -2,9 +2,10 @@ import { Router } from "express";
 import multer from "multer";
 import path from "path";
 import { fileURLToPath } from "url";
-import { mkdir, writeFile } from "fs/promises";
+import { mkdir, writeFile, readFile } from "fs/promises";
 import Replicate from "replicate";
 import { requireAuth } from "../middlewares/requireAuth";
+import { isBaselineMode, baselineDisabledResponse } from "../lib/baseline-mode";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOADS_DIR = path.join(__dirname, "../public/uploads");
@@ -31,6 +32,10 @@ router.post("/face-swap", requireAuth, upload.fields([
   { name: "swapImage", maxCount: 1 },
   { name: "targetImage", maxCount: 1 },
 ]), async (req, res) => {
+  if (isBaselineMode()) {
+    return res.status(503).json(baselineDisabledResponse("/face-swap"));
+  }
+
   const files = req.files as Record<string, Express.Multer.File[]> | undefined;
   const swapFile   = files?.swapImage?.[0];
   const targetFile = files?.targetImage?.[0];
@@ -48,18 +53,36 @@ router.post("/face-swap", requireAuth, upload.fields([
   await mkdir(SWAPS_DIR,   { recursive: true });
 
   const domain = process.env.REPLIT_DEV_DOMAIN ?? process.env.REPLIT_DOMAINS?.split(",")[0];
-  if (!domain) return res.status(500).json({ error: "Could not determine public domain" });
 
-  // Save both images to disk and serve publicly so Replicate can access them
   const swapPath   = path.join(UPLOADS_DIR, `${jobId}-swap.png`);
   const targetPath = path.join(UPLOADS_DIR, `${jobId}-target.png`);
   await writeFile(swapPath,   swapFile.buffer);
   await writeFile(targetPath, targetFile.buffer);
 
-  const swapUrl   = `https://${domain}/api/uploads/${jobId}-swap.png`;
-  const targetUrl = `https://${domain}/api/uploads/${jobId}-target.png`;
-
   const replicate = new Replicate({ auth: token });
+
+  let swapUrl: string;
+  let targetUrl: string;
+  if (domain) {
+    swapUrl   = `https://${domain}/api/uploads/${jobId}-swap.png`;
+    targetUrl = `https://${domain}/api/uploads/${jobId}-target.png`;
+  } else {
+    const upload = async (p: string, kind: string) => {
+      const buf = await readFile(p);
+      const uploaded = await replicate.files.create(buf, { jobId, kind, route: "face-swap" });
+      const getUrl = (uploaded as { urls?: { get?: string } })?.urls?.get;
+      if (typeof getUrl !== "string" || !getUrl.startsWith("http")) {
+        throw new Error("Replicate file upload returned an invalid URL.");
+      }
+      return getUrl;
+    };
+    try {
+      swapUrl   = await upload(swapPath, "swap");
+      targetUrl = await upload(targetPath, "target");
+    } catch (err: any) {
+      return res.status(500).json({ error: `Failed to upload images: ${err.message}` });
+    }
+  }
 
   let output: unknown;
   try {
