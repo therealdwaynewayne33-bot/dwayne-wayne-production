@@ -132,6 +132,7 @@ type BgResult = {
     aspectRatio?: string;
     seed?: number;
     replicateInput?: Record<string, unknown>;
+    warnings?: string[];
     errorMessage?: string;
   };
 };
