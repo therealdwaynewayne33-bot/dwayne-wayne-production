@@ -20,5 +20,11 @@
   "dependencies": {
     "stripe": "^22.1.0",
     "stripe-replit-sync": "^1.0.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@ffmpeg-installer/linux-x64",
+      "esbuild"
+    ]
   }
 }
