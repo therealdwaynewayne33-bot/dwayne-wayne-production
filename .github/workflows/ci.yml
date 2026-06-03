@@ -28,6 +28,9 @@ jobs:
           node-version: "22"
           cache: pnpm
 
+      - name: Approve pnpm build scripts
+        run: pnpm approve-builds @ffmpeg-installer/linux-x64 esbuild ffmpeg-static ffprobe-static @swc/core msw
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
