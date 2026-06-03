@@ -70,12 +70,8 @@ autoInstallPeers: false
 
 onlyBuiltDependencies:
   - '@ffmpeg-installer/linux-x64'
-  - '@swc/core'
   - esbuild
   - ffmpeg-static
-  - ffprobe-static
-  - msw
-  - unrs-resolver
 
 overrides:
   # replit uses linux-x64 only, we can exclude all other platforms
@@ -148,8 +144,4 @@ overrides:
   # drizzle-kit uses esbuild internally on an older version that's vulnerable, this overrides it
   "@esbuild-kit/esm-loader": "npm:tsx@^4.21.0"
   esbuild: "0.27.3"
-  "foo": "^1.0.0"
-  "quux": "npm:@myorg/quux@^1.0.0"
-  "bar@^2.1.0": "3.0.0"
-  "qar@1>zoo": "2"
 
