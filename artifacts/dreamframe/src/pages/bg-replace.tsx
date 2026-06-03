@@ -91,7 +91,6 @@ type BgResult = {
   sourceUrl?: string;
   lumaUrl?: string;
   faceLocked?: boolean;
-  demoMode?: boolean;
   selectedMode?: string;
   selectedRoute?: string;
   selectedEngine?: string;
@@ -104,7 +103,6 @@ type BgResult = {
     selectedMode: string;
     selectedRoute: string;
     selectedEngine: string;
-    demoMode: boolean;
     realAiCalled: boolean;
     inputVideoUrlPresent: boolean;
     inputImageUrlPresent: boolean;
@@ -115,28 +113,126 @@ type BgResult = {
     finalOutputUrlPresent: boolean;
     errorMessage: string;
   };
+  kontextColorUrl?: string;
+  kontextError?: string;
+  kontextCreditsCharged?: number;
+  kontextCreditsRemaining?: number;
+  inputVideoUrl?: string | null;
+  colorPromptApplied?: string;
+  cinematicStylePreset?: string;
+  cinematicStyleLabel?: string;
+  pipelineWarnings?: string[];
+  replicateColorDebug?: {
+    model?: string;
+    replicateOutputUrl?: string;
+    bgInputMethod?: string;
+    bgPresetId?: string;
+    referenceImageUrl?: string | null;
+    prompt?: string;
+    aspectRatio?: string;
+    seed?: number;
+    replicateInput?: Record<string, unknown>;
+    warnings?: string[];
+    errorMessage?: string;
+  };
 };
 
 type RenderMode = "background_replace" | "character_lock" | "clothes_change" | "color_grade" | "object_edit";
 
-const PRESETS = [
-  { label: "White walls",     prompt: "Replace the background with clean white studio walls, soft natural lighting" },
-  { label: "Wooden floor",    prompt: "Place the subject in a warm wooden-floor interior, soft daylight" },
-  { label: "Tropical beach",  prompt: "Place the subject on a tropical beach at sunset with palm trees and ocean behind" },
-  { label: "Cyberpunk city",  prompt: "Place the subject in a neon-lit cyberpunk city street at night, rain reflections" },
-  { label: "Studio backdrop", prompt: "Plain seamless white studio backdrop, professional photography lighting" },
-  { label: "Dark walls",      prompt: "Place the subject in a moody dark-charcoal interior with dramatic side lighting" },
-  { label: "Brick wall",      prompt: "Place the subject in front of an exposed red brick wall, warm tungsten lighting" },
-  { label: "Forest",          prompt: "Place the subject in a lush green forest with dappled sunlight through the canopy" },
+const BG_PRESERVE_SUFFIX =
+  " Keep the person, their face, clothing and all movement exactly the same.";
+
+const BG_REFERENCE_DEFAULT_PROMPT =
+  `Replace the background to match this reference image.${BG_PRESERVE_SUFFIX}`;
+
+type BgPresetId =
+  | "luxury_mansion"
+  | "beach_sunset"
+  | "nyc_rooftop"
+  | "studio_black"
+  | "studio_white"
+  | "mountain_peak"
+  | "private_jet"
+  | "music_studio";
+
+type BgInputMethod = "preset" | "custom" | "reference";
+
+const BG_PRESET_BACKGROUNDS: Array<{
+  id: BgPresetId;
+  label: string;
+  thumbClass: string;
+  prompt: string;
+}> = [
+  {
+    id: "luxury_mansion",
+    label: "Luxury Mansion",
+    thumbClass: "bg-gradient-to-br from-amber-900 via-stone-700 to-yellow-900/80",
+    prompt:
+      "Replace the background with an elegant luxury mansion living room with marble floors, large chandelier, modern furniture, soft warm lighting. Keep the person, their face, clothing and all movement exactly the same.",
+  },
+  {
+    id: "beach_sunset",
+    label: "Beach Sunset",
+    thumbClass: "bg-gradient-to-br from-orange-500 via-rose-400 to-teal-600",
+    prompt:
+      "Replace the background with a tropical beach at golden hour sunset, palm trees, ocean waves, soft warm light. Keep the person, their face, clothing and all movement exactly the same.",
+  },
+  {
+    id: "nyc_rooftop",
+    label: "NYC Rooftop",
+    thumbClass: "bg-gradient-to-br from-slate-950 via-indigo-950 to-amber-500/40",
+    prompt:
+      "Replace the background with a New York City rooftop at night, skyline lights, urban dramatic atmosphere. Keep the person, their face, clothing and all movement exactly the same.",
+  },
+  {
+    id: "studio_black",
+    label: "Studio (Black BG)",
+    thumbClass: "bg-gradient-to-br from-zinc-900 via-black to-zinc-800",
+    prompt:
+      "Replace the background with a professional photography studio, solid black backdrop, dramatic studio lighting. Keep the person, their face, clothing and all movement exactly the same.",
+  },
+  {
+    id: "studio_white",
+    label: "Studio (White BG)",
+    thumbClass: "bg-gradient-to-br from-white via-zinc-100 to-zinc-300",
+    prompt:
+      "Replace the background with a professional photography studio, solid white backdrop, soft even lighting. Keep the person, their face, clothing and all movement exactly the same.",
+  },
+  {
+    id: "mountain_peak",
+    label: "Mountain Peak",
+    thumbClass: "bg-gradient-to-br from-sky-400 via-orange-300 to-slate-700",
+    prompt:
+      "Replace the background with a stunning mountain peak vista at sunrise, dramatic clouds, epic landscape. Keep the person, their face, clothing and all movement exactly the same.",
+  },
+  {
+    id: "private_jet",
+    label: "Private Jet",
+    thumbClass: "bg-gradient-to-br from-stone-800 via-amber-950 to-zinc-900",
+    prompt:
+      "Replace the background with the interior of a luxury private jet, leather seats, ambient lighting, premium cabin. Keep the person, their face, clothing and all movement exactly the same.",
+  },
+  {
+    id: "music_studio",
+    label: "Music Studio",
+    thumbClass: "bg-gradient-to-br from-violet-900 via-indigo-900 to-fuchsia-800",
+    prompt:
+      "Replace the background with a professional recording studio, mixing console, ambient purple/blue lighting, vinyl records on the wall. Keep the person, their face, clothing and all movement exactly the same.",
+  },
 ];
 
 export default function BgReplacePage() {
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [bgPrompt, setBgPrompt] = useState("");
-  const [lockFace, setLockFace] = useState(true);
-  const [lockTargets, setLockTargets] = useState<string[]>(["face"]);
-  const [mode, setMode] = useState<RenderMode>("character_lock");
+  const [mode, setMode] = useState<RenderMode>("background_replace");
+  const [bgInputMethod, setBgInputMethod] = useState<BgInputMethod | null>(null);
+  const [selectedBgPreset, setSelectedBgPreset] = useState<BgPresetId | null>(null);
+  const [customBgPrompt, setCustomBgPrompt] = useState("");
+  const [referenceImage, setReferenceImage] = useState<File | null>(null);
+  const [referencePreviewUrl, setReferencePreviewUrl] = useState<string | null>(null);
+  const [refDragging, setRefDragging] = useState(false);
+  const refFileRef = useRef<HTMLInputElement>(null);
   const [selectedObject, setSelectedObject] = useState<string>("");
   const [objectAnchor, setObjectAnchor] = useState<{ x: number; y: number } | null>(null);
   const [maskRadius, setMaskRadius] = useState(0.16);
@@ -149,6 +245,13 @@ export default function BgReplacePage() {
   const [stage, setStage] = useState<Stage>("idle");
   const [result, setResult] = useState<BgResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [progressMessage, setProgressMessage] = useState("");
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [replicateTokenMissing, setReplicateTokenMissing] = useState(false);
+  // BASELINE: Real AI toggle disconnected — always local.
+  const realAiMode = false;
+  const setRealAiMode = (_value: boolean | ((prev: boolean) => boolean)) => {};
   const [dragging, setDragging] = useState(false);
   const [fixing, setFixing] = useState(false);
   const [clipDuration, setClipDuration] = useState<number | null>(null);
@@ -186,6 +289,89 @@ export default function BgReplacePage() {
     };
   }, []);
 
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => () => stopPolling(), [stopPolling]);
+
+  const pollJobStatus = useCallback(
+    (jobId: string) => {
+      stopPolling();
+      const token = localStorage.getItem("dreamframe_token");
+      const pollOnce = async () => {
+        try {
+          const resp = await fetch(`/api/render/status?jobId=${encodeURIComponent(jobId)}`, {
+            credentials: "include",
+            headers: token ? { Authorization: `Bearer ${token}` } : {},
+          });
+          const raw = await resp.text();
+          let data: Record<string, unknown> = {};
+          try {
+            data = raw ? JSON.parse(raw) : {};
+          } catch {
+            return;
+          }
+          if (!resp.ok) return;
+
+          const msg = typeof data.progressMessage === "string" ? data.progressMessage : "";
+          if (msg) setProgressMessage(msg);
+
+          const status = typeof data.status === "string" ? data.status : "";
+          if (status === "done") {
+            stopPolling();
+            setActiveJobId(null);
+            setResult(data as BgResult);
+            setStage("done");
+            setReplicateTokenMissing(false);
+            return;
+          }
+          if (status === "failed" || status === "cancelled") {
+            stopPolling();
+            setActiveJobId(null);
+            const errMsg =
+              typeof data.error === "string" ? data.error : status === "cancelled" ? "Render cancelled." : "Render failed.";
+            setError(errMsg);
+            setStage("error");
+          }
+        } catch {
+          /* keep polling */
+        }
+      };
+
+      void pollOnce();
+      pollRef.current = setInterval(() => void pollOnce(), 2000);
+    },
+    [stopPolling],
+  );
+
+  const handleCancelRender = async () => {
+    stopPolling();
+    const token = localStorage.getItem("dreamframe_token");
+    if (activeJobId) {
+      try {
+        await fetch("/api/render/cancel", {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "Content-Type": "application/json",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({ jobId: activeJobId }),
+        });
+      } catch {
+        /* ignore */
+      }
+    }
+    setActiveJobId(null);
+    setProgressMessage("");
+    setStage("idle");
+    setError(null);
+  };
+
   const VIDEO_EXTS = [".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v", ".3gp"];
   const isVideoFile = (f: File) => {
     const ext = "." + f.name.split(".").pop()?.toLowerCase();
@@ -200,10 +386,13 @@ export default function BgReplacePage() {
     console.log("[BG Replace] file.size", f.size);
 
     if (!isVideoFile(f)) { toast({ title: "Please upload a video file (MP4, MOV, WebM…)", variant: "destructive" }); return; }
-    if (f.size > 100 * 1024 * 1024) { toast({ title: "Video must be under 100 MB (Luma limit)", variant: "destructive" }); return; }
+    if (f.size > 100 * 1024 * 1024) { toast({ title: "Video must be under 100 MB (Wayne Cinema limit)", variant: "destructive" }); return; }
     const url = URL.createObjectURL(f);
+    setPreviewUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return url;
+    });
     setFile(f);
-    setPreviewUrl(url);
     setClipDuration(null);
     setResult(null);
     setError(null);
@@ -212,17 +401,20 @@ export default function BgReplacePage() {
     setSegmentTrackBusy(false);
     setSegmentTrackError(null);
 
-    // Probe duration just so we can show a small "auto-trimmed" badge in the
-    // preview. The backend trims to the first 9 s automatically.
+    // Probe duration for display in the upload preview.
     const probe = document.createElement("video");
     probe.preload = "metadata";
     probe.onloadedmetadata = () => {
       const d = probe.duration;
       if (Number.isFinite(d) && d > 0) setClipDuration(d);
+      probe.removeAttribute("src");
+      probe.load();
     };
     probe.onerror = () => {
       // Don't block uploads if metadata probing fails.
       console.log("[BG Replace] metadata probe failed");
+      probe.removeAttribute("src");
+      probe.load();
     };
     probe.src = url;
   };
@@ -233,55 +425,104 @@ export default function BgReplacePage() {
     if (f) handleFile(f);
   }, []);
 
-  const handleSubmit = async () => {
-    if (!file) { toast({ title: "Upload a video first", variant: "destructive" }); return; }
-    if ((mode === "background_replace" || mode === "clothes_change") && !bgPrompt.trim()) {
-      toast({ title: "Describe the edit first", variant: "destructive" });
+  const IMAGE_EXTS_REF = [".jpg", ".jpeg", ".png", ".webp"];
+  const isReferenceImage = (f: File) => {
+    const ext = "." + f.name.split(".").pop()?.toLowerCase();
+    return f.type.startsWith("image/") || IMAGE_EXTS_REF.includes(ext);
+  };
+
+  const handleReferenceImage = (f: File) => {
+    if (!isReferenceImage(f)) {
+      toast({ title: "Please upload JPG, PNG, or WebP", variant: "destructive" });
       return;
     }
-    if (mode === "object_edit") {
-      if (!bgPrompt.trim()) {
-        toast({ title: "Describe the object edit (e.g. change wall to white)", variant: "destructive" });
-        return;
+    if (f.size > 10 * 1024 * 1024) {
+      toast({ title: "Reference image must be under 10 MB", variant: "destructive" });
+      return;
+    }
+    if (referencePreviewUrl) URL.revokeObjectURL(referencePreviewUrl);
+    setReferenceImage(f);
+    setReferencePreviewUrl(URL.createObjectURL(f));
+    setBgInputMethod("reference");
+    setSelectedBgPreset(null);
+    setCustomBgPrompt("");
+  };
+
+  const clearReferenceImage = () => {
+    if (referencePreviewUrl) URL.revokeObjectURL(referencePreviewUrl);
+    setReferenceImage(null);
+    setReferencePreviewUrl(null);
+    if (bgInputMethod === "reference") setBgInputMethod(null);
+  };
+
+  const selectBgPreset = (preset: (typeof BG_PRESET_BACKGROUNDS)[number]) => {
+    setBgInputMethod("preset");
+    setSelectedBgPreset(preset.id);
+    setCustomBgPrompt("");
+    clearReferenceImage();
+  };
+
+  const buildBackgroundPrompt = (): string | null => {
+    if (bgInputMethod === "preset" && selectedBgPreset) {
+      return BG_PRESET_BACKGROUNDS.find((p) => p.id === selectedBgPreset)?.prompt ?? null;
+    }
+    if (bgInputMethod === "custom") {
+      const trimmed = customBgPrompt.trim();
+      if (!trimmed) return null;
+      if (/keep the person/i.test(trimmed)) return trimmed;
+      return `${trimmed}${BG_PRESERVE_SUFFIX}`;
+    }
+    if (bgInputMethod === "reference" && referenceImage) {
+      const trimmed = customBgPrompt.trim();
+      if (trimmed) {
+        if (/keep the person/i.test(trimmed)) return trimmed;
+        return `${trimmed}${BG_PRESERVE_SUFFIX}`;
       }
-      if (!selectedObject.trim()) {
-        toast({ title: "Pick or label the object (wall, car, couch…)", variant: "destructive" });
-        return;
-      }
-      if (objectMaskEngineRef.current === "SAM2" && !segmentTrackJobId) {
-        toast({
-          title: "Click the object on the video first",
-          description: "SAM2 tracks from your click through the whole clip before rendering.",
-          variant: "destructive",
-        });
-        return;
-      }
+      return BG_REFERENCE_DEFAULT_PROMPT;
+    }
+    return null;
+  };
+
+  const canSubmitBgReplace = Boolean(file && bgInputMethod && buildBackgroundPrompt());
+
+  const handleSubmit = async () => {
+    if (!file) { toast({ title: "Upload a video first", variant: "destructive" }); return; }
+
+    if (mode !== "background_replace") {
+      toast({
+        title: "This mode is disabled during rebuild",
+        description: "Only Background Replace is active right now.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const backgroundPrompt = buildBackgroundPrompt();
+    if (!backgroundPrompt || !bgInputMethod) {
+      toast({
+        title: "Choose a background method",
+        description: "Pick a preset, enter a custom prompt, or upload a reference image.",
+        variant: "destructive",
+      });
+      return;
     }
 
     setStage("processing");
     setError(null);
+    setReplicateTokenMissing(false);
+    setProgressMessage("Runway Aleph is re-rendering your scene…");
+    setActiveJobId(null);
+    stopPolling();
 
     const form = new FormData();
     form.append("video", file);
-    form.append("backgroundPrompt", bgPrompt.trim() || "keep original");
-    form.append("lockFace", String(lockFace));
-    form.append("lockTargets", JSON.stringify(lockTargets));
-    const selectedModeForProduction =
-      mode === "color_grade"
-        ? "color_grade"
-        : mode === "object_edit"
-          ? "object_edit"
-          : "full_production";
-    form.append("selectedMode", selectedModeForProduction);
-    if (mode === "object_edit") {
-      form.append("selectedObject", selectedObject);
-      form.append("requestedEdit", bgPrompt.trim());
-      form.append("objectX", String(objectAnchor?.x ?? ""));
-      form.append("objectY", String(objectAnchor?.y ?? ""));
-      form.append("maskRadius", String(maskRadius));
-      if (segmentTrackJobId) form.append("segmentTrackJobId", segmentTrackJobId);
+    form.append("selectedMode", "background_replace");
+    form.append("backgroundPrompt", backgroundPrompt);
+    form.append("bgInputMethod", bgInputMethod);
+    if (selectedBgPreset) form.append("bgPresetId", selectedBgPreset);
+    if (bgInputMethod === "reference" && referenceImage) {
+      form.append("reference", referenceImage);
     }
-    if (mode === "color_grade") form.append("look", "luma_style_cinematic_fast");
 
     const token = localStorage.getItem("dreamframe_token");
     const route = "/api/render/production";
@@ -300,27 +541,22 @@ export default function BgReplacePage() {
       }
       if (!resp.ok) {
         console.log("[BG Replace] backend error:", data?.error ?? raw);
+        if (typeof data?.error === "string" && data.error.includes("REPLICATE_API_TOKEN")) {
+          setReplicateTokenMissing(true);
+        }
         throw new Error(data?.error ?? raw ?? "Unknown error");
       }
-      const st = data?.targetedMaskEngineStatus as
-        | {
-            fullyConnected?: boolean;
-            clientWarnings?: string[];
-            objectMaskEngine?: ObjectMaskEngineMode;
-            replicateConfigured?: boolean;
-          }
-        | undefined;
-      if (st?.objectMaskEngine === "SAM2" && st?.replicateConfigured) setMaskEngineWarning(null);
-      else if (st?.fullyConnected) setMaskEngineWarning(null);
-      else if (Array.isArray(st?.clientWarnings) && st.clientWarnings[0]) setMaskEngineWarning(st.clientWarnings[0]);
-      else if (data?.targetedObjectEdit?.clientWarnings?.[0])
-        setMaskEngineWarning(data.targetedObjectEdit.clientWarnings[0]);
+
       setResult(data);
       setStage("done");
+      setReplicateTokenMissing(false);
     } catch (err: any) {
-      console.log("[BG Replace] submit error:", err?.message ?? err);
-      setError(describeFetchFailure(err instanceof Error ? err : new Error(String(err?.message ?? err))));
-      setStage("error");
+    console.log("[BG Replace] submit error:", err?.message ?? err);
+    if (err instanceof Error && err.message.includes("REPLICATE_API_TOKEN")) {
+      setReplicateTokenMissing(true);
+    }
+    setError(describeFetchFailure(err instanceof Error ? err : new Error(String(err?.message ?? err))));
+    setStage("error");
     }
   };
 
@@ -369,15 +605,26 @@ export default function BgReplacePage() {
   };
 
   const reset = () => {
-    setFile(null); setPreviewUrl(null); setResult(null); setError(null);
+    stopPolling();
+    setFile(null);
+    setPreviewUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return null;
+    });
+    setResult(null); setError(null);
     setStage("idle"); setBgPrompt(""); setClipDuration(null);
-    setLockTargets(["face"]);
+    setProgressMessage("");
+    setActiveJobId(null);
     setSelectedObject("");
     setObjectAnchor(null);
     setMaskRadius(0.16);
     setSegmentTrackJobId(null);
     setSegmentTrackBusy(false);
     setSegmentTrackError(null);
+    setBgInputMethod(null);
+    setSelectedBgPreset(null);
+    setCustomBgPrompt("");
+    clearReferenceImage();
   };
 
   const runSegmentTrack = async (vid: HTMLVideoElement, nx: number, ny: number) => {
@@ -433,29 +680,21 @@ export default function BgReplacePage() {
     void runSegmentTrack(e.currentTarget, nx, ny);
   };
 
-  const toggleLockTarget = (target: string) => {
-    setLockTargets((prev) =>
-      prev.includes(target) ? prev.filter((t) => t !== target) : [...prev, target]
-    );
-  };
-
   return (
     <AppLayout>
       <div className="max-w-5xl mx-auto px-8 py-14">
         {/* Header */}
         <div className="mb-12">
-          <p className="text-xs text-white/30 uppercase tracking-widest mb-2">Luma Ray-2 · video to video</p>
+          <p className="text-xs text-white/30 uppercase tracking-widest mb-2">Background Replace · Runway Gen-4 Aleph</p>
           <h1 className="text-4xl font-semibold text-white tracking-tight">Background Replace</h1>
           <p className="text-sm text-white/30 mt-2">
-            Drop a video — Luma re-renders the entire scene from your prompt while keeping the motion. Optional face-lock stamps your original face back on.
+            Upload a video and describe a new background — Runway Gen-4 Aleph re-renders the scene from your preset, prompt, or reference image.
           </p>
-          <p className="text-xs text-white/45 mt-3">
-            {result?.renderMode === "production"
-              ? "PRODUCTION MODE — real AI rendering may cost credits."
-              : result?.renderMode === "local"
-                ? "LOCAL MODE — free local processing, no paid AI called."
-                : "MOCK TEST MODE — free testing, no paid AI called."}
-          </p>
+          {mode !== "background_replace" && (
+            <p className="text-xs text-amber-300/80 mt-3">
+              Other modes are disabled during rebuild. Background Replace is active.
+            </p>
+          )}
         </div>
 
         {mode === "object_edit" && objectMaskEngine === "GEOMETRIC" && maskEngineWarning ? (
@@ -491,10 +730,15 @@ export default function BgReplacePage() {
                       className="absolute top-3 right-3 w-7 h-7 rounded-full bg-black/80 hover:bg-black flex items-center justify-center text-white transition-colors">
                       <X className="w-3.5 h-3.5" />
                     </button>
-                    <div className="absolute bottom-3 left-3 px-2.5 py-1 rounded-full bg-black/70 text-white text-[10px] font-medium">
-                      {file.name} · {(file.size / 1024 / 1024).toFixed(1)} MB
-                      {clipDuration ? ` · ${clipDuration.toFixed(1)}s` : ""}
-                    </div>
+                    {clipDuration ? (
+                      <div className="absolute bottom-3 left-3 px-2.5 py-1 rounded-full bg-black/70 text-white text-[10px] font-medium">
+                        {file.name} · {(file.size / 1024 / 1024).toFixed(1)} MB · {clipDuration.toFixed(1)}s
+                      </div>
+                    ) : (
+                      <div className="absolute bottom-3 left-3 px-2.5 py-1 rounded-full bg-black/70 text-white text-[10px] font-medium">
+                        {file.name} · {(file.size / 1024 / 1024).toFixed(1)} MB
+                      </div>
+                    )}
                     {mode === "object_edit" && objectMaskEngine === "SAM2" && (
                       <div className="absolute top-14 left-3 max-w-[70%] px-2.5 py-1 rounded-full bg-cyan-950/85 border border-cyan-500/35 text-cyan-100 text-[10px] font-medium leading-snug">
                         {segmentTrackBusy
@@ -518,11 +762,6 @@ export default function BgReplacePage() {
                         }}
                       />
                     )}
-                    {clipDuration && clipDuration > 9.5 ? (
-                      <div className="absolute top-3 left-3 px-2.5 py-1 rounded-full bg-amber-500/90 text-black text-[10px] font-semibold">
-                        Will trim to first 9s
-                      </div>
-                    ) : null}
                   </>
                 ) : (
                   <div className="flex flex-col items-center gap-4 text-center px-6">
@@ -531,7 +770,7 @@ export default function BgReplacePage() {
                     </div>
                     <div>
                       <p className="text-sm font-medium text-white/50">Drop your video here</p>
-                      <p className="text-xs text-white/20 mt-1">MP4, MOV, WebM · up to 100 MB · trimmed to first 9 seconds</p>
+                      <p className="text-xs text-white/20 mt-1">MP4, MOV, WebM · up to 100 MB</p>
                     </div>
                     <button onClick={() => fileRef.current?.click()}
                       className="text-xs text-white/40 hover:text-white transition-colors font-medium">Browse file</button>
@@ -542,7 +781,141 @@ export default function BgReplacePage() {
               </div>
             </div>
 
-            {/* Background prompt */}
+            {/* Background Replace — Runway Gen-4 Aleph via Replicate */}
+            {mode === "background_replace" && (
+              <div className="rounded-2xl border border-cyan-500/25 bg-cyan-950/20 px-4 py-3 space-y-4">
+                <Alert className="border-amber-500/30 bg-amber-500/10 text-amber-100">
+                  <AlertTriangle className="h-4 w-4 text-amber-300" />
+                  <AlertDescription className="text-xs leading-relaxed">
+                    ⚠️ Each render costs ~$1.60 (Runway Gen-4 Aleph, up to 9 seconds of video)
+                  </AlertDescription>
+                </Alert>
+                <div>
+                  <p className="text-[9px] uppercase tracking-[0.5em] text-cyan-300/70">Background Replace</p>
+                  <p className="text-xs font-semibold uppercase tracking-[0.3em] text-cyan-200 mt-1">
+                    Runway Gen-4 Aleph · video-to-video
+                  </p>
+                  <p className="text-[11px] text-white/45 mt-1">
+                    Pick one method below — preset, custom prompt, or reference image.
+                  </p>
+                </div>
+
+                <div className="space-y-2">
+                  <p className="text-[11px] text-white/40 uppercase tracking-widest">Preset backgrounds</p>
+                  <div className="grid grid-cols-2 gap-2">
+                    {BG_PRESET_BACKGROUNDS.map((preset) => (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        onClick={() => selectBgPreset(preset)}
+                        className={cn(
+                          "rounded-xl border overflow-hidden text-left transition-all",
+                          bgInputMethod === "preset" && selectedBgPreset === preset.id
+                            ? "border-cyan-400/50 ring-1 ring-cyan-400/30"
+                            : "border-white/10 hover:border-white/25",
+                        )}
+                      >
+                        <div className={cn("aspect-video w-full bg-black/40 overflow-hidden", preset.thumbClass)}>
+                          <img
+                            src={`/api/bg-presets/${preset.id}.jpg`}
+                            alt={preset.label}
+                            className="w-full h-full object-cover"
+                          />
+                        </div>
+                        <p className="text-[11px] font-medium text-white/85 px-2 py-1.5">{preset.label}</p>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-[11px] text-white/40 uppercase tracking-widest">Describe your background</label>
+                  <textarea
+                    value={customBgPrompt}
+                    onChange={(e) => {
+                      setCustomBgPrompt(e.target.value);
+                      if (referenceImage) {
+                        setBgInputMethod("reference");
+                        setSelectedBgPreset(null);
+                      } else {
+                        setBgInputMethod("custom");
+                        setSelectedBgPreset(null);
+                      }
+                    }}
+                    placeholder="e.g., 'Replace background with a Lamborghini showroom, polished floors, bright modern lighting'"
+                    rows={3}
+                    className="w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-xs text-white/80 placeholder:text-white/25 focus:outline-none focus:border-cyan-400/40"
+                  />
+                  <p className="text-[10px] text-white/25">
+                    We auto-append: &quot;Keep the person, their face, clothing and all movement exactly the same.&quot;
+                  </p>
+                </div>
+
+                <div className="space-y-2">
+                  <p className="text-[11px] text-white/40 uppercase tracking-widest">
+                    Or upload a reference image of the background you want
+                  </p>
+                  <div
+                    onDragOver={(e) => { e.preventDefault(); setRefDragging(true); }}
+                    onDragLeave={() => setRefDragging(false)}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      setRefDragging(false);
+                      const f = e.dataTransfer.files[0];
+                      if (f) handleReferenceImage(f);
+                    }}
+                    onClick={() => !referenceImage && refFileRef.current?.click()}
+                    className={cn(
+                      "relative rounded-xl border-2 border-dashed transition-all overflow-hidden",
+                      refDragging ? "border-cyan-400/50 bg-cyan-400/5" : "border-white/10",
+                      referenceImage ? "cursor-default" : "cursor-pointer hover:border-white/25",
+                    )}
+                  >
+                    {referenceImage && referencePreviewUrl ? (
+                      <div className="relative aspect-video">
+                        <img src={referencePreviewUrl} alt="Reference background" className="w-full h-full object-cover" />
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); clearReferenceImage(); }}
+                          className="absolute top-2 right-2 w-7 h-7 rounded-full bg-black/80 hover:bg-black flex items-center justify-center text-white"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                        <div className="absolute bottom-2 left-2 px-2 py-1 rounded-full bg-black/70 text-[10px] text-white">
+                          {referenceImage.name}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="py-8 flex flex-col items-center gap-2 text-center px-4">
+                        <Upload className="w-5 h-5 text-white/30" />
+                        <p className="text-xs text-white/45">Drag & drop JPG, PNG, or WebP</p>
+                        <p className="text-[10px] text-white/25">Up to 10 MB</p>
+                      </div>
+                    )}
+                    <input
+                      ref={refFileRef}
+                      type="file"
+                      accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+                      className="hidden"
+                      onChange={(e) => e.target.files?.[0] && handleReferenceImage(e.target.files[0])}
+                    />
+                  </div>
+                  {bgInputMethod === "reference" && (
+                    <p className="text-[10px] text-white/30">
+                      Optional: add a custom prompt above to refine the reference-based background.
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {mode === "color_grade" && (
+              <div className="rounded-2xl border border-white/10 bg-white/[0.02] px-4 py-6 text-center">
+                <p className="text-sm text-amber-200/90 font-medium">Mode disabled during rebuild</p>
+                <p className="text-xs text-white/35 mt-2">Color Grade is paused. Use Background Replace.</p>
+              </div>
+            )}
+
             <div>
               <p className="text-[11px] text-white/30 uppercase tracking-widest mb-3">Mode</p>
               <div className="grid grid-cols-1 gap-2 mb-4">
@@ -555,18 +928,36 @@ export default function BgReplacePage() {
                 ].map((m) => (
                   <button
                     key={m.id}
-                    onClick={() => setMode(m.id)}
+                    onClick={() => {
+                      if (m.id !== "background_replace") {
+                        toast({
+                          title: "Mode disabled during rebuild",
+                          description: m.id === "color_grade"
+                            ? "Color Grade is paused. Background Replace is active."
+                            : "Only Background Replace is active right now.",
+                          variant: "destructive",
+                        });
+                        return;
+                      }
+                      setMode(m.id);
+                    }}
                     className={cn(
                       "w-full rounded-xl border px-3 py-2.5 text-left transition-all",
                       mode === m.id ? "border-white/40 bg-white/10" : "border-white/8 hover:border-white/20",
+                      m.id !== "background_replace" && "opacity-40 cursor-not-allowed",
                     )}
                   >
                     <p className={cn("text-xs font-medium", mode === m.id ? "text-white" : "text-white/45")}>{m.title}</p>
                     <p className="text-[10px] text-white/25 mt-1">{m.desc}</p>
+                    {m.id === "color_grade" && (
+                      <p className="text-[10px] text-amber-300/70 mt-1">Mode disabled during rebuild</p>
+                    )}
                   </button>
                 ))}
               </div>
 
+              {mode !== "background_replace" && (
+              <>
               <p className="text-[11px] text-white/30 uppercase tracking-widest mb-3">Describe the new scene</p>
               <Input data-testid="input-bg-prompt"
                 placeholder='e.g. "Place the subject on a tropical beach at sunset"'
@@ -581,8 +972,10 @@ export default function BgReplacePage() {
                     ? "Only clothing region should be changed from your prompt."
                     : mode === "color_grade"
                       ? "Color/lighting grade only. Person and scene geometry are preserved."
-                    : "Luma re-renders the whole scene from this prompt while keeping your motion intact"}
+                    : "Wayne Cinema re-renders the whole scene from this prompt while keeping your motion intact"}
               </p>
+              </>
+              )}
               {mode === "object_edit" && (
                 <div className="mb-3 space-y-2">
                   <p className="text-[10px] text-white/30 uppercase tracking-widest">Select object</p>
@@ -620,117 +1013,31 @@ export default function BgReplacePage() {
                   </label>
                 </div>
               )}
-              <div className="flex flex-wrap gap-2">
-                {PRESETS.map((p) => (
-                  <button key={p.label} onClick={() => setBgPrompt(p.prompt)}
-                    className={cn("text-xs px-3 py-1.5 rounded-full border transition-all",
-                      bgPrompt === p.prompt
-                        ? "border-white/40 bg-white/10 text-white"
-                        : "border-white/8 text-white/30 hover:border-white/20 hover:text-white/60")}>
-                    {p.label}
-                  </button>
-                ))}
-              </div>
             </div>
-
-            {/* Lock my face toggle */}
-            <div className="rounded-2xl border border-white/8 bg-white/[0.02] p-4 flex items-start gap-4">
-              <button
-                data-testid="toggle-lock-face"
-                onClick={() => setLockFace(v => !v)}
-                role="switch"
-                aria-checked={lockFace}
-                className={cn(
-                  "relative w-10 h-6 rounded-full transition-colors shrink-0 mt-0.5",
-                  lockFace ? "bg-white" : "bg-white/15"
-                )}>
-                <span
-                  className={cn(
-                    "absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-black transition-transform",
-                    lockFace ? "translate-x-4" : "translate-x-0"
-                  )}
-                />
-              </button>
-              <div className="flex-1">
-                <div className="flex items-center gap-2 mb-1">
-                  <ShieldCheck className={cn("w-3.5 h-3.5", lockFace ? "text-white" : "text-white/30")} />
-                  <p className={cn("text-sm font-medium", lockFace ? "text-white" : "text-white/50")}>Lock my face</p>
-                </div>
-                <p className="text-[11px] text-white/30 leading-relaxed">
-                  After render, we stamp your original face back on every frame so your character stays recognizable. Adds about a minute and a small extra cost.
-                </p>
-                <div className="mt-3">
-                  <p className="text-[10px] text-white/30 uppercase tracking-widest mb-2">Face lock options</p>
-                  <div className="grid grid-cols-2 gap-2">
-                    {[
-                      { id: "face", label: "Face" },
-                      { id: "hair", label: "Hair" },
-                      { id: "skin_tone", label: "Skin tone" },
-                      { id: "accessories", label: "Accessories" },
-                    ].map((opt) => (
-                      <button
-                        key={opt.id}
-                        type="button"
-                        onClick={() => toggleLockTarget(opt.id)}
-                        className={cn(
-                          "flex items-center gap-2 rounded-lg border px-2.5 py-2 text-xs text-left transition-all",
-                          lockTargets.includes(opt.id)
-                            ? "border-white/40 bg-white/10 text-white"
-                            : "border-white/10 text-white/45 hover:border-white/25"
-                        )}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={lockTargets.includes(opt.id)}
-                          readOnly
-                          className="accent-white"
-                        />
-                        <span>{opt.label}</span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {mode === "character_lock" && (
-              <div className="rounded-2xl border border-emerald-400/20 bg-emerald-400/5 p-4">
-                <p className="text-xs text-emerald-200">Character protected. No full-scene regeneration.</p>
-              </div>
-            )}
 
             {/* Submit */}
             <Button data-testid="button-replace-bg" onClick={handleSubmit}
-              disabled={!file || !bgPrompt.trim() || stage === "processing"}
+              disabled={!canSubmitBgReplace || stage === "processing"}
               className="w-full bg-white text-black hover:bg-white/90 font-semibold gap-2 h-11 rounded-full">
               {stage === "processing" ? (
                 <>
                   <div className="w-4 h-4 rounded-full border-2 border-black/20 border-t-black animate-spin" />
-                  {mode === "character_lock" ? "Protecting character..." : mode === "object_edit" ? "Editing selected object..." : "Rendering..."}
+                  {progressMessage || "Runway Aleph is re-rendering your scene…"}
                 </>
               ) : (
                 <>
                   <Sparkles className="w-4 h-4" />
-                  {mode === "character_lock"
-                    ? "Apply character lock"
-                    : mode === "object_edit"
-                      ? "Apply object edit"
-                    : mode === "clothes_change"
-                      ? "Apply clothes change"
-                      : mode === "color_grade"
-                        ? "Apply color grade"
-                        : "Replace background"}
+                  Replace Background with Runway
                 </>
               )}
             </Button>
 
-            {stage === "processing" && (
+            {stage === "processing" && mode === "background_replace" && (
               <div className="border border-white/8 rounded-2xl p-5 space-y-4">
                 <p className="text-xs font-semibold text-white/50 uppercase tracking-widest">Pipeline</p>
                 {[
                   "Uploading your video",
-                  "Luma Ray-2 re-rendering scene",
-                  ...(lockFace ? ["Locking your face back on every frame"] : []),
+                  "Runway Gen-4 Aleph re-rendering the scene",
                   "Encoding final video",
                 ].map((step, i) => (
                   <div key={step} className="flex items-center gap-3">
@@ -739,7 +1046,26 @@ export default function BgReplacePage() {
                   </div>
                 ))}
                 <p className="text-[11px] text-white/20 pt-1">
-                  Takes about {lockFace ? "4–6" : "3–4"} minutes — Luma renders in the cloud
+                  Takes about 2–4 minutes — Runway renders on Replicate
+                </p>
+              </div>
+            )}
+
+            {stage === "processing" && mode !== "background_replace" && (
+              <div className="border border-white/8 rounded-2xl p-5 space-y-4">
+                <p className="text-xs font-semibold text-white/50 uppercase tracking-widest">Pipeline</p>
+                {[
+                  "Uploading your video",
+                  "Wayne Cinema Ray-2 re-rendering the scene",
+                  "Encoding final video",
+                ].map((step, i) => (
+                  <div key={step} className="flex items-center gap-3">
+                    <div className={cn("w-1.5 h-1.5 rounded-full shrink-0", i < 2 ? "bg-white animate-pulse" : "bg-white/15")} />
+                    <span className="text-xs text-white/40">{step}</span>
+                  </div>
+                ))}
+                <p className="text-[11px] text-white/20 pt-1">
+                  Takes about 3–4 minutes — Wayne Cinema renders in the cloud
                 </p>
               </div>
             )}
@@ -753,19 +1079,23 @@ export default function BgReplacePage() {
 
           {/* Right: result */}
           <div>
-            {stage === "done" && result ? (
-              <div className="space-y-5">
+          {stage === "done" && result ? (
+            <div className="space-y-5">
+              {/* Replicate token missing alert */}
+              {replicateTokenMissing && (
+                <Alert variant="destructive" className="px-4 py-3 text-xs">
+                  <AlertDescription>
+                    Background replace requires <span className="font-bold">REPLICATE_API_TOKEN</span> in{" "}
+                    <span className="font-bold">.env.local</span>. Add your token and restart the API server.
+                  </AlertDescription>
+                </Alert>
+              )}
                 <div className="flex items-center justify-between mb-2 gap-2">
                   <div className="flex items-center gap-2 text-sm font-medium text-white/60">
                     <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                    <span>{result.demoMode ? "DEMO ONLY render" : "Scene re-rendered"}</span>
+                    <span>{mode === "background_replace" ? "Background replaced" : "Scene re-rendered"}</span>
                   </div>
                   <div className="flex items-center gap-2">
-                    {result.demoMode && (
-                      <div className="flex items-center gap-1.5 text-[11px] text-amber-300 bg-amber-400/10 px-2.5 py-1 rounded-full border border-amber-400/20">
-                        <span>DEMO</span>
-                      </div>
-                    )}
                     {result.faceLocked && (
                       <div className="flex items-center gap-1.5 text-[11px] text-emerald-400/80 bg-emerald-400/5 px-2.5 py-1 rounded-full border border-emerald-400/15">
                         <ShieldCheck className="w-3 h-3" />
@@ -780,14 +1110,30 @@ export default function BgReplacePage() {
                     <p className="text-[10px] text-white/35 break-all">selectedMode: {result.renderProof?.selectedMode ?? result.selectedMode}</p>
                     <p className="text-[10px] text-white/35 break-all">selectedRoute: {result.renderProof?.selectedRoute ?? result.selectedRoute}</p>
                     <p className="text-[10px] text-white/35 break-all">selectedEngine: {result.renderProof?.selectedEngine ?? result.selectedEngine}</p>
-                    <p className="text-[10px] text-white/35 break-all">demoMode: {String(result.renderProof?.demoMode ?? result.demoMode ?? false)}</p>
-                    <p className="text-[10px] text-white/35 break-all">realAiCalled: {String(result.renderProof?.realAiCalled ?? !result.demoMode)}</p>
+                    <p className="text-[10px] text-white/35 break-all">realAiCalled: {String(result.renderProof?.realAiCalled ?? true)}</p>
                     <p className="text-[10px] text-white/35 break-all">inputVideoUrl present: {String(result.renderProof?.inputVideoUrlPresent ?? Boolean(previewUrl))}</p>
                     <p className="text-[10px] text-white/35 break-all">inputImageUrl present: {String(result.renderProof?.inputImageUrlPresent ?? false)}</p>
                     <p className="text-[10px] text-white/35 break-all">faceLock active: {String(result.renderProof?.faceLockActive ?? result.faceLocked ?? false)}</p>
                     <p className="text-[10px] text-white/35 break-all">backgroundReplace active: {String(result.renderProof?.backgroundReplaceActive ?? (mode === "background_replace" || mode === "character_lock"))}</p>
                     <p className="text-[10px] text-white/35 break-all">objectEdit active: {String(result.renderProof?.objectEditActive ?? mode === "object_edit")}</p>
                     <p className="text-[10px] text-white/35 break-all">colorGrade active: {String(result.renderProof?.colorGradeActive ?? mode === "color_grade")}</p>
+                    {result.replicateColorDebug && (
+                      <>
+                        <p className="text-[10px] text-white/35 break-all">replicateOutputUrl: {String(result.replicateColorDebug.replicateOutputUrl ?? "—")}</p>
+                        <p className="text-[10px] text-white/35 break-all">bgInputMethod: {result.replicateColorDebug.bgInputMethod ?? "—"}</p>
+                        <p className="text-[10px] text-white/35 break-all">bgPresetId: {result.replicateColorDebug.bgPresetId ?? "—"}</p>
+                        <p className="text-[10px] text-white/35 break-all">referenceImageUrl: {String(result.replicateColorDebug.referenceImageUrl ?? "—")}</p>
+                        <p className="text-[10px] text-white/35 break-all">prompt: {result.replicateColorDebug.prompt ?? "—"}</p>
+                        <p className="text-[10px] text-white/35 break-all">aspectRatio: {result.replicateColorDebug.aspectRatio ?? "—"}</p>
+                        <p className="text-[10px] text-white/35 break-all">seed: {String(result.replicateColorDebug.seed ?? "—")}</p>
+                        <p className="text-[10px] text-white/35 break-all">errorMessage: {result.replicateColorDebug.errorMessage || result.renderProof?.errorMessage || "—"}</p>
+                      </>
+                    )}
+                    {(result.pipelineWarnings?.length ?? result.replicateColorDebug?.warnings?.length) ? (
+                      <p className="text-[10px] text-amber-200/80 break-all">
+                        warnings: {(result.pipelineWarnings ?? result.replicateColorDebug?.warnings ?? []).join(" · ")}
+                      </p>
+                    ) : null}
                     <p className="text-[10px] text-white/35 break-all">finalOutputUrl present: {String(result.renderProof?.finalOutputUrlPresent ?? Boolean(result.videoUrl))}</p>
                     <p className="text-[10px] text-white/35 break-all">errorMessage: {result.renderProof?.errorMessage || ""}</p>
                     {result.selectedObject && <p className="text-[10px] text-white/35 break-all">selectedObject: {result.selectedObject}</p>}
@@ -796,7 +1142,58 @@ export default function BgReplacePage() {
                     {result.editMask && <p className="text-[10px] text-white/35 break-all">editMask: {result.editMask}</p>}
                   </div>
                 )}
-                <VideoPlayer src={result.videoUrl} thumbnail={result.thumbnailUrl} />
+                {mode === "background_replace" || mode === "color_grade" ? (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <p className="text-[11px] uppercase tracking-widest text-white/40">Original</p>
+                      <VideoPlayer
+                        src={result.inputVideoUrl ?? previewUrl ?? ""}
+                        thumbnail={result.thumbnailUrl}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <p className="text-[11px] uppercase tracking-widest text-cyan-300/70">
+                        {mode === "background_replace" ? "New Background" : "Runway Graded"}
+                      </p>
+                      <VideoPlayer src={result.videoUrl} thumbnail={result.thumbnailUrl} />
+                    </div>
+                  </div>
+                ) : (
+                  <VideoPlayer src={result.videoUrl} thumbnail={result.thumbnailUrl} />
+                )}
+                {(result.pipelineWarnings?.length ?? 0) > 0 && (
+                  <Alert className="border-amber-500/30 bg-amber-500/10 text-amber-100">
+                    <AlertTriangle className="h-4 w-4 text-amber-300" />
+                    <AlertDescription className="text-xs leading-relaxed">
+                      {result.pipelineWarnings!.join(" ")}
+                    </AlertDescription>
+                  </Alert>
+                )}
+                {result.kontextError && (
+                  <Alert variant="destructive" className="pt-2 px-3">
+                    <AlertDescription>{result.kontextError}</AlertDescription>
+                  </Alert>
+                )}
+                {result.kontextColorUrl && (
+                  <div className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <p className="text-[11px] uppercase tracking-widest text-white/40">Cinematic color grade preview</p>
+                      {typeof result.kontextCreditsCharged === "number" && (
+                        <span className="text-[11px] text-white/50">
+                          -{result.kontextCreditsCharged} credits
+                        </span>
+                      )}
+                    </div>
+                    <img
+                      src={result.kontextColorUrl}
+                      alt="Cinematic color grade preview"
+                      className="w-full rounded-2xl border border-white/10"
+                    />
+                    <a href={result.kontextColorUrl} download className="text-[11px] text-white/50 hover:text-white underline">
+                      Download color grade still
+                    </a>
+                  </div>
+                )}
 
                 {/* Fix face button */}
                 {result.lumaUrl && result.sourceUrl && (
@@ -841,9 +1238,9 @@ export default function BgReplacePage() {
                 </div>
                 <div className="text-[11px] text-white/15 space-y-1.5 text-left w-full max-w-xs">
                   <p className="text-white/25 font-medium mb-2">How it works</p>
-                  <p>1. Luma Ray-2 re-renders the entire scene from your prompt</p>
-                  <p>2. Your motion and framing are preserved</p>
-                  <p>3. Optional face lock stamps your original face back on</p>
+                  <p>1. Runway Gen-4 Aleph re-renders your video with the new background</p>
+                  <p>2. Pick a preset, custom prompt, or reference image</p>
+                  <p>3. Compare original vs result side by side</p>
                 </div>
               </div>
             )}

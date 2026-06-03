@@ -2,12 +2,13 @@ import { Router } from "express";
 import multer from "multer";
 import path from "path";
 import { fileURLToPath } from "url";
-import { mkdir, writeFile } from "fs/promises";
+import { mkdir, writeFile, readFile } from "fs/promises";
 import { exec } from "child_process";
 import { promisify } from "util";
 import Replicate from "replicate";
 import ffmpegPath from "ffmpeg-static";
 import { requireAuth } from "../middlewares/requireAuth";
+import { isBaselineMode, baselineDisabledResponse } from "../lib/baseline-mode";
 import { resolveFfmpegBin } from "../lib/ffmpeg";
 import {
   chargeCredits,
@@ -38,16 +39,18 @@ const upload = multer({
 });
 
 // ---------------------------------------------------------------------------
-// Engine catalog. All four are hosted on Replicate and use the existing
-// REPLICATE_API_TOKEN — no extra accounts required.
+// Engine catalog — Replicate-hosted models via REPLICATE_API_TOKEN.
 //
-// `needsImage` = the model literally cannot run without a still image input.
-// `imageKey`   = the field name the model expects for the still image.
+// `needsImage` = the model cannot run without a still image input.
 // `build()`    = constructs the Replicate input payload from our normalized
-//                request body. Keep these minimal — Replicate fills in good
-//                defaults for anything we omit.
+//                request body.
 // ---------------------------------------------------------------------------
-type EngineId = "runway-gen-4.5" | "kling-2.1" | "hailuo-02" | "pixverse-4.5" | "wan-2.2-i2v";
+type EngineId =
+  | "runway-gen-4.5"
+  | "kling-2.1"
+  | "hailuo-02"
+  | "pixverse-4.5"
+  | "wan-2.2-i2v";
 
 type ScenePayload = {
   prompt: string;
@@ -199,7 +202,7 @@ router.get("/scene/engines", requireAuth, (_req, res) => {
 // four supported Replicate engines. Returns the saved videoUrl + thumbnail.
 //
 // Form fields:
-//   engine          (required) one of: kling-2.1 | hailuo-02 | pixverse-4.5 | wan-2.2-i2v
+//   engine          (required) scene engine id (see ENGINES in generate-scene.ts)
 //   prompt          (required)
 //   duration        (optional, seconds; engine-specific)
 //   aspectRatio     (optional; only respected by engines that take it)
@@ -207,6 +210,10 @@ router.get("/scene/engines", requireAuth, (_req, res) => {
 //   image           (optional file upload — required for engines where needsImage=true)
 // ---------------------------------------------------------------------------
 router.post("/scene/generate", requireAuth, upload.single("image"), async (req, res) => {
+  if (isBaselineMode()) {
+    return res.status(503).json(baselineDisabledResponse("/scene/generate"));
+  }
+
   const engineId = (req.body?.engine as string | undefined)?.trim();
   if (!isEngineId(engineId)) {
     return res.status(400).json({ error: `Unknown engine. Pick one of: ${Object.keys(ENGINES).join(", ")}` });
@@ -223,8 +230,8 @@ router.post("/scene/generate", requireAuth, upload.single("image"), async (req, 
   const token = process.env.REPLICATE_API_TOKEN;
   if (!token) return res.status(500).json({ error: "REPLICATE_API_TOKEN not set" });
 
+  const replicate = new Replicate({ auth: token });
   const domain = getDomain();
-  if (!domain) return res.status(500).json({ error: "Could not determine public domain" });
 
   await mkdir(UPLOADS_DIR, { recursive: true });
   await mkdir(VIDEOS_DIR,  { recursive: true });
@@ -232,15 +239,29 @@ router.post("/scene/generate", requireAuth, upload.single("image"), async (req, 
 
   const jobId = `scn-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
-  // 1. If an image was uploaded, persist it and build a public URL the
-  //    Replicate worker can fetch.
+  // 1. If an image was uploaded, persist it and build a URL the
+  //    Replicate worker can fetch. If no public HTTPS domain is available,
+  //    upload the file to Replicate's temporary storage.
   let imageUrl: string | undefined;
   if (req.file) {
     const ext = "." + (req.file.originalname.split(".").pop() ?? "png").toLowerCase();
     const safeExt = IMAGE_EXTS.has(ext) ? ext : ".png";
     const imgPath = path.join(UPLOADS_DIR, `${jobId}-img${safeExt}`);
     await writeFile(imgPath, req.file.buffer);
-    imageUrl = `https://${domain}/api/uploads/${jobId}-img${safeExt}`;
+    if (domain) {
+      imageUrl = `https://${domain}/api/uploads/${jobId}-img${safeExt}`;
+    } else {
+      try {
+        const buf = await readFile(imgPath);
+        const uploaded = await replicate.files.create(buf, { jobId, kind: "scene-input", route: "scene/generate" });
+        const getUrl = (uploaded as { urls?: { get?: string } })?.urls?.get;
+        if (typeof getUrl === "string" && getUrl.startsWith("http")) {
+          imageUrl = getUrl;
+        }
+      } catch (err: any) {
+        return res.status(500).json({ error: `Failed to upload image: ${err.message}` });
+      }
+    }
   }
 
   const duration       = req.body?.duration       ? Number(req.body.duration) : undefined;
@@ -258,8 +279,6 @@ router.post("/scene/generate", requireAuth, upload.single("image"), async (req, 
   const input = spec.build({ prompt, imageUrl, duration, aspectRatio, negativePrompt });
 
   req.log.info({ jobId, engine: engineId, prompt, cost }, "scene/generate: calling model");
-
-  const replicate = new Replicate({ auth: token });
   let resultUrl: string;
   try {
     const output = await replicate.run(spec.model, { input });
